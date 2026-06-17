@@ -112,11 +112,15 @@ def extract_asian_handicap(values: list[dict]) -> dict[float, dict]:
 
 # ─── 主解析：单场 odds → 行列表 ──────────────────────────────────────────────
 def parse_odds_response(entry: dict, snapshot_utc: str,
-                        commence_utc: str) -> list[dict]:
+                        commence_utc: str,
+                        pool_ids: set[int] | None = None) -> list[dict]:
     """
     解析 /odds 的 response[0] → odds_history 行列表（含凯利）。
-    两轮：先用全部庄算市场平均，再为每家庄生成行。
+    两轮：先用启用的庄算市场平均，再为每家庄生成行。
+    pool_ids: 参与抓取/凯利计算的庄家 ID 集合；None 时回退到 config 全集。
     """
+    if pool_ids is None:
+        pool_ids = config.KELLY_POOL_IDS
     fixture_id = entry.get("fixture", {}).get("id")
     if not fixture_id:
         return []
@@ -132,7 +136,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
 
     for bm in bookmakers:
         bid = bm.get("id")
-        if bid not in config.KELLY_POOL_IDS:
+        if bid not in pool_ids:
             continue
         h2h = None
         ah = None

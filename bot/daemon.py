@@ -15,7 +15,7 @@ import sys
 import logging
 from logging.handlers import RotatingFileHandler
 
-from . import db, scheduler
+from . import db, scheduler, tgbot
 
 
 def setup_logging() -> None:
@@ -51,14 +51,32 @@ def main() -> None:
     except Exception:
         log.exception("启动时拉取赛程失败，继续启动调度器")
 
-    sched = scheduler.build_scheduler()
-    log.info("调度器启动：任务A(每日%02d:%02d) / 任务B(每%dh) / 任务C(每%dmin)",
-             scheduler.config.TASK_A_HOUR, scheduler.config.TASK_A_MINUTE,
-             scheduler.config.TASK_B_HOURS, scheduler.config.TASK_C_MINUTES)
-    try:
+    if tgbot.TOKEN:
+        # 模式①：后台调度器 + 主线程跑 Telegram bot
+        sched = scheduler.build_scheduler(blocking=False)
         sched.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("守护进程停止")
+        log.info("调度器(后台)+Telegram bot 已启动："
+                 "任务A(每日%02d:%02d)/B(每%dh)/C(每%dmin)",
+                 scheduler.config.TASK_A_HOUR, scheduler.config.TASK_A_MINUTE,
+                 scheduler.config.TASK_B_HOURS, scheduler.config.TASK_C_MINUTES)
+        try:
+            tgbot.run_polling()
+        except (KeyboardInterrupt, SystemExit):
+            log.info("收到停止信号")
+        finally:
+            sched.shutdown(wait=False)
+            log.info("守护进程停止")
+    else:
+        # 模式②：未配置 bot token，纯阻塞调度器
+        log.info("未配置 TELEGRAM_BOT_TOKEN，仅运行调度器（无 bot）")
+        sched = scheduler.build_scheduler(blocking=True)
+        log.info("调度器启动：任务A(每日%02d:%02d)/B(每%dh)/C(每%dmin)",
+                 scheduler.config.TASK_A_HOUR, scheduler.config.TASK_A_MINUTE,
+                 scheduler.config.TASK_B_HOURS, scheduler.config.TASK_C_MINUTES)
+        try:
+            sched.start()
+        except (KeyboardInterrupt, SystemExit):
+            log.info("守护进程停止")
 
 
 if __name__ == "__main__":
