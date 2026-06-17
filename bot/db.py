@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS odds_history (
 CREATE INDEX IF NOT EXISTS idx_odds_fix_time ON odds_history(fixture_id, snapshot_utc);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_odds_dedup
     ON odds_history(fixture_id, snapshot_utc, bookmaker_id, market, handicap);
+
+-- 动态配置表：由 TG bot 实时增删/开关，调度器每次抓取时读取
+CREATE TABLE IF NOT EXISTS watched_leagues (
+    league_id   INTEGER PRIMARY KEY,
+    league_name TEXT,
+    season      INTEGER,
+    enabled     INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS watched_bookmakers (
+    bookmaker_id INTEGER PRIMARY KEY,
+    name         TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 1
+);
 """
 
 # odds_history 批量插入用的列顺序（与 parser 产出的行字典对齐）
@@ -74,8 +87,23 @@ def init_db(db_path: str | None = None) -> None:
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        seed_config(conn)
     finally:
         conn.close()
+
+
+def seed_config(conn: sqlite3.Connection) -> None:
+    """首次启动把 config.py 的默认联赛/公司灌入配置表（已存在则跳过，不覆盖开关）。"""
+    league_rows = [(lid, name, season)
+                   for lid, (name, season) in config.WATCH_LEAGUES.items()]
+    conn.executemany(
+        "INSERT OR IGNORE INTO watched_leagues (league_id, league_name, season, enabled) "
+        "VALUES (?,?,?,1)", league_rows)
+    bm_rows = [(bid, name) for bid, name in config.BOOKMAKER_NAMES.items()]
+    conn.executemany(
+        "INSERT OR IGNORE INTO watched_bookmakers (bookmaker_id, name, enabled) "
+        "VALUES (?,?,1)", bm_rows)
+    conn.commit()
 
 
 def _now_utc_iso() -> str:
@@ -140,3 +168,79 @@ def get_fixtures_between(conn: sqlite3.Connection, start_utc: str,
 def checkpoint_wal(conn: sqlite3.Connection) -> None:
     """截断 WAL，避免长跑时文件膨胀。"""
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+
+# ─── 动态配置读写（供调度器读、TG bot 写）──────────────────────────────────
+def get_enabled_leagues(conn: sqlite3.Connection) -> dict[int, tuple[str, int]]:
+    """返回启用的联赛 {league_id: (name, season)}，供调度器抓取。"""
+    cur = conn.execute(
+        "SELECT league_id, league_name, season FROM watched_leagues "
+        "WHERE enabled=1")
+    return {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+
+def get_enabled_bookmaker_ids(conn: sqlite3.Connection) -> set[int]:
+    """返回启用的庄家 ID 集合，供解析时过滤与凯利池。"""
+    cur = conn.execute(
+        "SELECT bookmaker_id FROM watched_bookmakers WHERE enabled=1")
+    return {r[0] for r in cur.fetchall()}
+
+
+def list_leagues(conn: sqlite3.Connection) -> list[tuple]:
+    """全部联赛 (league_id, name, season, enabled)，供 bot 展示。"""
+    return conn.execute(
+        "SELECT league_id, league_name, season, enabled FROM watched_leagues "
+        "ORDER BY league_id").fetchall()
+
+
+def list_bookmakers(conn: sqlite3.Connection) -> list[tuple]:
+    """全部庄家 (bookmaker_id, name, enabled)，供 bot 展示。"""
+    return conn.execute(
+        "SELECT bookmaker_id, name, enabled FROM watched_bookmakers "
+        "ORDER BY bookmaker_id").fetchall()
+
+
+def toggle_league(conn: sqlite3.Connection, league_id: int) -> int | None:
+    """翻转某联赛启用状态，返回新状态（1/0）；不存在返回 None。"""
+    row = conn.execute("SELECT enabled FROM watched_leagues WHERE league_id=?",
+                       (league_id,)).fetchone()
+    if row is None:
+        return None
+    new = 0 if row[0] else 1
+    conn.execute("UPDATE watched_leagues SET enabled=? WHERE league_id=?",
+                 (new, league_id))
+    conn.commit()
+    return new
+
+
+def toggle_bookmaker(conn: sqlite3.Connection, bookmaker_id: int) -> int | None:
+    """翻转某庄家启用状态，返回新状态；不存在返回 None。"""
+    row = conn.execute(
+        "SELECT enabled FROM watched_bookmakers WHERE bookmaker_id=?",
+        (bookmaker_id,)).fetchone()
+    if row is None:
+        return None
+    new = 0 if row[0] else 1
+    conn.execute("UPDATE watched_bookmakers SET enabled=? WHERE bookmaker_id=?",
+                 (new, bookmaker_id))
+    conn.commit()
+    return new
+
+
+def add_league(conn: sqlite3.Connection, league_id: int, name: str,
+               season: int) -> None:
+    """新增/更新一个关注联赛（默认启用）。"""
+    conn.execute(
+        "INSERT INTO watched_leagues (league_id, league_name, season, enabled) "
+        "VALUES (?,?,?,1) ON CONFLICT(league_id) DO UPDATE SET "
+        "league_name=excluded.league_name, season=excluded.season, enabled=1",
+        (league_id, name, season))
+    conn.commit()
+
+
+def remove_league(conn: sqlite3.Connection, league_id: int) -> bool:
+    """删除一个关注联赛。返回是否删除了行。"""
+    cur = conn.execute("DELETE FROM watched_leagues WHERE league_id=?",
+                       (league_id,))
+    conn.commit()
+    return cur.rowcount > 0

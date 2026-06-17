@@ -82,3 +82,12 @@ NODE_THRESHOLDS: list[tuple[float, str]] = [
 
 # ─── 数据库 ──────────────────────────────────────────────────────────────────
 DB_PATH = "odds.db"
+
+# ─── Telegram bot ────────────────────────────────────────────────────────────
+# token 与白名单从 .env 读取，不写死在代码里：
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+#   TELEGRAM_ALLOWED_CHAT_IDS=11111111,22222222   （逗号分隔，只有这些人能操控）
+TELEGRAM_API = "https://api.telegram.org"
+TG_POLL_TIMEOUT = 50          # long polling 超时（秒）
+TG_LEAGUES_PER_ROW = 2        # 联赛按钮每行个数
+TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
