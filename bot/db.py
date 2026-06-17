@@ -93,16 +93,25 @@ def init_db(db_path: str | None = None) -> None:
 
 
 def seed_config(conn: sqlite3.Connection) -> None:
-    """首次启动把 config.py 的默认联赛/公司灌入配置表（已存在则跳过，不覆盖开关）。"""
-    league_rows = [(lid, name, season)
-                   for lid, (name, season) in config.WATCH_LEAGUES.items()]
+    """首次启动把 config 的联赛/公司灌入配置表。
+    INSERT OR IGNORE：已存在的行保留用户在 bot 里改过的开关，不覆盖。
+    enabled 初值按 config 的「默认启用」集合决定（核心联赛/12家庄=1，扩充池=0）。
+    """
+    default_lg = set(config.DEFAULT_ENABLED_LEAGUES)
+    league_rows = [
+        (lid, name, season, 1 if lid in default_lg else 0)
+        for lid, (name, season) in config.WATCH_LEAGUES.items()
+    ]
     conn.executemany(
         "INSERT OR IGNORE INTO watched_leagues (league_id, league_name, season, enabled) "
-        "VALUES (?,?,?,1)", league_rows)
-    bm_rows = [(bid, name) for bid, name in config.BOOKMAKER_NAMES.items()]
+        "VALUES (?,?,?,?)", league_rows)
+
+    default_bm = config.DEFAULT_ENABLED_BOOKMAKERS
+    bm_rows = [(bid, name, 1 if bid in default_bm else 0)
+               for bid, name in config.ALL_BOOKMAKERS.items()]
     conn.executemany(
         "INSERT OR IGNORE INTO watched_bookmakers (bookmaker_id, name, enabled) "
-        "VALUES (?,?,1)", bm_rows)
+        "VALUES (?,?,?)", bm_rows)
     conn.commit()
 
 

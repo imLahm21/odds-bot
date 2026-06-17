@@ -29,6 +29,8 @@ env/
 .tmp.drivedownload/
 .tmp.driveupload/
 probe_samples/
+catalog_leagues.txt
+catalog_bookmakers.txt
 
 # ===== 编辑器 / 系统 =====
 .vscode/

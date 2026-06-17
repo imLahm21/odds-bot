@@ -12,42 +12,112 @@ AUTH_HEADER = "x-apisports-key"     # 直连鉴权头（非 RapidAPI）
 # ─── 关注的联赛（league_id 与 season 均已实测）──────────────────────────────
 # 格式：league_id -> (中文名, season)
 # season 注意：欧洲跨年联赛 2025-26 标记为 2025；北欧/世界杯为自然年
-WATCH_LEAGUES: dict[int, tuple[str, int]] = {
+#
+# 两层结构：
+#   DEFAULT_ENABLED_LEAGUES —— 开机即抓的核心联赛（enabled=1）
+#   EXTRA_LEAGUES           —— 写入可选池但默认停用（enabled=0），TG bot 点开即用
+# 调度器只抓数据库里 enabled=1 的，所以加进 EXTRA 不会平白消耗额度。
+
+# 默认启用：五大联赛 + 五大杯赛 + 冰岛超/沙特联/中超 + 欧战 + 世界杯
+DEFAULT_ENABLED_LEAGUES: dict[int, tuple[str, int]] = {
     39:  ("英超 EPL",            2025),
     140: ("西甲 La Liga",        2025),
     78:  ("德甲 Bundesliga",     2025),
     135: ("意甲 Serie A",        2025),
     61:  ("法甲 Ligue 1",        2025),
+    45:  ("足总杯 FA Cup",       2025),
+    143: ("西班牙国王杯 Copa del Rey", 2025),
+    81:  ("德国杯 DFB Pokal",    2026),
+    137: ("意大利杯 Coppa Italia", 2025),
+    66:  ("法国杯 Coupe de France", 2025),
+    164: ("冰岛超 Úrvalsdeild",  2026),
+    307: ("沙特联 Pro League",   2025),
+    169: ("中超 CSL",            2026),
     2:   ("欧冠 Champions Lg",   2025),
     3:   ("欧联 Europa Lg",      2025),
     848: ("欧协联 Conference",   2025),
     5:   ("欧国联 Nations Lg",   2026),
     1:   ("世界杯 World Cup",    2026),
-    169: ("中超 CSL",            2026),
-    98:  ("日职联 J1",           2027),
-    292: ("韩K联 K League 1",    2026),
-    307: ("沙特联 Pro League",   2025),
-    164: ("冰岛超 Úrvalsdeild",  2026),
 }
 
-# ─── 关注的庄家（bookmaker_id 已实测）────────────────────────────────────────
-# 全部 12 家都抓取并参与市场平均凯利计算；前两家是风控双锚。
-BOOKMAKER_NAMES: dict[int, str] = {
-    4:  "Pinnacle",       # 亚盘风控锚 <0.96 报警
-    8:  "Bet365",         # 欧指基准锚 >1.03 报警
-    7:  "William Hill",
-    2:  "Marathonbet",
-    3:  "Betfair",
-    11: "1xBet",
-    16: "Unibet",
-    36: "BetVictor",
-    1:  "10Bet",
-    5:  "SBO",
-    32: "Betano",
-    9:  "Dafabet",
+# 扩充可选池：默认停用，需要时在 TG bot /leagues 面板点开
+EXTRA_LEAGUES: dict[int, tuple[str, int]] = {
+    # 英格兰次级
+    40:  ("英冠 Championship",   2025),
+    41:  ("英甲 League One",     2025),
+    42:  ("英乙 League Two",     2025),
+    # 其他五大次级
+    141: ("西乙 Segunda",        2025),
+    79:  ("德乙 2.Bundesliga",   2025),
+    136: ("意乙 Serie B",        2025),
+    62:  ("法乙 Ligue 2",        2026),
+    # 其他欧洲顶级
+    88:  ("荷甲 Eredivisie",     2026),
+    94:  ("葡超 Primeira Liga",  2025),
+    144: ("比甲 Jupiler Pro",    2025),
+    203: ("土超 Süper Lig",      2025),
+    179: ("苏超 Premiership",    2025),
+    197: ("希超 Super League 1", 2025),
+    235: ("俄超 Premier League", 2025),
+    207: ("瑞士超 Super League", 2025),
+    218: ("奥甲 Bundesliga",     2025),
+    119: ("丹超 Superliga",      2026),
+    113: ("瑞典超 Allsvenskan",  2026),
+    103: ("挪超 Eliteserien",    2026),
+    106: ("波兰 Ekstraklasa",    2026),
+    333: ("乌超 Premier League", 2025),
+    210: ("克甲 HNL",            2026),
+    # 美洲
+    71:  ("巴西甲 Serie A",      2026),
+    128: ("阿甲 Liga Pro",       2026),
+    253: ("美职联 MLS",          2026),
+    262: ("墨超 Liga MX",        2026),
+    239: ("哥伦比亚 Primera A",  2026),
+    265: ("智利甲 Primera",      2026),
+    # 亚洲/大洋洲
+    98:  ("日职联 J1",           2027),
+    292: ("韩K联 K League 1",    2026),
+    188: ("澳超 A-League",       2025),
 }
-# 计算市场平均时纳入的庄家（全部）；如需收窄可改这里
-KELLY_POOL_IDS = set(BOOKMAKER_NAMES.keys())
+
+# 合并：种子灌库时用（值含 enabled 标记）
+WATCH_LEAGUES: dict[int, tuple[str, int]] = {
+    **DEFAULT_ENABLED_LEAGUES, **EXTRA_LEAGUES,
+}
+
+# ─── 关注的庄家（bookmaker_id 已用 /odds/bookmakers 实测，共 33 家）──────────
+# 全部写入可选池；DEFAULT_ENABLED_BOOKMAKERS 默认启用，其余 TG bot 点开。
+ALL_BOOKMAKERS: dict[int, str] = {
+    1: "10Bet", 2: "Marathonbet", 3: "Betfair", 4: "Pinnacle", 5: "SBO",
+    6: "Bwin", 7: "William Hill", 8: "Bet365", 9: "Dafabet", 10: "Ladbrokes",
+    11: "1xBet", 12: "BetFred", 13: "188Bet", 15: "Interwetten", 16: "Unibet",
+    17: "5Dimes", 18: "Intertops", 19: "Bovada", 20: "Betcris", 21: "888Sport",
+    22: "Tipico", 23: "Sportingbet", 24: "Betway", 25: "Expekt", 26: "Betsson",
+    27: "NordicBet", 28: "ComeOn", 30: "Netbet", 32: "Betano", 33: "Fonbet",
+    34: "Superbet", 36: "BetVictor",
+}
+
+# 默认启用的 12 家主流（前两家是风控双锚）
+DEFAULT_ENABLED_BOOKMAKERS: set[int] = {
+    4,   # Pinnacle  亚盘风控锚 <0.96 报警
+    8,   # Bet365    欧指基准锚 >1.03 报警
+    7,   # William Hill
+    2,   # Marathonbet
+    3,   # Betfair
+    11,  # 1xBet
+    16,  # Unibet
+    36,  # BetVictor
+    1,   # 10Bet
+    5,   # SBO
+    32,  # Betano
+    9,   # Dafabet
+}
+
+# 兼容旧引用：种子用全集
+BOOKMAKER_NAMES: dict[int, str] = ALL_BOOKMAKERS
+# 凯利池 = 数据库里启用的庄家（运行时由 db.get_enabled_bookmaker_ids 提供）；
+# 这里作为离线/兜底默认值
+KELLY_POOL_IDS = set(DEFAULT_ENABLED_BOOKMAKERS)
 
 # ─── bet 类型 ID（已实测）────────────────────────────────────────────────────
 BET_MATCH_WINNER = 1     # 欧赔 1X2，value: Home/Draw/Away
