@@ -24,6 +24,7 @@ env/
 *.zip
 .recallloom/
 .tmp.drivedownload/
+probe_samples/
 
 # ===== 编辑器 / 系统 =====
 .vscode/
