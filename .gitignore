@@ -11,6 +11,9 @@ report/
 *.sqlite
 *.sqlite3
 *.xlsx
+*.log
+*.db-wal
+*.db-shm
 
 # ===== Python =====
 __pycache__/
@@ -24,6 +27,7 @@ env/
 *.zip
 .recallloom/
 .tmp.drivedownload/
+.tmp.driveupload/
 probe_samples/
 
 # ===== 编辑器 / 系统 =====
