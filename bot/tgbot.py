@@ -234,9 +234,10 @@ def _cmd_odds(chat_id: int, args: list[str]) -> None:
 
 
 def _cmd_export(chat_id: int, args: list[str]) -> None:
-    """导出某场全部盘口快照为 CSV，作为文件发回 Telegram。"""
+    """导出某场全部盘口快照为 CSV，对齐旧 main.py 格式（可直接喂精算 SOP）。"""
     import csv
     import io
+    from datetime import datetime, timezone, timedelta
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/export &lt;fixture_id&gt;（id 见 /fixtures）")
         return
@@ -244,7 +245,7 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     conn = db.get_conn()
     try:
         fx = conn.execute(
-            "SELECT home_team, away_team, league_name FROM fixtures "
+            "SELECT home_team, away_team, league_name, commence_utc FROM fixtures "
             "WHERE fixture_id=?", (fid,)).fetchone()
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker, market, "
@@ -257,18 +258,51 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     if not rows:
         send(chat_id, f"fixture {fid} 暂无盘口数据")
         return
-    # 生成 CSV（UTF-8 BOM，Excel 打开中文不乱码）
+
+    tz_cst = timezone(timedelta(hours=8))
+
+    def to_cst(iso_str: str) -> str:
+        if not iso_str:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return dt.astimezone(tz_cst).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, AttributeError):
+            return iso_str
+
+    home = fx[0] if fx else ""
+    away = fx[1] if fx else ""
+    league = fx[2] if fx else ""
+    kick_cst = to_cst(fx[3]) if fx else ""
+    market_zh = {"h2h": "欧指", "ah": "亚盘"}
+
+    # 旧 19 列格式
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["快照时间", "节点", "博彩公司", "盘口", "主胜", "平", "客胜",
-                "凯利主", "凯利平", "凯利客", "让球", "主水", "客水",
-                "凯利主水", "凯利客水"])
-    w.writerows(rows)
+    w.writerow(["快照时间(CST)", "联赛", "开球时间(CST)", "主队", "客队",
+                "博彩公司", "盘口类型", "主胜赔率", "平局赔率", "客胜赔率",
+                "凯利(主胜)", "凯利(平局)", "凯利(客胜)",
+                "让球", "主队水位", "客队水位", "凯利(主)", "凯利(客)",
+                "数据更新(CST)"])
+    for (snap, node, bm, market, ho, do, ao, kh, kd, ka,
+         hc, hw, aw, khw, kaw) in rows:
+        snap_cst = to_cst(snap)
+        snap_label = f"{snap_cst}（{node}）" if node else snap_cst
+        is_h2h = market == "h2h"
+        w.writerow([
+            snap_label, league, kick_cst, home, away, bm,
+            market_zh.get(market, market),
+            ho if is_h2h else "", do if is_h2h else "", ao if is_h2h else "",
+            kh if is_h2h else "", kd if is_h2h else "", ka if is_h2h else "",
+            "" if is_h2h else hc, "" if is_h2h else hw, "" if is_h2h else aw,
+            "" if is_h2h else khw, "" if is_h2h else kaw,
+            snap_cst,   # 数据更新(CST)：用抓取时刻近似（API update 字段未单独入库）
+        ])
     content = ("﻿" + buf.getvalue()).encode("utf-8")
-    teams = f"{fx[0]}_vs_{fx[1]}" if fx else str(fid)
-    caption = (f"{fx[2]} {fx[0]} vs {fx[1]}\n共 {len(rows)} 行快照"
+    teams = f"{home}_vs_{away}".replace(" ", "_") if fx else str(fid)
+    caption = (f"{league} {home} vs {away}\n共 {len(rows)} 行快照"
                if fx else f"fixture {fid}：{len(rows)} 行")
-    send_document(chat_id, f"{teams}_{fid}.csv", content, caption)
+    send_document(chat_id, f"{teams}_stages.csv", content, caption)
 
 
 def handle_message(msg: dict) -> None:
