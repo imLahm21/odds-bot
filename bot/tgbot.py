@@ -65,6 +65,19 @@ def answer_callback(callback_id: str, text: str = "") -> None:
     _post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
 
+def send_document(chat_id: int, filename: str, content: bytes,
+                  caption: str = "") -> None:
+    """以文件形式发送（multipart 上传）。content 为文件字节。"""
+    try:
+        requests.post(
+            f"{API_BASE}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"document": (filename, content, "text/csv")},
+            timeout=60)
+    except requests.exceptions.RequestException as e:
+        log.warning("sendDocument 失败: %s", e)
+
+
 def _authorized(chat_id: int) -> bool:
     """白名单校验：未配置白名单时拒绝所有（防误开放）。"""
     if not ALLOWED_CHAT_IDS:
@@ -122,6 +135,7 @@ HELP = (
     "/status — 当前启用项\n"
     "/fixtures — 未来 3 天赛程\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
+    "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
 )
 
 
@@ -219,6 +233,44 @@ def _cmd_odds(chat_id: int, args: list[str]) -> None:
     send(chat_id, "\n".join(lines[:40]))
 
 
+def _cmd_export(chat_id: int, args: list[str]) -> None:
+    """导出某场全部盘口快照为 CSV，作为文件发回 Telegram。"""
+    import csv
+    import io
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/export &lt;fixture_id&gt;（id 见 /fixtures）")
+        return
+    fid = int(args[0])
+    conn = db.get_conn()
+    try:
+        fx = conn.execute(
+            "SELECT home_team, away_team, league_name FROM fixtures "
+            "WHERE fixture_id=?", (fid,)).fetchone()
+        rows = conn.execute(
+            "SELECT snapshot_utc, node_label, bookmaker, market, "
+            "home_odds, draw_odds, away_odds, kelly_home, kelly_draw, kelly_away, "
+            "handicap, home_water, away_water, kelly_h_water, kelly_a_water "
+            "FROM odds_history WHERE fixture_id=? "
+            "ORDER BY snapshot_utc, bookmaker, market, handicap", (fid,)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        send(chat_id, f"fixture {fid} 暂无盘口数据")
+        return
+    # 生成 CSV（UTF-8 BOM，Excel 打开中文不乱码）
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["快照时间", "节点", "博彩公司", "盘口", "主胜", "平", "客胜",
+                "凯利主", "凯利平", "凯利客", "让球", "主水", "客水",
+                "凯利主水", "凯利客水"])
+    w.writerows(rows)
+    content = ("﻿" + buf.getvalue()).encode("utf-8")
+    teams = f"{fx[0]}_vs_{fx[1]}" if fx else str(fid)
+    caption = (f"{fx[2]} {fx[0]} vs {fx[1]}\n共 {len(rows)} 行快照"
+               if fx else f"fixture {fid}：{len(rows)} 行")
+    send_document(chat_id, f"{teams}_{fid}.csv", content, caption)
+
+
 def handle_message(msg: dict) -> None:
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "").strip()
@@ -250,6 +302,8 @@ def handle_message(msg: dict) -> None:
         _cmd_fixtures(chat_id)
     elif cmd == "odds":
         _cmd_odds(chat_id, args)
+    elif cmd == "export":
+        _cmd_export(chat_id, args)
     else:
         send(chat_id, "未知命令，发 /help 看用法")
 
