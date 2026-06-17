@@ -43,6 +43,10 @@ def task_a_update_fixtures() -> int:
             if n:
                 log.info("  %s: %d 场", name, n)
             time.sleep(config.REQUEST_THROTTLE_SEC)
+        # 清理结束很久的旧比赛，防表膨胀
+        fix_n, odds_n = db.cleanup_old(conn, config.CLEANUP_DAYS)
+        if fix_n or odds_n:
+            log.info("  清理旧数据：删 %d 场 / %d 行快照", fix_n, odds_n)
         db.checkpoint_wal(conn)
     finally:
         conn.close()

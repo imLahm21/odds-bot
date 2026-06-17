@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS fixtures (
     season        INTEGER,
     home_team     TEXT NOT NULL,
     away_team     TEXT NOT NULL,
+    home_team_id  INTEGER,
+    away_team_id  INTEGER,
     commence_utc  TEXT NOT NULL,
     status        TEXT,
     updated_at    TEXT
@@ -82,14 +84,24 @@ def get_conn(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """建表（幂等）。"""
+    """建表（幂等）+ 轻量迁移。"""
     conn = get_conn(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        _migrate(conn)
         seed_config(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的旧库补加新列（CREATE TABLE IF NOT EXISTS 不会改已有表）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fixtures)")}
+    for col in ("home_team_id", "away_team_id"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE fixtures ADD COLUMN {col} INTEGER")
+    conn.commit()
 
 
 def seed_config(conn: sqlite3.Connection) -> None:
@@ -126,17 +138,20 @@ def upsert_fixtures(conn: sqlite3.Connection, rows: list[dict]) -> int:
     now = _now_utc_iso()
     payload = [
         (r["fixture_id"], r["league_id"], r.get("league_name"), r.get("season"),
-         r["home_team"], r["away_team"], r["commence_utc"], r.get("status"), now)
+         r["home_team"], r["away_team"], r.get("home_team_id"),
+         r.get("away_team_id"), r["commence_utc"], r.get("status"), now)
         for r in rows
     ]
     conn.executemany(
         """INSERT INTO fixtures
            (fixture_id, league_id, league_name, season, home_team, away_team,
-            commence_utc, status, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?)
+            home_team_id, away_team_id, commence_utc, status, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(fixture_id) DO UPDATE SET
              league_name=excluded.league_name,
              season=excluded.season,
+             home_team_id=excluded.home_team_id,
+             away_team_id=excluded.away_team_id,
              commence_utc=excluded.commence_utc,
              status=excluded.status,
              updated_at=excluded.updated_at""",
@@ -177,6 +192,29 @@ def get_fixtures_between(conn: sqlite3.Connection, start_utc: str,
 def checkpoint_wal(conn: sqlite3.Connection) -> None:
     """截断 WAL，避免长跑时文件膨胀。"""
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+
+def get_fixture_meta(conn: sqlite3.Connection, fixture_id: int):
+    """取单场比赛元信息（供基本面/精算用）。返回行或 None。"""
+    return conn.execute(
+        "SELECT fixture_id, league_id, league_name, season, home_team, away_team, "
+        "home_team_id, away_team_id, commence_utc FROM fixtures WHERE fixture_id=?",
+        (fixture_id,)).fetchone()
+
+
+def cleanup_old(conn: sqlite3.Connection, days: int = 30) -> tuple[int, int]:
+    """删除开球时间早于 days 天前的比赛及其盘口快照。返回 (删赛程数, 删快照数)。"""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    od = conn.execute(
+        "DELETE FROM odds_history WHERE fixture_id IN "
+        "(SELECT fixture_id FROM fixtures WHERE commence_utc < ?)", (cutoff,))
+    odds_n = od.rowcount
+    fx = conn.execute("DELETE FROM fixtures WHERE commence_utc < ?", (cutoff,))
+    fix_n = fx.rowcount
+    conn.commit()
+    return fix_n, odds_n
 
 
 # ─── 动态配置读写（供调度器读、TG bot 写）──────────────────────────────────

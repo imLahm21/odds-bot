@@ -1,10 +1,12 @@
 # ===== 密钥与配置 (绝不上传) =====
 .env
+.env.*
+auth.json
 *.pem
 *.key
 secrets.*
 
-# ===== 数据资产 (用备份, 不进 git) =====
+# ===== 数据资产 (用备份，不进 git) =====
 data/
 report/
 *.db
