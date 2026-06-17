@@ -136,6 +136,7 @@ HELP = (
     "/fixtures — 未来 3 天赛程\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
+    "/analyze &lt;fixture_id&gt; — LLM 精算（盘口+基本面跑SOP，1~3分钟）\n"
 )
 
 
@@ -233,15 +234,13 @@ def _cmd_odds(chat_id: int, args: list[str]) -> None:
     send(chat_id, "\n".join(lines[:40]))
 
 
-def _cmd_export(chat_id: int, args: list[str]) -> None:
-    """导出某场全部盘口快照为 CSV，对齐旧 main.py 格式（可直接喂精算 SOP）。"""
+def _build_csv(fid: int):
+    """查某场盘口快照，生成对齐旧 main.py 的 19 列 CSV 字符串。
+    返回 (csv_str, meta)；无数据返回 (None, None)。meta 含 home/away/league/rows。
+    """
     import csv
     import io
     from datetime import datetime, timezone, timedelta
-    if not args or not args[0].isdigit():
-        send(chat_id, "用法：/export &lt;fixture_id&gt;（id 见 /fixtures）")
-        return
-    fid = int(args[0])
     conn = db.get_conn()
     try:
         fx = conn.execute(
@@ -256,8 +255,7 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     finally:
         conn.close()
     if not rows:
-        send(chat_id, f"fixture {fid} 暂无盘口数据")
-        return
+        return None, None
 
     tz_cst = timezone(timedelta(hours=8))
 
@@ -276,7 +274,6 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     kick_cst = to_cst(fx[3]) if fx else ""
     market_zh = {"h2h": "欧指", "ah": "亚盘"}
 
-    # 旧 19 列格式
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["快照时间(CST)", "联赛", "开球时间(CST)", "主队", "客队",
@@ -296,13 +293,95 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
             kh if is_h2h else "", kd if is_h2h else "", ka if is_h2h else "",
             "" if is_h2h else hc, "" if is_h2h else hw, "" if is_h2h else aw,
             "" if is_h2h else khw, "" if is_h2h else kaw,
-            snap_cst,   # 数据更新(CST)：用抓取时刻近似（API update 字段未单独入库）
+            snap_cst,
         ])
-    content = ("﻿" + buf.getvalue()).encode("utf-8")
-    teams = f"{home}_vs_{away}".replace(" ", "_") if fx else str(fid)
-    caption = (f"{league} {home} vs {away}\n共 {len(rows)} 行快照"
-               if fx else f"fixture {fid}：{len(rows)} 行")
+    meta = {"home": home, "away": away, "league": league,
+            "kick_cst": kick_cst, "rows": len(rows)}
+    return buf.getvalue(), meta
+
+
+def _cmd_export(chat_id: int, args: list[str]) -> None:
+    """导出某场全部盘口快照为 CSV，对齐旧 main.py 格式（可直接喂精算 SOP）。"""
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/export &lt;fixture_id&gt;（id 见 /fixtures）")
+        return
+    fid = int(args[0])
+    csv_str, meta = _build_csv(fid)
+    if not csv_str:
+        send(chat_id, f"fixture {fid} 暂无盘口数据")
+        return
+    content = ("﻿" + csv_str).encode("utf-8")
+    teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
+    caption = f"{meta['league']} {meta['home']} vs {meta['away']}\n共 {meta['rows']} 行快照"
     send_document(chat_id, f"{teams}_stages.csv", content, caption)
+
+
+def _send_long(chat_id: int, text: str) -> None:
+    """长文本按 TG_MSG_MAX 拆段发送，优先在换行处断开。"""
+    limit = config.TG_MSG_MAX
+    while text:
+        if len(text) <= limit:
+            send(chat_id, text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        send(chat_id, text[:cut])
+        text = text[cut:].lstrip("\n")
+
+
+def _archive_report(meta: dict, report: str) -> str | None:
+    """把精算报告存一份 md 到 report/<开球日期>/<主队>_vs_<客队>_report.md。"""
+    import os
+    try:
+        date = (meta.get("kick_cst") or "")[:10] or "未知日期"
+        teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
+        out_dir = os.path.join("report", date)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{teams}_report.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)
+        return path
+    except Exception as e:
+        log.warning("报告归档失败: %s", e)
+        return None
+
+
+def _cmd_analyze(chat_id: int, args: list[str]) -> None:
+    """对某场比赛跑 LLM 精算：盘口CSV + 基本面 → SOP 报告 → 拆段发 + 归档。"""
+    from . import analyzer, fundamentals
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/analyze &lt;fixture_id&gt;（id 见 /fixtures）")
+        return
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法精算。")
+        return
+    fid = int(args[0])
+    csv_str, meta = _build_csv(fid)
+    if not csv_str:
+        send(chat_id, f"fixture {fid} 暂无盘口数据，无法分析")
+        return
+
+    send(chat_id, f"⏳ 正在精算 {meta['home']} vs {meta['away']}，"
+                  f"gpt-5.5 推理较慢，约 1~3 分钟，请稍候…")
+
+    # 拉基本面（失败不阻断）
+    try:
+        conn = db.get_conn()
+        try:
+            funds = fundamentals.build_fundamentals(conn, fid)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("基本面拉取失败: %s", e)
+        funds = "（基本面拉取失败）"
+
+    report = analyzer.analyze(csv_str, funds, meta["home"], meta["away"],
+                              meta["league"])
+    _send_long(chat_id, report)
+    path = _archive_report(meta, report)
+    if path:
+        send(chat_id, f"📁 报告已归档：{path}")
 
 
 def handle_message(msg: dict) -> None:
@@ -338,6 +417,8 @@ def handle_message(msg: dict) -> None:
         _cmd_odds(chat_id, args)
     elif cmd == "export":
         _cmd_export(chat_id, args)
+    elif cmd == "analyze":
+        _cmd_analyze(chat_id, args)
     else:
         send(chat_id, "未知命令，发 /help 看用法")
 

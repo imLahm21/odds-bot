@@ -225,6 +225,8 @@ def parse_fixtures_response(fixtures: list[dict], league_id: int,
             "season": season,
             "home_team": teams.get("home", {}).get("name", ""),
             "away_team": teams.get("away", {}).get("name", ""),
+            "home_team_id": teams.get("home", {}).get("id"),
+            "away_team_id": teams.get("away", {}).get("id"),
             "commence_utc": fx.get("date", ""),
             "status": fx.get("status", {}).get("short", ""),
         })

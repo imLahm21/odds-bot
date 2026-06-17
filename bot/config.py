@@ -161,3 +161,27 @@ TELEGRAM_API = "https://api.telegram.org"
 TG_POLL_TIMEOUT = 50          # long polling 超时（秒）
 TG_LEAGUES_PER_ROW = 2        # 联赛按钮每行个数
 TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
+TG_MSG_MAX = 4000             # 单条消息最大字符（Telegram 上限 4096，留余量）
+
+# ─── 旧数据清理 ──────────────────────────────────────────────────────────────
+CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
+
+# ─── LLM 精算 (/analyze) ─────────────────────────────────────────────────────
+# IKuncode（OpenAI 兼容），从 .env 读：
+#   LLM_BASE_URL=https://api.ikuncode.cc/v1
+#   LLM_API_KEY=sk-xxx
+LLM_MODEL = "gpt-5.5"
+LLM_TIMEOUT = 300             # 秒，gpt-5.5 high 推理 + 长报告，给足超时
+LLM_MAX_TOKENS = 8000         # 报告输出上限
+# 全量规则文件（相对项目根），按顺序拼接成 system prompt
+ANALYZE_RULE_FILES = [
+    "CLAUDE.md",
+    "rules/方法论/reference_asian_handicap.md",
+    "rules/方法论/reference_dynamic_analysis.md",
+    "rules/风控验证/reference_kelly_index.md",
+    "rules/实战教训/reference_case_lessons.md",
+    "rules/实战教训/reference_cases.md",
+]
+# 基本面拉取参数
+FUND_RECENT_N = 10            # 各队近 N 场
+FUND_H2H_N = 10               # 交锋近 N 场
