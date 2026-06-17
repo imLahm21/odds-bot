@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python _add_metrics.py)",
+      "Bash(mv 'case_2026_05_20_zhejiang_vs_shandong.md' '20260520_case_01_zhejiang_vs_shandong.md')",
+      "Bash(mv 'case_2026-05-20_Bournemouth_vs_Manchester_City.md' '20260520_case_02_bournemouth_vs_man_city.md')",
+      "Bash(mv 'feedback_shallow_opening_upgrade_lure.md' '20260520_feedback_01_shallow_opening_upgrade_lure.md')",
+      "Bash(mv 'feedback_shallow_opening_kelly_distortion.md' '20260520_feedback_02_shallow_opening_kelly_distortion.md')",
+      "Bash(mv 'feedback_csl_home_rebound_potential.md' '20260520_feedback_03_csl_home_rebound_potential.md')"
+    ]
+  }
+}

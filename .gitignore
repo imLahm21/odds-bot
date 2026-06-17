@@ -1,0 +1,32 @@
+# ===== 密钥与配置 (绝不上传) =====
+.env
+*.pem
+*.key
+secrets.*
+
+# ===== 数据资产 (用备份, 不进 git) =====
+data/
+report/
+*.db
+*.sqlite
+*.sqlite3
+*.xlsx
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== 无关文件 =====
+*.zip
+.recallloom/
+.tmp.drivedownload/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
