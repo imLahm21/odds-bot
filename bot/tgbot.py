@@ -15,6 +15,7 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
   /remove <id>        删除关注联赛
   /status             当前启用了哪些联赛/庄家
   /fixtures           过去 3 天 ~ 未来 3 天赛程
+  /coverage <fixture_id>  某场数据采集进度（10 节点缺漏一览）
   /odds <fixture_id>  某场最新盘口（Pinnacle/Bet365）
 """
 
@@ -162,6 +163,7 @@ HELP = (
     "/remove &lt;id&gt; — 删联赛\n"
     "/status — 当前启用项\n"
     "/fixtures — 过去 3 天 ~ 未来 3 天赛程（✅已开赛可复盘 / 🔵未来可精算）\n"
+    "/coverage &lt;fixture_id&gt; — 看某场数据采集进度（10 节点抓了几个、缺哪些）\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
@@ -250,6 +252,81 @@ def _cmd_fixtures(chat_id: int) -> None:
     for fid, commence, home, away in fixtures[:40]:
         mark = "✅" if kicked_off(commence) else "🔵"
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  {home} vs {away}")
+    send(chat_id, "\n".join(lines))
+
+
+def _cmd_coverage(chat_id: int, args: list[str]) -> None:
+    """查某场比赛的数据采集进度：10 节点哪些已抓/缺失、各节点快照数与庄家数、
+    距开球时长。用于跑 SOP 前判断数据是否够用。"""
+    from datetime import datetime, timezone, timedelta
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/coverage &lt;fixture_id&gt;（看某场数据采集到哪了）")
+        return
+    fid = int(args[0])
+    conn = db.get_conn()
+    try:
+        fx = conn.execute(
+            "SELECT home_team, away_team, league_name, commence_utc "
+            "FROM fixtures WHERE fixture_id=?", (fid,)).fetchone()
+        # 各节点：快照次数、去重庄家数、最近一次抓取时间
+        rows = conn.execute(
+            "SELECT node_label, COUNT(DISTINCT snapshot_utc) AS snaps, "
+            "COUNT(DISTINCT bookmaker_id) AS bms, MAX(snapshot_utc) AS last_snap "
+            "FROM odds_history WHERE fixture_id=? GROUP BY node_label",
+            (fid,)).fetchall()
+    finally:
+        conn.close()
+    if not fx:
+        send(chat_id, f"未找到 fixture {fid}（先 /fixtures 看可用 id）")
+        return
+
+    home, away, league, commence = fx[0], fx[1], fx[2], fx[3]
+    now = datetime.now(timezone.utc)
+    tz_cst = timezone(timedelta(hours=8))
+
+    def to_cst(iso_str):
+        if not iso_str:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return dt.astimezone(tz_cst).strftime("%m-%d %H:%M")
+        except (ValueError, AttributeError):
+            return iso_str
+
+    # 距开球时长（正=未开赛剩余，负=已开赛）
+    kick_line = to_cst(commence)
+    try:
+        kt = datetime.fromisoformat(commence.replace("Z", "+00:00"))
+        delta_h = (kt - now).total_seconds() / 3600
+        if delta_h >= 0:
+            till = f"距开球 {delta_h:.1f}h"
+        else:
+            till = f"已开赛 {-delta_h:.1f}h"
+    except (ValueError, AttributeError):
+        delta_h, till = None, "开球时间未知"
+
+    by_node = {r[0]: (r[1], r[2], r[3]) for r in rows if r[0]}
+    got = sum(1 for _, lbl in config.NODE_THRESHOLDS if lbl in by_node)
+    total = len(config.NODE_THRESHOLDS)
+
+    lines = [f"📡 <b>{home} vs {away}</b> 数据采集进度",
+             f"{league}  开球 {kick_line}（{till}）",
+             f"已采集 <b>{got}/{total}</b> 个节点：",
+             "<pre>节点    状态  快照×庄家  最近抓取"]
+    # 按 SOP 时间线顺序（初盘→即时）逐节点列出
+    for thresh, lbl in config.NODE_THRESHOLDS:
+        if lbl in by_node:
+            snaps, bms, last_snap = by_node[lbl]
+            lines.append(f"{lbl:<6} ✅    {snaps}×{bms:<6} {to_cst(last_snap)}")
+        else:
+            # 该节点是否「本该已过」：开球前 thresh 小时这个时点已到却没抓到
+            missed = delta_h is not None and delta_h < thresh
+            mark = "❌" if missed else "⬜"
+            lines.append(f"{lbl:<6} {mark}")
+    lines.append("</pre>")
+    lines.append("✅=已抓　❌=该时点已过却缺数据　⬜=尚未到该节点")
+    if got < total:
+        lines.append("\n数据越全 SOP 定性越准；缺初盘段会影响开盘深浅判断。")
     send(chat_id, "\n".join(lines))
 
 
@@ -765,6 +842,8 @@ def handle_message(msg: dict) -> None:
         _cmd_status(chat_id)
     elif cmd == "fixtures":
         _cmd_fixtures(chat_id)
+    elif cmd == "coverage":
+        _cmd_coverage(chat_id, args)
     elif cmd == "odds":
         _cmd_odds(chat_id, args)
     elif cmd == "export":
