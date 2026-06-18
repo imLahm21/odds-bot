@@ -867,6 +867,13 @@ def run_polling(stop_flag=lambda: False) -> None:
                 params["offset"] = offset
             r = requests.get(f"{API_BASE}/getUpdates", params=params, timeout=70)
             updates = r.json().get("result", [])
+            if updates:
+                log.info("收到 %d 个 update: %s", len(updates),
+                         [(u.get("update_id"),
+                           ("msg:" + u["message"].get("text", "")[:20])
+                           if "message" in u else
+                           ("cb:" + u.get("callback_query", {}).get("data", "")))
+                          for u in updates])
             for u in updates:
                 uid = u["update_id"]
                 offset = uid + 1            # 始终前移 offset 确认，避免重拉
