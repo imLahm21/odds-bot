@@ -17,8 +17,25 @@ from . import config
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip().rstrip("/")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+
+def _clean_header_value(raw: str) -> str:
+    """清洗将放进 HTTP 头的配置值。
+
+    从聊天/文档复制 key/url 时常混入非 ASCII 不可见字符（全角空格 U+3000、
+    零宽空格 U+200B、BOM 等），会导致 requests 编码请求头时
+    UnicodeEncodeError('latin-1')。这里去掉首尾常见不可见字符 + 所有非 ASCII，
+    并记录告警，避免整条命令崩溃。
+    """
+    s = raw.strip().strip("　​‌‍﻿\xa0")
+    ascii_only = s.encode("ascii", "ignore").decode("ascii")
+    if ascii_only != s:
+        log.warning("配置值含非 ASCII 字符，已剥离 %d 个（请检查 .env 是否复制带入"
+                    "全角符号）", len(s) - len(ascii_only))
+    return ascii_only
+
+
+LLM_BASE_URL = _clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
+LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
 _rules_cache: str | None = None
 
@@ -73,6 +90,10 @@ def _call_llm(system: str, user: str) -> str:
             or "LLM 返回空内容"
     except requests.exceptions.Timeout:
         return f"LLM 超时（>{config.LLM_TIMEOUT}s）。gpt-5.5 推理较慢，可稍后重试。"
+    except UnicodeEncodeError as e:
+        log.error("LLM 请求头编码失败（key/url 含非 ASCII 字符）: %s", e)
+        return ("LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时混入了"
+                "全角符号/空格）。请检查服务器 .env 后重启。")
     except requests.exceptions.RequestException as e:
         log.error("LLM 网络错误: %s", e)
         return f"LLM 网络错误：{e}"
@@ -128,6 +149,10 @@ def _stream_llm(system: str, user: str):
     except requests.exceptions.Timeout:
         yield ("error", f"LLM 超时（>{config.LLM_TIMEOUT}s）。"
                         f"gpt-5.5 推理较慢，可稍后重试。")
+    except UnicodeEncodeError as e:
+        log.error("LLM 请求头编码失败（key/url 含非 ASCII 字符）: %s", e)
+        yield ("error", "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时"
+                        "混入了全角符号/空格）。请检查服务器 .env 后重启。")
     except requests.exceptions.RequestException as e:
         log.error("LLM 流式网络错误: %s", e)
         yield ("error", f"LLM 网络错误：{e}")
