@@ -107,6 +107,32 @@ def send_document(chat_id: int, filename: str, content: bytes,
         log.warning("sendDocument 失败: %s", e)
 
 
+def setup_commands() -> None:
+    """注册命令菜单（setMyCommands）：用户在输入框打 / 会弹出命令列表，
+    左下角菜单按钮也会展示这些命令。启动时调一次即可，Telegram 端持久保存。
+    command 必须是全小写、不含 /；description 是右侧灰字说明。
+    """
+    commands = [
+        {"command": "help", "description": "查看全部命令用法"},
+        {"command": "fixtures", "description": "过去3天~未来3天赛程（含 fixture_id）"},
+        {"command": "coverage", "description": "看某场数据采集进度（10节点缺漏）"},
+        {"command": "analyze", "description": "对某场跑 SOP 精算预测"},
+        {"command": "review", "description": "对已结束的比赛做盘口复盘"},
+        {"command": "odds", "description": "查某场最新盘口"},
+        {"command": "export", "description": "导出某场全部盘口为 CSV"},
+        {"command": "leagues", "description": "联赛抓取开关面板"},
+        {"command": "bookmakers", "description": "庄家抓取开关面板"},
+        {"command": "status", "description": "当前启用了哪些联赛/庄家"},
+        {"command": "add", "description": "按 league_id 新增关注联赛"},
+        {"command": "remove", "description": "删除关注联赛"},
+    ]
+    resp = _post("setMyCommands", {"commands": commands})
+    if resp and resp.get("ok"):
+        log.info("命令菜单已注册（%d 条）", len(commands))
+    else:
+        log.warning("命令菜单注册失败: %s", resp)
+
+
 def _authorized(chat_id: int) -> bool:
     """白名单校验：未配置白名单时拒绝所有（防误开放）。"""
     if not ALLOWED_CHAT_IDS:
@@ -966,6 +992,7 @@ def run_polling(stop_flag=lambda: False) -> None:
         log.error("未配置 TELEGRAM_BOT_TOKEN，bot 不启动")
         return
     log.info("Telegram bot 启动，白名单 %d 人", len(ALLOWED_CHAT_IDS))
+    setup_commands()   # 注册 / 命令菜单（输入框打 / 弹出）
     offset = None
     last_processed = -1   # 已处理的最大 update_id，去重水位线（防同一 update 被重复消费）
 
