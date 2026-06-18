@@ -56,8 +56,8 @@ def main() -> None:
         sched = scheduler.build_scheduler(blocking=False)
         sched.start()
         log.info("调度器(后台)+Telegram bot 已启动："
-                 "任务A(每日%02d:%02d)/B(每%dh)/C(每%dmin)",
-                 scheduler.config.TASK_A_HOUR, scheduler.config.TASK_A_MINUTE,
+                 "任务A(每日%s点整)/B(每%dh)/C(每%dmin)",
+                 scheduler.config.TASK_A_HOURS,
                  scheduler.config.TASK_B_HOURS, scheduler.config.TASK_C_MINUTES)
         try:
             tgbot.run_polling()
@@ -70,8 +70,8 @@ def main() -> None:
         # 模式②：未配置 bot token，纯阻塞调度器
         log.info("未配置 TELEGRAM_BOT_TOKEN，仅运行调度器（无 bot）")
         sched = scheduler.build_scheduler(blocking=True)
-        log.info("调度器启动：任务A(每日%02d:%02d)/B(每%dh)/C(每%dmin)",
-                 scheduler.config.TASK_A_HOUR, scheduler.config.TASK_A_MINUTE,
+        log.info("调度器启动：任务A(每日%s点整)/B(每%dh)/C(每%dmin)",
+                 scheduler.config.TASK_A_HOURS,
                  scheduler.config.TASK_B_HOURS, scheduler.config.TASK_C_MINUTES)
         try:
             sched.start()

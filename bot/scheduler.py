@@ -1,7 +1,7 @@
 """
 调度层 —— 三档定时任务 A/B/C
 
-  任务 A（每日 01:07）：拉关注联赛未来赛程，upsert fixtures
+  任务 A（每日 02:00 / 14:00）：拉关注联赛未来赛程，upsert fixtures
   任务 B（每 2 小时）：拉未来 N 天比赛的最新赔率，存 odds_history
   任务 C（每 15 分钟）：仅对"开球前 2h 内"的比赛高频抓取
 
@@ -125,7 +125,7 @@ def build_scheduler(blocking: bool = True):
         from apscheduler.schedulers.background import BackgroundScheduler
         sched = BackgroundScheduler(timezone="Asia/Shanghai")
     sched.add_job(task_a_update_fixtures, "cron",
-                  hour=config.TASK_A_HOUR, minute=config.TASK_A_MINUTE,
+                  hour=config.TASK_A_HOURS, minute=config.TASK_A_MINUTE,
                   id="task_a", misfire_grace_time=3600)
     sched.add_job(task_b_regular_odds, "interval",
                   hours=config.TASK_B_HOURS, id="task_b",
