@@ -4,6 +4,7 @@
 对应 CLAUDE.md SOP 步骤：
   1b 球队近况  /fixtures?team=&last=N
   1c 历史交锋  /fixtures/headtohead?h2h=a-b&last=N
+  1d 未来赛程  /fixtures?team=&next=N（赛程密度/双线/轮换风险）
   1d 积分榜    /standings?league=&season=
 
 ⚠️ API-Football 无澳客网的「99家平均终指/365终指」，故 SOP 的「终指质量加权」
@@ -50,6 +51,19 @@ def _recent(team_id: int, team_name: str) -> str:
     if not matches:
         return f"【{team_name} 近况】无数据"
     lines = [f"【{team_name} 近 {len(matches)} 场】"]
+    lines += [f"  {_fmt_match(m, team_id)}" for m in matches]
+    return "\n".join(lines)
+
+
+def _upcoming(team_id: int, team_name: str) -> str:
+    """该队未来 N 场赛程（判赛程密度/双线作战/临近强敌/轮换风险）。
+    /fixtures?team=&next=N 返回未开赛比赛，_fmt_match 对其显示「未赛」。"""
+    data = api_client.api_get("/fixtures",
+                              {"team": team_id, "next": config.FUND_UPCOMING_N})
+    matches = (data or {}).get("response", []) if data else []
+    if not matches:
+        return f"【{team_name} 未来赛程】无数据"
+    lines = [f"【{team_name} 未来 {len(matches)} 场赛程】"]
     lines += [f"  {_fmt_match(m, team_id)}" for m in matches]
     return "\n".join(lines)
 
@@ -111,6 +125,8 @@ def build_fundamentals(conn, fixture_id: int) -> str:
         parts.append(_recent(home_id, home))
         parts.append(_recent(away_id, away))
         parts.append(_h2h(home_id, away_id, home, away))
+        parts.append(_upcoming(home_id, home))
+        parts.append(_upcoming(away_id, away))
         parts.append(_standings(league_id, season, home, away))
     except Exception as e:               # 基本面失败不应阻断精算
         log.warning("基本面拉取部分失败: %s", e)
