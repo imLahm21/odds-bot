@@ -37,6 +37,10 @@ ALLOWED_CHAT_IDS = {int(x) for x in _allowed_raw.replace(" ", "").split(",")
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
+# 等待用户回复自定义侧重的会话状态：chat_id -> fixture_id
+# 用户点「✍️ 自定义侧重」后置位，下一条非命令文本被当作侧重消费后清除。
+_pending_custom: dict[int, int] = {}
+
 
 # ─── Telegram HTTP 封装 ──────────────────────────────────────────────────────
 def _post(method: str, payload: dict) -> dict | None:
@@ -148,7 +152,7 @@ HELP = (
     "/fixtures — 未来 3 天赛程\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
-    "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选是否跑SOP预测\n"
+    "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
     "/review &lt;fixture_id&gt; — 对已结束的比赛做盘口复盘（盘口走势+实际比分）\n"
 )
 
@@ -539,19 +543,25 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
         funds = "（基本面拉取失败）"
     _send_long(chat_id, "🧩 <b>基本面</b>\n" + funds)
 
-    # 末条带「开始SOP精算」按钮
+    # 末条带「预设精算 / 自定义侧重」两个按钮
     if not analyzer.available():
         send(chat_id, "⚠️ 未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
                       "无法进行 SOP 精算预测，仅能查看上方数据。")
         return
     kb = {"inline_keyboard": [[
-        {"text": "🎯 开始 SOP 精算预测", "callback_data": f"az:{fid}"}]]}
+        {"text": "🎯 预设精算", "callback_data": f"az:{fid}"},
+        {"text": "✍️ 自定义侧重", "callback_data": f"ac:{fid}"},
+    ]]}
     send(chat_id, "以上为该场的基本面与盘口数据。是否用 SOP 跑结果预测？\n"
+                  "🎯 预设精算 = 直接按标准 SOP 跑；\n"
+                  "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
                   "（gpt-5.5 推理较慢，约 1~3 分钟）", kb)
 
 
-def _run_sop(chat_id: int, fid: int) -> None:
-    """第二步：真正跑 SOP 精算（由内联按钮 az:<fid> 触发）。"""
+def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
+    """第二步：真正跑 SOP 精算。
+    extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
+    """
     from . import fundamentals
     if not analyzer.available():
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法精算。")
@@ -573,7 +583,11 @@ def _run_sop(chat_id: int, fid: int) -> None:
         funds = "（基本面拉取失败）"
 
     # 流式精算 + 原地进度播报
-    title = f"⏳ 正在精算 {meta['home']} vs {meta['away']}（gpt-5.5，约 1~3 分钟）"
+    tag = "✍️自定义" if extra_instruction.strip() else "🎯预设"
+    title = (f"⏳ 正在精算 {meta['home']} vs {meta['away']}"
+             f"（{tag}，gpt-5.5，约 1~3 分钟）")
+    if extra_instruction.strip():
+        title += f"\n侧重：{extra_instruction.strip()[:80]}"
     total = analyzer._TOTAL_STAGES
     done_stages: list[str] = []
 
@@ -592,7 +606,8 @@ def _run_sop(chat_id: int, fid: int) -> None:
     msg_id = send(chat_id, progress_text(1, "数据提取"))
     report = None
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
-                                      meta["away"], meta["league"]):
+                                      meta["away"], meta["league"],
+                                      extra_instruction):
         if ev[0] == "stage":
             _, n, name = ev
             done_stages = [analyzer._STAGE_NAMES[i] for i in range(1, n)]
@@ -667,6 +682,24 @@ def handle_message(msg: dict) -> None:
                       f"把它加入服务器 .env 的 TELEGRAM_ALLOWED_CHAT_IDS 即可。")
         return
 
+    # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
+    if chat_id in _pending_custom:
+        fid = _pending_custom.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消"):
+            send(chat_id, "已取消自定义精算。")
+            return
+        if text.startswith("/"):
+            # 用户改发了别的命令，放弃自定义、按正常命令处理
+            send(chat_id, "（已取消上一条自定义精算输入，改为执行新命令）")
+        else:
+            send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
+            try:
+                _run_sop(chat_id, fid, extra_instruction=text)
+            except Exception:
+                log.exception("自定义 SOP 精算执行出错")
+                send(chat_id, "精算执行出错，请查看服务器日志。")
+            return
+
     parts = text.split()
     cmd = parts[0].lower().lstrip("/")
     args = parts[1:]
@@ -699,7 +732,10 @@ def handle_message(msg: dict) -> None:
 
 
 def handle_callback(cb: dict) -> None:
-    """处理内联按钮点击：tl:<league_id> / tb:<bookmaker_id> / az:<fixture_id>"""
+    """处理内联按钮点击：
+    tl:<league_id> / tb:<bookmaker_id> / az:<fixture_id>(预设精算) /
+    ac:<fixture_id>(自定义侧重，引导用户回复后再跑)
+    """
     cb_id = cb.get("id")
     data = cb.get("data", "")
     msg = cb.get("message", {})
@@ -719,6 +755,19 @@ def handle_callback(cb: dict) -> None:
         except Exception:
             log.exception("SOP 精算执行出错")
             send(chat_id, "精算执行出错，请查看服务器日志。")
+        return
+
+    # 自定义侧重按钮：置位待输入状态，引导用户回复一条侧重要求
+    if data.startswith("ac:"):
+        fid = int(data[3:])
+        answer_callback(cb_id, "请回复你的侧重要求")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        _pending_custom[chat_id] = fid
+        send(chat_id,
+             f"✍️ 请发一条消息，描述对 fixture {fid} 的精算侧重要求\n"
+             "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
+             "（直接发文字即可；发 /cancel 取消）",
+             {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
         return
 
     conn = db.get_conn()
