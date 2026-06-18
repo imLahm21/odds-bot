@@ -137,8 +137,11 @@ def _stream_llm(system: str, user: str):
                 d = json.loads(body)
             except json.JSONDecodeError:
                 continue
-            delta = (d.get("choices", [{}])[0].get("delta", {})
-                     .get("content", ""))
+            # 末尾常有只带 usage、choices 为空的收尾帧；choices[0] 前必须判空
+            choices = d.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0].get("delta") or {}).get("content", "")
             if delta:
                 acc += delta
                 yield ("delta", acc)
