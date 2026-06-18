@@ -843,6 +843,23 @@ def run_polling(stop_flag=lambda: False) -> None:
         return
     log.info("Telegram bot 启动，白名单 %d 人", len(ALLOWED_CHAT_IDS))
     offset = None
+    last_processed = -1   # 已处理的最大 update_id，去重水位线（防同一 update 被重复消费）
+
+    # 启动时丢弃积压 update：重启后 offset=None 会拉回 Telegram 保留(最长24h)的
+    # 所有未确认旧消息，导致历史命令被重新执行。offset=-1 仅取最后一条并据此
+    # 确认掉之前全部积压，避免重启重放。
+    try:
+        r0 = requests.get(f"{API_BASE}/getUpdates",
+                          params={"offset": -1, "timeout": 0}, timeout=15)
+        backlog = r0.json().get("result", [])
+        if backlog:
+            last_uid = backlog[-1]["update_id"]
+            offset = last_uid + 1
+            last_processed = last_uid   # 这些积压全部视为已处理，不再执行
+            log.info("启动丢弃积压 update（截至 update_id=%s）", last_uid)
+    except requests.exceptions.RequestException as e:
+        log.warning("启动清积压失败（忽略，继续）: %s", e)
+
     while not stop_flag():
         try:
             params = {"timeout": config.TG_POLL_TIMEOUT}
@@ -851,7 +868,12 @@ def run_polling(stop_flag=lambda: False) -> None:
             r = requests.get(f"{API_BASE}/getUpdates", params=params, timeout=70)
             updates = r.json().get("result", [])
             for u in updates:
-                offset = u["update_id"] + 1
+                uid = u["update_id"]
+                offset = uid + 1            # 始终前移 offset 确认，避免重拉
+                if uid <= last_processed:   # 已处理过的 update，跳过（去重）
+                    log.warning("跳过重复 update_id=%s", uid)
+                    continue
+                last_processed = uid
                 if "message" in u:
                     handle_message(u["message"])
                 elif "callback_query" in u:
