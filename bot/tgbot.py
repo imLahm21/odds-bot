@@ -25,7 +25,7 @@ import logging
 import requests
 from dotenv import load_dotenv
 
-from . import config, db, api_client, parser, analyzer
+from . import config, db, api_client, analyzer
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -190,7 +190,8 @@ def _cmd_remove(chat_id: int, args: list[str]) -> None:
 def _cmd_fixtures(chat_id: int) -> None:
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
-    start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 过去 3 天 ~ 未来 3 天：过去的可 /review 复盘，未来的可 /analyze 精算
+    start = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = db.get_conn()
     try:
@@ -198,13 +199,30 @@ def _cmd_fixtures(chat_id: int) -> None:
     finally:
         conn.close()
     if not fixtures:
-        send(chat_id, "未来 3 天暂无赛程（可能休赛期或赛程未拉取）")
+        send(chat_id, "过去/未来 3 天暂无赛程（可能休赛期或赛程未拉取）")
         return
-    lines = ["<b>未来 3 天赛程</b>"]
-    for fid, commence, home, away in fixtures[:30]:
-        cst = parser.node_label  # 仅借用模块；下面手动转时区
-        t = commence.replace("T", " ")[:16]
-        lines.append(f"<code>{fid}</code> {t}  {home} vs {away}")
+
+    tz_cst = timezone(timedelta(hours=8))
+
+    def to_cst(iso_str):
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return dt.astimezone(tz_cst).strftime("%m-%d %H:%M")
+        except (ValueError, AttributeError):
+            return iso_str.replace("T", " ")[:16]
+
+    def kicked_off(iso_str):
+        try:
+            return datetime.fromisoformat(iso_str.replace("Z", "+00:00")) <= now
+        except (ValueError, AttributeError):
+            return False
+
+    lines = ["<b>赛程（过去 3 天 ~ 未来 3 天）</b>",
+             "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
+    for fid, commence, home, away in fixtures[:40]:
+        mark = "✅" if kicked_off(commence) else "🔵"
+        lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  {home} vs {away}")
+    send(chat_id, "\n".join(lines))
     send(chat_id, "\n".join(lines))
 
 
