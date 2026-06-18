@@ -660,12 +660,44 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
                       f"无法复盘。请在比赛结束后再试。")
         return
 
-    send(chat_id, f"⏳ 正在复盘 {meta['home']} vs {meta['away']}\n"
-                  f"{result_text.splitlines()[0]}\n"
-                  f"gpt-5.5 推理较慢，约 1~3 分钟，请稍候…")
+    # 流式复盘 + 原地进度播报（6 步）
+    title = (f"⏳ 正在复盘 {meta['home']} vs {meta['away']}\n"
+             f"{result_text.splitlines()[0]}\n（gpt-5.5，约 1~3 分钟）")
+    total = analyzer._REVIEW_TOTAL_STAGES
 
-    report = analyzer.review(csv_str, result_text, meta["home"], meta["away"],
-                             meta["league"])
+    def progress_text(cur_n: int | None) -> str:
+        lines = [title, ""]
+        for n in range(1, total + 1):
+            name = analyzer._REVIEW_STAGE_NAMES[n]
+            if n < (cur_n or 0):
+                lines.append(f"✅ {n}. {name}")
+            elif n == cur_n:
+                lines.append(f"🔄 {n}. {name} …")
+            else:
+                lines.append(f"⬜ {n}. {name}")
+        return "\n".join(lines)
+
+    msg_id = send(chat_id, progress_text(1))
+    report = None
+    for ev in analyzer.review_stream(csv_str, result_text, meta["home"],
+                                     meta["away"], meta["league"]):
+        if ev[0] == "stage":
+            if msg_id:
+                edit_text(chat_id, msg_id, progress_text(ev[1]))
+        elif ev[0] == "done":
+            report = ev[1]
+        elif ev[0] == "error":
+            if msg_id:
+                edit_text(chat_id, msg_id, f"❌ 复盘失败：{ev[1]}")
+            else:
+                send(chat_id, f"❌ 复盘失败：{ev[1]}")
+            return
+
+    if not report:
+        send(chat_id, "❌ 复盘未产出报告，请稍后重试。")
+        return
+    if msg_id:
+        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 6 步完成，复盘如下：")
     _send_long(chat_id, report)
     path = _archive_report(meta, report, suffix="review")
     if path:

@@ -219,16 +219,9 @@ def analyze_stream(csv_text: str, fundamentals: str,
             yield ("error", payload)
 
 
-def review(csv_text: str, result_text: str,
-           home: str, away: str, league: str) -> str:
-    """已结束比赛的事后复盘：盘口全程走势 + 实际结果 → 信号有效性归因。
-
-    与 analyze 区别：这是赛后复盘而非赛前预测，不喂基本面、不读旧报告，
-    专注「盘口走势事前能多大程度预示此结果、哪些信号准/误导」。
-    """
-    if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
-
+def _review_prompts(csv_text: str, result_text: str,
+                    home: str, away: str, league: str) -> tuple[str, str]:
+    """构造复盘的 (system, user) prompt，供阻塞版与流式版共用。"""
     system = (
         load_rules()
         + "\n\n===== 任务（赛后复盘，非赛前预测）=====\n"
@@ -265,4 +258,56 @@ def review(csv_text: str, result_text: str,
         f"### 全程盘口快照（CSV）\n{csv_text}\n\n"
         f"### 最终结果\n{result_text}\n"
     )
+    return system, user
+
+
+def review(csv_text: str, result_text: str,
+           home: str, away: str, league: str) -> str:
+    """已结束比赛的事后复盘：盘口全程走势 + 实际结果 → 信号有效性归因。
+
+    与 analyze 区别：这是赛后复盘而非赛前预测，不喂基本面、不读旧报告，
+    专注「盘口走势事前能多大程度预示此结果、哪些信号准/误导」。
+    """
+    if not available():
+        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
+    system, user = _review_prompts(csv_text, result_text, home, away, league)
     return _call_llm(system, user)
+
+
+# 复盘报告 ### N. 段标题 → 进度阶段名
+_REVIEW_STAGE_NAMES = {
+    1: "实际结果",
+    2: "盘口结算回放",
+    3: "全程走势复核",
+    4: "信号有效性复盘",
+    5: "经验教训",
+    6: "盘口指示强度评分",
+}
+_REVIEW_TOTAL_STAGES = 6
+
+
+def review_stream(csv_text: str, result_text: str,
+                  home: str, away: str, league: str):
+    """流式复盘。yield 进度/结果事件（同 analyze_stream）：
+      ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
+      ('done', 完整报告)
+      ('error', 错误串)
+    """
+    import re
+    if not available():
+        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。")
+        return
+    system, user = _review_prompts(csv_text, result_text, home, away, league)
+    head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
+    seen: set[int] = set()
+    for kind, payload in _stream_llm(system, user):
+        if kind == "delta":
+            for m in head_re.finditer(payload):
+                n = int(m.group(1))
+                if n in _REVIEW_STAGE_NAMES and n not in seen:
+                    seen.add(n)
+                    yield ("stage", n, _REVIEW_STAGE_NAMES[n])
+        elif kind == "done":
+            yield ("done", payload)
+        elif kind == "error":
+            yield ("error", payload)
