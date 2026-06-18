@@ -127,6 +127,9 @@ def _stream_llm(system: str, user: str):
             log.error("LLM HTTP %s: %s", r.status_code, body)
             yield ("error", f"LLM 请求失败 HTTP {r.status_code}：{body}")
             return
+        # 强制 UTF-8 解码：部分网关流式响应头不声明 charset，requests 会
+        # 默认按 latin-1 解 iter_lines(decode_unicode=True) → 中文乱码。
+        r.encoding = "utf-8"
         for line in r.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
