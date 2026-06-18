@@ -177,8 +177,8 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         + "\n\n===== 任务 =====\n"
         "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
         "步骤1~7执行分析，按文档「输出格式」章节的结构输出完整精算报告。"
-        "盘口数据为 CSV，基本面为文本。注意：基本面来自 API-Football，"
-        "无99家终指数据，不要编造终指，按战绩/比分/排名/交锋综合加权。"
+        "盘口数据为 CSV，基本面为文本。注意：缺失的数据或节点不要编造，"
+        "按已有的盘口走势与战绩/比分/排名/交锋综合加权判断。"
     )
     if extra_instruction.strip():
         system += (
@@ -250,17 +250,35 @@ def analyze_stream(csv_text: str, fundamentals: str,
             yield ("error", payload)
 
 
-def _review_prompts(csv_text: str, result_text: str,
+def review_blind_stream(csv_text: str, home: str, away: str, league: str):
+    """复盘第一遍【盲推】：只喂盘口 CSV，不给比分、不给基本面，
+    让模型从上到下正向跑 SOP 步骤 1~7 得出赛前预判（它此时并不知道结果）。
+    直接复用 analyze_stream（基本面置空），阶段名沿用精算 7 段。
+    """
+    blind_note = ("（赛后复盘·第一遍盲推：本次不提供基本面与比赛结果，"
+                  "请仅依据盘口走势正向执行 SOP 步骤1~7，给出赛前预判结论。）")
+    yield from analyze_stream(csv_text, blind_note, home, away, league)
+
+
+def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
                     home: str, away: str, league: str) -> tuple[str, str]:
-    """构造复盘的 (system, user) prompt，供阻塞版与流式版共用。"""
+    """构造复盘第二遍【对照】的 (system, user)。
+
+    关键：第一遍已在不知道比分的情况下正向推出预判（forecast_text）。
+    本遍才揭晓真实比分，让模型对照「盲推预判 vs 实际结果」做归因，
+    而非拿结果倒推 SOP。
+    """
     system = (
         load_rules()
-        + "\n\n===== 任务（赛后复盘，非赛前预测）=====\n"
-        "你是拥有20年经验的庄家操盘手和数据精算师。现在对一场【已结束】的比赛"
-        "做事后复盘。已知该场全程盘口走势（CSV）与最终比分。请对照上述规则库的"
-        "军规、动态走势形态、凯利/返还率判别与既有实战教训，回放并检验盘口信号。"
-        "注意：本次复盘只依据盘口走势 + 实际结果，不使用基本面，也不要编造终指。\n\n"
-        "严格按以下结构输出复盘报告：\n"
+        + "\n\n===== 任务（赛后对照复盘）=====\n"
+        "你是拥有20年经验的庄家操盘手和数据精算师。这是一场【已结束】比赛的复盘"
+        "第二阶段。第一阶段已在【完全不知道比分】的前提下，仅凭盘口走势正向跑完"
+        "SOP 得出了赛前预判（见下方『第一遍盲推预判』）。现在揭晓真实比分，请你"
+        "对照【盲推预判】与【实际结果】做归因复盘。\n"
+        "要求：以第一遍的正向预判为基准做检验，不要重新拿结果倒推 SOP；"
+        "客观指出盲推哪里对、哪里错、为何错。只依据盘口走势 + 预判 + 实际结果，"
+        "不使用基本面，缺失数据不要编造。\n\n"
+        "严格按以下结构输出对照复盘报告：\n"
         "## 复盘：[主队] [比分] [客队]\n"
         "## 赛事：[联赛]  开球：[CST]\n\n"
         "### 1. 实际结果\n"
@@ -269,17 +287,16 @@ def _review_prompts(csv_text: str, result_text: str,
         "### 2. 盘口结算回放\n"
         "- 主流亚盘主盘口（如 -0.75）最终结算：上盘[赢/输/走水]，并说明赢半/输半\n"
         "- 关键节点其它盘口的结算结果\n\n"
-        "### 3. 全程走势复核\n"
-        "- 变盘路径回放（让球/水位/欧赔的时间线）\n"
-        "- 庄家赛前意图 vs 实际结果：是否兑现（诱上/诱下/阻盘/降赔是否奏效）\n"
-        "- 形态（给水/阻上/诱上）事后定性是否成立\n\n"
+        "### 3. 盲推预判 vs 实际对照\n"
+        "- 第一遍盲推的亚盘/胜平负/比分/置信度逐项列出\n"
+        "- 与实际结果逐项比对：命中 / 偏差 / 完全错\n\n"
         "### 4. 信号有效性复盘\n"
-        "- 正确信号：哪些变盘/凯利/水位/欧赔信号正确预示了结果\n"
-        "- 误导信号：哪些是噪音或反向\n"
+        "- 正确信号：盲推中哪些变盘/凯利/水位/欧赔信号正确预示了结果\n"
+        "- 误导信号：哪些把盲推带偏了（噪音或反向）\n"
         "- 凯利/返还率事后检验（报警是否兑现）\n\n"
         "### 5. 经验教训\n"
         "- 本场印证/修正了哪条军规或既有教训（引用规则库编号）\n"
-        "- 可沉淀的防错提醒\n\n"
+        "- 盲推若判错，根因是什么；可沉淀的防错提醒\n\n"
         "### 6. 盘口指示强度评分\n"
         "- 盘口对结果的预示强度：[0~100]（事前仅凭盘口能多大程度预判此结果）\n"
         "- 一句话总结\n"
@@ -287,29 +304,27 @@ def _review_prompts(csv_text: str, result_text: str,
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 全程盘口快照（CSV）\n{csv_text}\n\n"
-        f"### 最终结果\n{result_text}\n"
+        f"### 第一遍盲推预判（模型当时不知道比分）\n{forecast_text}\n\n"
+        f"### 实际结果（现在才揭晓）\n{result_text}\n"
     )
     return system, user
 
 
-def review(csv_text: str, result_text: str,
+def review(csv_text: str, forecast_text: str, result_text: str,
            home: str, away: str, league: str) -> str:
-    """已结束比赛的事后复盘：盘口全程走势 + 实际结果 → 信号有效性归因。
-
-    与 analyze 区别：这是赛后复盘而非赛前预测，不喂基本面、不读旧报告，
-    专注「盘口走势事前能多大程度预示此结果、哪些信号准/误导」。
-    """
+    """复盘第二遍对照（阻塞版）。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
-    system, user = _review_prompts(csv_text, result_text, home, away, league)
+    system, user = _review_prompts(csv_text, forecast_text, result_text,
+                                   home, away, league)
     return _call_llm(system, user)
 
 
-# 复盘报告 ### N. 段标题 → 进度阶段名
+# 复盘报告 ### N. 段标题 → 进度阶段名（对照复盘第二遍）
 _REVIEW_STAGE_NAMES = {
     1: "实际结果",
     2: "盘口结算回放",
-    3: "全程走势复核",
+    3: "盲推预判 vs 实际对照",
     4: "信号有效性复盘",
     5: "经验教训",
     6: "盘口指示强度评分",
@@ -317,18 +332,20 @@ _REVIEW_STAGE_NAMES = {
 _REVIEW_TOTAL_STAGES = 6
 
 
-def review_stream(csv_text: str, result_text: str,
+def review_stream(csv_text: str, forecast_text: str, result_text: str,
                   home: str, away: str, league: str):
-    """流式复盘。yield 进度/结果事件（同 analyze_stream）：
+    """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
       ('error', 错误串)
+    forecast_text 为第一遍盲推产出的预判全文。
     """
     import re
     if not available():
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。")
         return
-    system, user = _review_prompts(csv_text, result_text, home, away, league)
+    system, user = _review_prompts(csv_text, forecast_text, result_text,
+                                   home, away, league)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user):

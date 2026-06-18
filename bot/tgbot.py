@@ -725,7 +725,9 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
 
 
 def _cmd_review(chat_id: int, args: list[str]) -> None:
-    """对已结束的比赛做事后复盘：实时拉最终比分 + 盘口走势 → LLM 归因 → 归档。"""
+    """对已结束的比赛做【正向盲推 + 对照】复盘：
+    第一遍只喂盘口走势(不给比分)正向跑 SOP 得预判 → 第二遍揭晓真实比分做对照归因。
+    两遍各自实时播报进度，最后两份报告都发回并归档。"""
     from . import api_client
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/review &lt;fixture_id&gt;（对已结束的比赛复盘）")
@@ -751,8 +753,49 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
                       f"无法复盘。请在比赛结束后再试。")
         return
 
-    # 流式复盘 + 原地进度播报（6 步）
-    title = (f"⏳ 正在复盘 {meta['home']} vs {meta['away']}\n"
+    # ── 第一遍：盲推（只喂盘口，不给比分），正向跑 SOP 7 步 ──
+    send(chat_id, f"🔬 复盘分两步。第一步【盲推】：不看比分，仅凭盘口正向跑 SOP "
+                  f"得赛前预判（gpt-5.5，约 1~3 分钟）…")
+    blind_title = f"⏳ 第一步·盲推 {meta['home']} vs {meta['away']}（不看结果）"
+    total_a = analyzer._TOTAL_STAGES
+
+    def blind_progress(cur_n: int | None, cur_name: str | None) -> str:
+        lines = [blind_title, ""]
+        for n in range(1, total_a + 1):
+            name = analyzer._STAGE_NAMES[n]
+            if cur_n and n < cur_n:
+                lines.append(f"✅ {n}. {name}")
+            elif n == cur_n:
+                lines.append(f"🔄 {n}. {name} …")
+            else:
+                lines.append(f"⬜ {n}. {name}")
+        return "\n".join(lines)
+
+    msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]))
+    forecast = None
+    for ev in analyzer.review_blind_stream(csv_str, meta["home"],
+                                           meta["away"], meta["league"]):
+        if ev[0] == "stage":
+            if msg_a:
+                edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]))
+        elif ev[0] == "done":
+            forecast = ev[1]
+        elif ev[0] == "error":
+            if msg_a:
+                edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}")
+            else:
+                send(chat_id, f"❌ 盲推失败：{ev[1]}")
+            return
+    if not forecast:
+        send(chat_id, "❌ 盲推未产出预判，复盘中止。")
+        return
+    if msg_a:
+        edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
+    _send_long(chat_id, "🔮 第一步·盲推预判\n\n" + forecast)
+
+    # ── 第二遍：揭晓比分，对照归因（6 步）──
+    send(chat_id, "🎬 第二步【对照】：揭晓真实比分，对照盲推预判做归因复盘…")
+    title = (f"⏳ 第二步·对照复盘 {meta['home']} vs {meta['away']}\n"
              f"{result_text.splitlines()[0]}\n（gpt-5.5，约 1~3 分钟）")
     total = analyzer._REVIEW_TOTAL_STAGES
 
@@ -770,8 +813,8 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
 
     msg_id = send(chat_id, progress_text(1))
     report = None
-    for ev in analyzer.review_stream(csv_str, result_text, meta["home"],
-                                     meta["away"], meta["league"]):
+    for ev in analyzer.review_stream(csv_str, forecast, result_text,
+                                     meta["home"], meta["away"], meta["league"]):
         if ev[0] == "stage":
             if msg_id:
                 edit_text(chat_id, msg_id, progress_text(ev[1]))
@@ -779,18 +822,21 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
             report = ev[1]
         elif ev[0] == "error":
             if msg_id:
-                edit_text(chat_id, msg_id, f"❌ 复盘失败：{ev[1]}")
+                edit_text(chat_id, msg_id, f"❌ 对照复盘失败：{ev[1]}")
             else:
-                send(chat_id, f"❌ 复盘失败：{ev[1]}")
+                send(chat_id, f"❌ 对照复盘失败：{ev[1]}")
             return
 
     if not report:
-        send(chat_id, "❌ 复盘未产出报告，请稍后重试。")
+        send(chat_id, "❌ 对照复盘未产出报告，请稍后重试。")
         return
     if msg_id:
         edit_text(chat_id, msg_id, title + "\n\n✅ 全部 6 步完成，复盘如下：")
     _send_long(chat_id, report)
-    path = _archive_report(meta, report, suffix="review")
+    # 归档：盲推预判 + 对照复盘合并存一份
+    full = ("# 第一步·盲推预判（不看比分）\n\n" + forecast
+            + "\n\n---\n\n# 第二步·对照复盘\n\n" + report)
+    path = _archive_report(meta, full, suffix="review")
     if path:
         send(chat_id, f"📁 复盘已归档：{path}")
 
