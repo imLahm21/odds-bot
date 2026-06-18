@@ -78,12 +78,64 @@ def _call_llm(system: str, user: str) -> str:
         return f"LLM 网络错误：{e}"
 
 
-def analyze(csv_text: str, fundamentals: str,
-            home: str, away: str, league: str) -> str:
-    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
-    if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
+def _stream_llm(system: str, user: str):
+    """流式 chat/completions。逐增量 yield ('delta', 累积全文)；
+    正常结束 yield ('done', 全文)，出错 yield ('error', 错误串)。
+    """
+    import json
+    payload = {
+        "model": config.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": config.LLM_MAX_TOKENS,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    acc = ""
+    try:
+        r = requests.post(f"{LLM_BASE_URL}/chat/completions",
+                          json=payload, headers=headers, stream=True,
+                          timeout=config.LLM_TIMEOUT)
+        if r.status_code != 200:
+            body = r.text[:300]
+            log.error("LLM HTTP %s: %s", r.status_code, body)
+            yield ("error", f"LLM 请求失败 HTTP {r.status_code}：{body}")
+            return
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            body = line[6:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                d = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            delta = (d.get("choices", [{}])[0].get("delta", {})
+                     .get("content", ""))
+            if delta:
+                acc += delta
+                yield ("delta", acc)
+        if not acc.strip():
+            yield ("error", "LLM 返回空内容")
+            return
+        yield ("done", acc.strip())
+    except requests.exceptions.Timeout:
+        yield ("error", f"LLM 超时（>{config.LLM_TIMEOUT}s）。"
+                        f"gpt-5.5 推理较慢，可稍后重试。")
+    except requests.exceptions.RequestException as e:
+        log.error("LLM 流式网络错误: %s", e)
+        yield ("error", f"LLM 网络错误：{e}")
 
+
+def _analyze_prompts(csv_text: str, fundamentals: str,
+                     home: str, away: str, league: str) -> tuple[str, str]:
+    """构造精算的 (system, user) prompt，供阻塞版与流式版共用。"""
     system = (
         load_rules()
         + "\n\n===== 任务 =====\n"
@@ -97,7 +149,58 @@ def analyze(csv_text: str, fundamentals: str,
         f"### 盘口快照（CSV）\n{csv_text}\n\n"
         f"### 基本面\n{fundamentals}\n"
     )
+    return system, user
+
+
+def analyze(csv_text: str, fundamentals: str,
+            home: str, away: str, league: str) -> str:
+    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
+    if not available():
+        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
+    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league)
     return _call_llm(system, user)
+
+
+# SOP 报告主段标题 → 进度阶段名（按 ### N. 数字识别，子段 1b/1c/1d 不计）
+_STAGE_NAMES = {
+    1: "数据提取",
+    2: "盘口定性",
+    3: "资金流向与热度",
+    4: "操盘手法匹配",
+    5: "风控验证",
+    6: "缺失节点预测",
+    7: "最终精算结论",
+}
+_TOTAL_STAGES = 7
+
+
+def analyze_stream(csv_text: str, fundamentals: str,
+                   home: str, away: str, league: str):
+    """流式精算。yield 进度/结果事件，供 bot 实时播报：
+      ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
+      ('done', 完整报告)
+      ('error', 错误串)
+    阶段识别：检测累积全文里新出现的 `### N.` 主段标题。
+    """
+    import re
+    if not available():
+        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
+        return
+    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league)
+    # 匹配行首的 "### 3." / "###3." 等主段标题，捕获段号
+    head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
+    seen: set[int] = set()
+    for kind, payload in _stream_llm(system, user):
+        if kind == "delta":
+            for m in head_re.finditer(payload):
+                n = int(m.group(1))
+                if n in _STAGE_NAMES and n not in seen:
+                    seen.add(n)
+                    yield ("stage", n, _STAGE_NAMES[n])
+        elif kind == "done":
+            yield ("done", payload)
+        elif kind == "error":
+            yield ("error", payload)
 
 
 def review(csv_text: str, result_text: str,

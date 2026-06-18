@@ -48,17 +48,29 @@ def _post(method: str, payload: dict) -> dict | None:
         return None
 
 
-def send(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+def send(chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
+    """发消息，返回新消息的 message_id（失败返回 None）。"""
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    _post("sendMessage", payload)
+    resp = _post("sendMessage", payload)
+    try:
+        return resp["result"]["message_id"]
+    except (TypeError, KeyError):
+        return None
 
 
 def edit_markup(chat_id: int, message_id: int, reply_markup: dict) -> None:
     _post("editMessageReplyMarkup", {
         "chat_id": chat_id, "message_id": message_id,
         "reply_markup": reply_markup})
+
+
+def edit_text(chat_id: int, message_id: int, text: str) -> None:
+    """编辑已发消息的文字（用于原地更新进度）。"""
+    _post("editMessageText", {
+        "chat_id": chat_id, "message_id": message_id,
+        "text": text, "parse_mode": "HTML"})
 
 
 def answer_callback(callback_id: str, text: str = "") -> None:
@@ -549,9 +561,6 @@ def _run_sop(chat_id: int, fid: int) -> None:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法分析")
         return
 
-    send(chat_id, f"⏳ 正在精算 {meta['home']} vs {meta['away']}，"
-                  f"gpt-5.5 推理较慢，约 1~3 分钟，请稍候…")
-
     # 重新拉基本面（与展示步独立，确保用最新数据）
     try:
         conn = db.get_conn()
@@ -563,8 +572,46 @@ def _run_sop(chat_id: int, fid: int) -> None:
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
 
-    report = analyzer.analyze(csv_str, funds, meta["home"], meta["away"],
-                              meta["league"])
+    # 流式精算 + 原地进度播报
+    title = f"⏳ 正在精算 {meta['home']} vs {meta['away']}（gpt-5.5，约 1~3 分钟）"
+    total = analyzer._TOTAL_STAGES
+    done_stages: list[str] = []
+
+    def progress_text(cur_n: int | None, cur_name: str | None) -> str:
+        lines = [title, ""]
+        for n in range(1, total + 1):
+            name = analyzer._STAGE_NAMES[n]
+            if n < (cur_n or 0) or name in done_stages:
+                lines.append(f"✅ {n}. {name}")
+            elif n == cur_n:
+                lines.append(f"🔄 {n}. {name} …")
+            else:
+                lines.append(f"⬜ {n}. {name}")
+        return "\n".join(lines)
+
+    msg_id = send(chat_id, progress_text(1, "数据提取"))
+    report = None
+    for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
+                                      meta["away"], meta["league"]):
+        if ev[0] == "stage":
+            _, n, name = ev
+            done_stages = [analyzer._STAGE_NAMES[i] for i in range(1, n)]
+            if msg_id:
+                edit_text(chat_id, msg_id, progress_text(n, name))
+        elif ev[0] == "done":
+            report = ev[1]
+        elif ev[0] == "error":
+            if msg_id:
+                edit_text(chat_id, msg_id, f"❌ 精算失败：{ev[1]}")
+            else:
+                send(chat_id, f"❌ 精算失败：{ev[1]}")
+            return
+
+    if not report:
+        send(chat_id, "❌ 精算未产出报告，请稍后重试。")
+        return
+    if msg_id:
+        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 7 步完成，报告如下：")
     _send_long(chat_id, report)
     path = _archive_report(meta, report)
     if path:
