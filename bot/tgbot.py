@@ -14,7 +14,7 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
   /add <id> <season> [名称]   按 league_id 新增关注联赛
   /remove <id>        删除关注联赛
   /status             当前启用了哪些联赛/庄家
-  /fixtures           未来 3 天赛程
+  /fixtures           过去 3 天 ~ 未来 3 天赛程
   /odds <fixture_id>  某场最新盘口（Pinnacle/Bet365）
 """
 
@@ -46,15 +46,27 @@ _pending_custom: dict[int, int] = {}
 def _post(method: str, payload: dict) -> dict | None:
     try:
         r = requests.post(f"{API_BASE}/{method}", json=payload, timeout=60)
-        return r.json()
+        data = r.json()
+        # Telegram 业务错误（HTTP 200 但 ok=false，如 HTML 解析失败 400）以前被
+        # 静默吞掉，导致“归档了但消息没发出”。这里记日志便于排查。
+        if isinstance(data, dict) and not data.get("ok", True):
+            log.warning("Telegram %s 失败: %s", method,
+                        data.get("description", data))
+        return data
     except requests.exceptions.RequestException as e:
         log.warning("Telegram %s 失败: %s", method, e)
         return None
 
 
-def send(chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
-    """发消息，返回新消息的 message_id（失败返回 None）。"""
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+def send(chat_id: int, text: str, reply_markup: dict | None = None,
+         plain: bool = False) -> int | None:
+    """发消息，返回新消息的 message_id（失败返回 None）。
+    plain=True 时不带 parse_mode（纯文本），适合含 <>&| 的 LLM 报告，
+    避免被当 HTML 解析导致 400 整条发送失败。
+    """
+    payload = {"chat_id": chat_id, "text": text}
+    if not plain:
+        payload["parse_mode"] = "HTML"
     if reply_markup:
         payload["reply_markup"] = reply_markup
     resp = _post("sendMessage", payload)
@@ -149,7 +161,7 @@ HELP = (
     "/add &lt;id&gt; &lt;season&gt; [名称] — 按 ID 加联赛\n"
     "/remove &lt;id&gt; — 删联赛\n"
     "/status — 当前启用项\n"
-    "/fixtures — 未来 3 天赛程\n"
+    "/fixtures — 过去 3 天 ~ 未来 3 天赛程（✅已开赛可复盘 / 🔵未来可精算）\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
@@ -478,17 +490,20 @@ def _fmt_result(entry: dict) -> tuple[str, str] | tuple[None, None]:
     return "\n".join(parts), short
 
 
-def _send_long(chat_id: int, text: str) -> None:
-    """长文本按 TG_MSG_MAX 拆段发送，优先在换行处断开。"""
+def _send_long(chat_id: int, text: str, plain: bool = True) -> None:
+    """长文本按 TG_MSG_MAX 拆段发送，优先在换行处断开。
+    默认 plain=True（纯文本）：LLM 报告/基本面含 <>&| 等字符，HTML 模式会
+    400 整条失败。需要 HTML 渲染（如含 <pre> 表格的盘口走势）时传 plain=False。
+    """
     limit = config.TG_MSG_MAX
     while text:
         if len(text) <= limit:
-            send(chat_id, text)
+            send(chat_id, text, plain=plain)
             break
         cut = text.rfind("\n", 0, limit)
         if cut <= 0:
             cut = limit
-        send(chat_id, text[:cut])
+        send(chat_id, text[:cut], plain=plain)
         text = text[cut:].lstrip("\n")
 
 
@@ -527,8 +542,8 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
         send(chat_id, f"fixture {fid} 暂无盘口数据")
         return
 
-    # 盘口走势预览
-    _send_long(chat_id, digest)
+    # 盘口走势预览（含 <pre> 表格，需 HTML 渲染）
+    _send_long(chat_id, digest, plain=False)
     send(chat_id, f"已获取 {meta['nodes']} 个节点的盘口走势。正在拉取基本面…")
 
     # 基本面（读库 + 调 API，失败不阻断）
@@ -541,7 +556,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     except Exception as e:
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
-    _send_long(chat_id, "🧩 <b>基本面</b>\n" + funds)
+    _send_long(chat_id, "🧩 基本面\n" + funds)
 
     # 末条带「预设精算 / 自定义侧重」两个按钮
     if not analyzer.available():
