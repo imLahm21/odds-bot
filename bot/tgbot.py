@@ -251,7 +251,6 @@ def _cmd_fixtures(chat_id: int) -> None:
         mark = "✅" if kicked_off(commence) else "🔵"
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  {home} vs {away}")
     send(chat_id, "\n".join(lines))
-    send(chat_id, "\n".join(lines))
 
 
 def _cmd_odds(chat_id: int, args: list[str]) -> None:
