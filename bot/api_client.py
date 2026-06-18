@@ -123,3 +123,12 @@ def fetch_odds(fixture_id: int) -> list:
     """拉单场比赛的当前盘口。返回 response 列表（通常 1 个元素）。"""
     data = api_get("/odds", {"fixture": fixture_id})
     return (data or {}).get("response", []) if data else []
+
+
+def fetch_fixture_result(fixture_id: int) -> dict | None:
+    """拉单场比赛的最终状态与比分（供复盘用）。
+    返回 response[0]（含 fixture.status/goals/score/teams）或 None。
+    """
+    data = api_get("/fixtures", {"id": fixture_id})
+    resp = (data or {}).get("response", []) if data else []
+    return resp[0] if resp else None

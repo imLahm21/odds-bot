@@ -44,26 +44,8 @@ def available() -> bool:
     return bool(LLM_BASE_URL and LLM_API_KEY)
 
 
-def analyze(csv_text: str, fundamentals: str,
-            home: str, away: str, league: str) -> str:
-    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
-    if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
-
-    system = (
-        load_rules()
-        + "\n\n===== 任务 =====\n"
-        "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
-        "步骤1~7执行分析，按文档「输出格式」章节的结构输出完整精算报告。"
-        "盘口数据为 CSV，基本面为文本。注意：基本面来自 API-Football，"
-        "无99家终指数据，不要编造终指，按战绩/比分/排名/交锋综合加权。"
-    )
-    user = (
-        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
-        f"### 盘口快照（CSV）\n{csv_text}\n\n"
-        f"### 基本面\n{fundamentals}\n"
-    )
-
+def _call_llm(system: str, user: str) -> str:
+    """统一的 chat/completions 调用 + 错误处理；失败返回错误说明串。"""
     payload = {
         "model": config.LLM_MODEL,
         "messages": [
@@ -94,3 +76,74 @@ def analyze(csv_text: str, fundamentals: str,
     except requests.exceptions.RequestException as e:
         log.error("LLM 网络错误: %s", e)
         return f"LLM 网络错误：{e}"
+
+
+def analyze(csv_text: str, fundamentals: str,
+            home: str, away: str, league: str) -> str:
+    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
+    if not available():
+        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
+
+    system = (
+        load_rules()
+        + "\n\n===== 任务 =====\n"
+        "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
+        "步骤1~7执行分析，按文档「输出格式」章节的结构输出完整精算报告。"
+        "盘口数据为 CSV，基本面为文本。注意：基本面来自 API-Football，"
+        "无99家终指数据，不要编造终指，按战绩/比分/排名/交锋综合加权。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
+        f"### 盘口快照（CSV）\n{csv_text}\n\n"
+        f"### 基本面\n{fundamentals}\n"
+    )
+    return _call_llm(system, user)
+
+
+def review(csv_text: str, result_text: str,
+           home: str, away: str, league: str) -> str:
+    """已结束比赛的事后复盘：盘口全程走势 + 实际结果 → 信号有效性归因。
+
+    与 analyze 区别：这是赛后复盘而非赛前预测，不喂基本面、不读旧报告，
+    专注「盘口走势事前能多大程度预示此结果、哪些信号准/误导」。
+    """
+    if not available():
+        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
+
+    system = (
+        load_rules()
+        + "\n\n===== 任务（赛后复盘，非赛前预测）=====\n"
+        "你是拥有20年经验的庄家操盘手和数据精算师。现在对一场【已结束】的比赛"
+        "做事后复盘。已知该场全程盘口走势（CSV）与最终比分。请对照上述规则库的"
+        "军规、动态走势形态、凯利/返还率判别与既有实战教训，回放并检验盘口信号。"
+        "注意：本次复盘只依据盘口走势 + 实际结果，不使用基本面，也不要编造终指。\n\n"
+        "严格按以下结构输出复盘报告：\n"
+        "## 复盘：[主队] [比分] [客队]\n"
+        "## 赛事：[联赛]  开球：[CST]\n\n"
+        "### 1. 实际结果\n"
+        "- 全场比分 / 半场比分（如有加时·点球一并列出）\n"
+        "- 胜平负：[主胜/平/客胜]；总进球数与大小球倾向\n\n"
+        "### 2. 盘口结算回放\n"
+        "- 主流亚盘主盘口（如 -0.75）最终结算：上盘[赢/输/走水]，并说明赢半/输半\n"
+        "- 关键节点其它盘口的结算结果\n\n"
+        "### 3. 全程走势复核\n"
+        "- 变盘路径回放（让球/水位/欧赔的时间线）\n"
+        "- 庄家赛前意图 vs 实际结果：是否兑现（诱上/诱下/阻盘/降赔是否奏效）\n"
+        "- 形态（给水/阻上/诱上）事后定性是否成立\n\n"
+        "### 4. 信号有效性复盘\n"
+        "- 正确信号：哪些变盘/凯利/水位/欧赔信号正确预示了结果\n"
+        "- 误导信号：哪些是噪音或反向\n"
+        "- 凯利/返还率事后检验（报警是否兑现）\n\n"
+        "### 5. 经验教训\n"
+        "- 本场印证/修正了哪条军规或既有教训（引用规则库编号）\n"
+        "- 可沉淀的防错提醒\n\n"
+        "### 6. 盘口指示强度评分\n"
+        "- 盘口对结果的预示强度：[0~100]（事前仅凭盘口能多大程度预判此结果）\n"
+        "- 一句话总结\n"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
+        f"### 全程盘口快照（CSV）\n{csv_text}\n\n"
+        f"### 最终结果\n{result_text}\n"
+    )
+    return _call_llm(system, user)
