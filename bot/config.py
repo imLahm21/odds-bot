@@ -129,7 +129,9 @@ TASK_A_MINUTE = 7        # 错峰，避开整点
 TASK_B_HOURS = 2         # 常规赔率：每 2 小时
 TASK_C_MINUTES = 15      # 临场高频：每 15 分钟
 NEAR_KICKOFF_HOURS = 2.0 # 任务 C 的"临场"定义：开球前 2 小时内
-ODDS_DAYS_AHEAD = 3      # 任务 B 只抓未来 N 天内的比赛，省额度
+ODDS_DAYS_AHEAD = 4      # 任务 B 抓未来 N 天内的比赛。设 4(=96h)而非 3:
+                         # SOP 初盘①在 -72h，若窗口恰为 72h 该点落在边缘易抓漏；
+                         # 放宽到 96h 让 -72h 稳定落在窗口内，确保初盘①采到。
 
 # 每次请求之间的节流（秒），保护每分钟 300 限速
 REQUEST_THROTTLE_SEC = 0.3
