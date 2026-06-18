@@ -134,8 +134,13 @@ def _stream_llm(system: str, user: str):
 
 
 def _analyze_prompts(csv_text: str, fundamentals: str,
-                     home: str, away: str, league: str) -> tuple[str, str]:
-    """构造精算的 (system, user) prompt，供阻塞版与流式版共用。"""
+                     home: str, away: str, league: str,
+                     extra_instruction: str = "") -> tuple[str, str]:
+    """构造精算的 (system, user) prompt，供阻塞版与流式版共用。
+
+    extra_instruction: 用户自定义侧重，非空时追加到标准任务说明之后；
+    明确要求不违背 SOP 与输出格式，以保护进度条依赖的 ### 1~7 段落结构。
+    """
     system = (
         load_rules()
         + "\n\n===== 任务 =====\n"
@@ -144,6 +149,12 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         "盘口数据为 CSV，基本面为文本。注意：基本面来自 API-Football，"
         "无99家终指数据，不要编造终指，按战绩/比分/排名/交锋综合加权。"
     )
+    if extra_instruction.strip():
+        system += (
+            "\n\n===== 用户额外侧重 =====\n"
+            "在不违背上述 SOP 步骤与「输出格式」章节结构（必须保留 ### 1~7 各段标题）"
+            "的前提下，优先满足以下用户要求：\n" + extra_instruction.strip()
+        )
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 盘口快照（CSV）\n{csv_text}\n\n"
@@ -153,11 +164,13 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
 
 
 def analyze(csv_text: str, fundamentals: str,
-            home: str, away: str, league: str) -> str:
+            home: str, away: str, league: str,
+            extra_instruction: str = "") -> str:
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
-    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league)
+    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
+                                    extra_instruction)
     return _call_llm(system, user)
 
 
@@ -175,18 +188,21 @@ _TOTAL_STAGES = 7
 
 
 def analyze_stream(csv_text: str, fundamentals: str,
-                   home: str, away: str, league: str):
+                   home: str, away: str, league: str,
+                   extra_instruction: str = ""):
     """流式精算。yield 进度/结果事件，供 bot 实时播报：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
       ('done', 完整报告)
       ('error', 错误串)
     阶段识别：检测累积全文里新出现的 `### N.` 主段标题。
+    extra_instruction: 用户自定义侧重，透传给 _analyze_prompts。
     """
     import re
     if not available():
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
         return
-    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league)
+    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
+                                    extra_instruction)
     # 匹配行首的 "### 3." / "###3." 等主段标题，捕获段号
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
