@@ -187,3 +187,4 @@ ANALYZE_RULE_FILES = [
 # 基本面拉取参数
 FUND_RECENT_N = 10            # 各队近 N 场
 FUND_H2H_N = 10               # 交锋近 N 场
+FUND_UPCOMING_N = 5           # 各队未来 N 场赛程（判赛程密度/双线/轮换风险）
