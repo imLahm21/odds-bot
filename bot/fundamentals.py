@@ -6,8 +6,9 @@
   1c 历史交锋  /fixtures/headtohead?h2h=a-b&last=N
   1d 积分榜    /standings?league=&season=
 
-⚠️ API-Football 无澳客网的「99家平均终指/365终指」，故"终指质量加权"无法做，
-   文本末尾会显式标注此局限，让 LLM 知道按战绩/比分/排名加权即可。
+⚠️ API-Football 无澳客网的「99家平均终指/365终指」，故 SOP 的「终指质量加权」
+   这一条在自动流程里跳过（CLAUDE.md 已加护栏：无终指字段则不执行、不编造），
+   LLM 按战绩/比分/排名/交锋综合加权即可。
 """
 
 import logging
@@ -115,6 +116,5 @@ def build_fundamentals(conn, fixture_id: int) -> str:
         log.warning("基本面拉取部分失败: %s", e)
         parts.append(f"（基本面拉取出错：{e}）")
 
-    parts.append("⚠️ 数据来源 API-Football，无『99家平均终指/365终指』，"
-                 "无法做终指质量加权，请按战绩/比分/排名/交锋综合判断。")
+    parts.append("⚠️ 缺失的数据不要编造，请按以上战绩/比分/排名/交锋综合判断。")
     return "\n".join(parts)
