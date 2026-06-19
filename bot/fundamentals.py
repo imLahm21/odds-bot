@@ -91,18 +91,38 @@ def _standings(league_id: int, season: int,
         tables = resp[0]["league"]["standings"]
     except (KeyError, IndexError, TypeError):
         return "【积分榜】结构异常，跳过"
+
+    focus = {home_name, away_name}
+
+    def _row_line(row: dict) -> str:
+        name = row.get("team", {}).get("name", "")
+        all_ = row.get("all", {})
+        mark = " ◀" if name in focus else ""
+        return (f"  {row.get('rank')}. {name} 积分{row.get('points')} "
+                f"{all_.get('win')}-{all_.get('draw')}-{all_.get('lose')}{mark}")
+
+    # 世界杯/杯赛分小组：每个 table 是一个小组。只列两队所在小组的完整排名，
+    # 组内比较才有意义——把所有组拉平成一张表会误导（小组赛积分不跨组可比）。
+    focus_tables = [t for t in tables
+                    if any(r.get("team", {}).get("name") in focus for r in t)]
+
+    if len(tables) > 1 and focus_tables:
+        # 分组赛制：只展示两队所在小组（同场比赛通常同组），列出整组
+        lines = ["【积分榜（两队所在小组完整排名，仅组内可比）】"]
+        for table in focus_tables:
+            grp = (table[0].get("group") if table else None) or "本组"
+            lines.append(f"〔{grp}〕")
+            lines += [_row_line(r) for r in table]
+        return "\n".join(lines)
+
+    # 单表联赛（非分组）：列两队 + 前4
     lines = ["【积分榜（仅列两队及前4）】"]
     for table in tables:
         for row in table:
             name = row.get("team", {}).get("name", "")
             rank = row.get("rank")
-            is_focus = name in (home_name, away_name)
-            if rank and rank <= 4 or is_focus:
-                all_ = row.get("all", {})
-                mark = " ◀" if is_focus else ""
-                lines.append(
-                    f"  {rank}. {name} 积分{row.get('points')} "
-                    f"{all_.get('win')}-{all_.get('draw')}-{all_.get('lose')}{mark}")
+            if (rank and rank <= 4) or name in focus:
+                lines.append(_row_line(row))
     return "\n".join(lines)
 
 
