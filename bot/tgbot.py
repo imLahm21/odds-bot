@@ -57,6 +57,38 @@ API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 # 用户点「✍️ 自定义侧重」后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, int] = {}
 
+# 访客每日 /analyze 计数：chat_id -> (日期字符串, 当日已用次数)。
+# 进程内存储，重启清零；跨天自动重置。管理员不计数、不受限。
+_analyze_usage: dict[int, tuple[str, int]] = {}
+
+
+def _today_cst() -> str:
+    """北京时间的日期字符串（跨天判定用，与抓取时区一致）。"""
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _analyze_quota_left(chat_id: int) -> int:
+    """返回该 chat 今日 /analyze 剩余次数。管理员或未设限时返回一个大数（视为无限）。"""
+    limit = config.VISITOR_ANALYZE_DAILY_LIMIT
+    if _is_admin(chat_id) or limit <= 0:
+        return 1 << 30
+    day, used = _analyze_usage.get(chat_id, ("", 0))
+    if day != _today_cst():
+        used = 0
+    return max(0, limit - used)
+
+
+def _analyze_consume(chat_id: int) -> None:
+    """记一次 /analyze 使用（管理员/未设限时不计）。"""
+    if _is_admin(chat_id) or config.VISITOR_ANALYZE_DAILY_LIMIT <= 0:
+        return
+    today = _today_cst()
+    day, used = _analyze_usage.get(chat_id, ("", 0))
+    if day != today:
+        used = 0
+    _analyze_usage[chat_id] = (today, used + 1)
+
 
 # ─── Telegram HTTP 封装 ──────────────────────────────────────────────────────
 def _post(method: str, payload: dict) -> dict | None:
@@ -673,6 +705,11 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/analyze &lt;fixture_id&gt;（id 见 /fixtures）")
         return
+    # 访客每日 /analyze 限额（管理员不限）。无额度则提前拒绝，不浪费 API 拉基本面。
+    if _analyze_quota_left(chat_id) <= 0:
+        send(chat_id, f"⛔ 你今日的精算次数已用完（每日上限 "
+                      f"{config.VISITOR_ANALYZE_DAILY_LIMIT} 次），请明天再试。")
+        return
     fid = int(args[0])
     digest, meta = _odds_digest(fid)
     if not digest:
@@ -722,6 +759,16 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
     if not csv_str:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法分析")
         return
+
+    # 访客每日限额权威卡点：确认有数据、真正发起 LLM 前才检查并计数。
+    if _analyze_quota_left(chat_id) <= 0:
+        send(chat_id, f"⛔ 你今日的精算次数已用完（每日上限 "
+                      f"{config.VISITOR_ANALYZE_DAILY_LIMIT} 次），请明天再试。")
+        return
+    _analyze_consume(chat_id)
+    left = _analyze_quota_left(chat_id)
+    if not _is_admin(chat_id) and config.VISITOR_ANALYZE_DAILY_LIMIT > 0:
+        send(chat_id, f"（本次精算已计入，今日剩余 {left} 次）")
 
     # 重新拉基本面（与展示步独立，确保用最新数据）
     try:

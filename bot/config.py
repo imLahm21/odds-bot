@@ -166,6 +166,8 @@ TG_POLL_TIMEOUT = 50          # long polling 超时（秒）
 TG_LEAGUES_PER_ROW = 2        # 联赛按钮每行个数
 TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
 TG_MSG_MAX = 4000             # 单条消息最大字符（Telegram 上限 4096，留余量）
+# 访客每日 /analyze 次数上限（管理员不受限）。防额度被刷；0 或负数=不限制。
+VISITOR_ANALYZE_DAILY_LIMIT = 10
 
 # ─── 旧数据清理 ──────────────────────────────────────────────────────────────
 CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
