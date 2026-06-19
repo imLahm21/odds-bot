@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS watched_bookmakers (
     name         TEXT,
     enabled      INTEGER NOT NULL DEFAULT 1
 );
+
+-- 访客每日 /analyze 用量：按 (chat_id, 北京日期) 计数，持久化以防重启清零
+CREATE TABLE IF NOT EXISTS analyze_usage (
+    chat_id  INTEGER NOT NULL,
+    day      TEXT NOT NULL,            -- 北京时间 YYYY-MM-DD
+    used     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, day)
+);
 """
 
 # odds_history 批量插入用的列顺序（与 parser 产出的行字典对齐）
@@ -215,6 +223,25 @@ def cleanup_old(conn: sqlite3.Connection, days: int = 30) -> tuple[int, int]:
     fix_n = fx.rowcount
     conn.commit()
     return fix_n, odds_n
+
+
+# ─── 访客 /analyze 每日用量（持久化，防重启清零）────────────────────────────
+def get_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
+    """取某 chat 在某北京日期已用的 /analyze 次数（无记录返回 0）。"""
+    row = conn.execute(
+        "SELECT used FROM analyze_usage WHERE chat_id=? AND day=?",
+        (chat_id, day)).fetchone()
+    return row[0] if row else 0
+
+
+def incr_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
+    """该 chat 当日用量 +1，返回自增后的值。UPSERT，跨天自然分行。"""
+    conn.execute(
+        "INSERT INTO analyze_usage (chat_id, day, used) VALUES (?,?,1) "
+        "ON CONFLICT(chat_id, day) DO UPDATE SET used = used + 1",
+        (chat_id, day))
+    conn.commit()
+    return get_analyze_used(conn, chat_id, day)
 
 
 # ─── 动态配置读写（供调度器读、TG bot 写）──────────────────────────────────
