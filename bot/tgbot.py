@@ -32,9 +32,24 @@ load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-_allowed_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
-ALLOWED_CHAT_IDS = {int(x) for x in _allowed_raw.replace(" ", "").split(",")
-                    if x.lstrip("-").isdigit()}
+
+
+def _parse_ids(raw: str) -> set[int]:
+    return {int(x) for x in raw.replace(" ", "").split(",")
+            if x.lstrip("-").isdigit()}
+
+
+# 两级权限：
+#   ADMIN  —— 管理员，全部命令（含改联赛/庄家配置）。即 TELEGRAM_ADMIN_CHAT_IDS。
+#   ALLOWED —— 能用 bot 的全体（管理员 + 访客）。访客只能查询/精算/复盘，
+#             不能改配置。为向后兼容：管理员自动并入 ALLOWED，老配置不写
+#             ADMIN 时退化为「ALLOWED 全员皆管理员」（与旧行为一致）。
+ADMIN_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ADMIN_CHAT_IDS", ""))
+ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
+    | ADMIN_CHAT_IDS
+
+# 仅管理员可用的配置类命令（访客调用会被拒绝）
+_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
@@ -141,6 +156,15 @@ def _authorized(chat_id: int) -> bool:
     return chat_id in ALLOWED_CHAT_IDS
 
 
+def _is_admin(chat_id: int) -> bool:
+    """管理员判定。未单独配 TELEGRAM_ADMIN_CHAT_IDS 时，退化为
+    「ALLOWED 全员皆管理员」——与未引入访客概念前的旧行为一致，
+    避免老部署升级后突然没人能改配置。"""
+    if not ADMIN_CHAT_IDS:
+        return chat_id in ALLOWED_CHAT_IDS
+    return chat_id in ADMIN_CHAT_IDS
+
+
 # ─── 内联键盘构建 ────────────────────────────────────────────────────────────
 def _leagues_keyboard() -> dict:
     conn = db.get_conn()
@@ -181,20 +205,31 @@ def _bookmakers_keyboard() -> dict:
 
 
 # ─── 命令处理 ────────────────────────────────────────────────────────────────
-HELP = (
+# 访客可见命令（查询 + 精算/复盘）
+_HELP_VISITOR = (
     "<b>赔率轮询 bot</b>\n\n"
-    "/leagues — 联赛开关面板\n"
-    "/bookmakers — 庄家开关面板\n"
-    "/add &lt;id&gt; &lt;season&gt; [名称] — 按 ID 加联赛\n"
-    "/remove &lt;id&gt; — 删联赛\n"
-    "/status — 当前启用项\n"
     "/fixtures — 过去 3 天 ~ 未来 3 天赛程（✅已开赛可复盘 / 🔵未来可精算）\n"
     "/coverage &lt;fixture_id&gt; — 看某场数据采集进度（10 节点抓了几个、缺哪些）\n"
     "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
     "/review &lt;fixture_id&gt; — 对已结束的比赛做盘口复盘（盘口走势+实际比分）\n"
+    "/status — 当前启用项\n"
 )
+# 管理员附加的配置类命令
+_HELP_ADMIN_EXTRA = (
+    "\n<b>管理员命令</b>\n"
+    "/leagues — 联赛开关面板\n"
+    "/bookmakers — 庄家开关面板\n"
+    "/add &lt;id&gt; &lt;season&gt; [名称] — 按 ID 加联赛\n"
+    "/remove &lt;id&gt; — 删联赛\n"
+)
+HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
+
+
+def _help_for(chat_id: int) -> str:
+    """按身份返回帮助：管理员看全部，访客只看查询/分析命令。"""
+    return HELP if _is_admin(chat_id) else _HELP_VISITOR
 
 
 def _cmd_status(chat_id: int) -> None:
@@ -899,8 +934,14 @@ def handle_message(msg: dict) -> None:
     cmd = parts[0].lower().lstrip("/")
     args = parts[1:]
 
+    # 配置类命令仅管理员可用；访客只能查询/精算/复盘
+    if cmd in _ADMIN_ONLY_CMDS and not _is_admin(chat_id):
+        send(chat_id, "⛔ 该命令仅管理员可用。你可以用 /fixtures 选比赛，"
+                      "再用 /analyze 或 /review 分析。发 /help 看可用命令。")
+        return
+
     if cmd in ("start", "help"):
-        send(chat_id, HELP)
+        send(chat_id, _help_for(chat_id))
     elif cmd == "leagues":
         send(chat_id, "点击切换联赛抓取开关（✅启用 / ⬜停用）：",
              _leagues_keyboard())
@@ -965,6 +1006,11 @@ def handle_callback(cb: dict) -> None:
              "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
              "（直接发文字即可；发 /cancel 取消）",
              {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
+        return
+
+    # 配置类按钮（联赛/庄家开关）仅管理员可点
+    if data.startswith(("tl:", "tb:")) and not _is_admin(chat_id):
+        answer_callback(cb_id, "仅管理员可改配置")
         return
 
     conn = db.get_conn()
