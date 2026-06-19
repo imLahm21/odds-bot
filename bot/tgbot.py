@@ -57,11 +57,8 @@ API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 # 用户点「✍️ 自定义侧重」后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, int] = {}
 
-# 访客每日 /analyze 计数：chat_id -> (日期字符串, 当日已用次数)。
-# 进程内存储，重启清零；跨天自动重置。管理员不计数、不受限。
-_analyze_usage: dict[int, tuple[str, int]] = {}
-
-
+# 访客每日 /analyze 计数：持久化在 odds.db 的 analyze_usage 表（重启不清零，
+# 跨北京日期自然分行）。管理员不计数、不受限。
 def _today_cst() -> str:
     """北京时间的日期字符串（跨天判定用，与抓取时区一致）。"""
     from datetime import datetime, timezone, timedelta
@@ -73,9 +70,11 @@ def _analyze_quota_left(chat_id: int) -> int:
     limit = config.VISITOR_ANALYZE_DAILY_LIMIT
     if _is_admin(chat_id) or limit <= 0:
         return 1 << 30
-    day, used = _analyze_usage.get(chat_id, ("", 0))
-    if day != _today_cst():
-        used = 0
+    conn = db.get_conn()
+    try:
+        used = db.get_analyze_used(conn, chat_id, _today_cst())
+    finally:
+        conn.close()
     return max(0, limit - used)
 
 
@@ -83,11 +82,11 @@ def _analyze_consume(chat_id: int) -> None:
     """记一次 /analyze 使用（管理员/未设限时不计）。"""
     if _is_admin(chat_id) or config.VISITOR_ANALYZE_DAILY_LIMIT <= 0:
         return
-    today = _today_cst()
-    day, used = _analyze_usage.get(chat_id, ("", 0))
-    if day != today:
-        used = 0
-    _analyze_usage[chat_id] = (today, used + 1)
+    conn = db.get_conn()
+    try:
+        db.incr_analyze_used(conn, chat_id, _today_cst())
+    finally:
+        conn.close()
 
 
 # ─── Telegram HTTP 封装 ──────────────────────────────────────────────────────
@@ -676,15 +675,22 @@ def _send_long(chat_id: int, text: str, plain: bool = True) -> None:
         text = text[cut:].lstrip("\n")
 
 
-def _archive_report(meta: dict, report: str, suffix: str = "report") -> str | None:
-    """把报告存一份 md 到 report/<开球日期>/<主队>_vs_<客队>_<suffix>.md。
+def _archive_report(meta: dict, report: str, suffix: str = "report",
+                    chat_id: int | None = None) -> str | None:
+    """把报告存一份 md。
+    - 管理员（或 chat_id 缺省）：report/<开球日期>/<主队>_vs_<客队>_<suffix>.md
+    - 访客：report/visitors/<chat_id>/<开球日期>/<...>.md
+      每个访客有独立专用文件夹（用其 chat_id 命名），互不混淆、便于审计。
     suffix: 'report'（精算）或 'review'（复盘）。
     """
     import os
     try:
         date = (meta.get("kick_cst") or "")[:10] or "未知日期"
         teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
-        out_dir = os.path.join("report", date)
+        if chat_id is not None and not _is_admin(chat_id):
+            out_dir = os.path.join("report", "visitors", str(chat_id), date)
+        else:
+            out_dir = os.path.join("report", date)
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{teams}_{suffix}.md")
         with open(path, "w", encoding="utf-8") as f:
@@ -827,7 +833,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
     if msg_id:
         edit_text(chat_id, msg_id, title + "\n\n✅ 全部 7 步完成，报告如下：")
     _send_long(chat_id, report)
-    path = _archive_report(meta, report)
+    path = _archive_report(meta, report, chat_id=chat_id)
     if path:
         send(chat_id, f"📁 报告已归档：{path}")
 
@@ -944,7 +950,7 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
     # 归档：盲推预判 + 对照复盘合并存一份
     full = ("# 第一步·盲推预判（不看比分）\n\n" + forecast
             + "\n\n---\n\n# 第二步·对照复盘\n\n" + report)
-    path = _archive_report(meta, full, suffix="review")
+    path = _archive_report(meta, full, suffix="review", chat_id=chat_id)
     if path:
         send(chat_id, f"📁 复盘已归档：{path}")
 
