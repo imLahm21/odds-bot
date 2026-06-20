@@ -38,6 +38,7 @@ LLM_BASE_URL = _clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
 LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
 _rules_cache: str | None = None
+_live_rules_cache: str | None = None
 
 
 def load_rules() -> str:
@@ -55,6 +56,23 @@ def load_rules() -> str:
     _rules_cache = "".join(parts)
     log.info("规则已加载，共 %d 字符", len(_rules_cache))
     return _rules_cache
+
+
+def load_live_rules() -> str:
+    """读取走地规则文件，独立缓存(不混进赛前 SOP 规则)。"""
+    global _live_rules_cache
+    if _live_rules_cache is not None:
+        return _live_rules_cache
+    parts = []
+    for rel in config.LIVE_RULE_FILES:
+        try:
+            with open(rel, encoding="utf-8") as f:
+                parts.append(f"\n\n===== {rel} =====\n{f.read()}")
+        except FileNotFoundError:
+            log.warning("走地规则文件缺失，跳过: %s", rel)
+    _live_rules_cache = "".join(parts)
+    log.info("走地规则已加载，共 %d 字符", len(_live_rules_cache))
+    return _live_rules_cache
 
 
 def available() -> bool:
@@ -229,6 +247,30 @@ def analyze(csv_text: str, fundamentals: str,
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
+    return _call_llm(system, user)
+
+
+def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
+               elapsed, score: str) -> str:
+    """走地实时研判(非流式，要快)。喂走地规则库 + 当前主盘口走势 + 异动 + 比分分钟，
+    让 LLM 给一段简短研判(看大/看小/看反超/封盘观望)。失败返回错误串。
+    走地不分 7 段(那是赛前)，只要一段结论。"""
+    if not available():
+        return ""   # 未配置 LLM 时静默(推送仍会带盘口快报)
+    system = (
+        load_live_rules()
+        + "\n\n===== 任务(走地实时研判) =====\n"
+        "你是拥有20年经验的走地操盘手。下面是一场【进行中】比赛的实时滚球盘口与"
+        "刚检测到的异动。请严格依据上述走地规则，给出一段【简短】研判(3~5句话即可，"
+        "不要分段、不要套赛前7步格式)：当前盘口在暗示什么(看大/看小/看反超/看封盘观望)、"
+        "异动的操盘含义、以及接下来值得关注的方向。数据缺失不要编造。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n"
+        f"## 当前：第 {elapsed} 分钟，比分 {score}\n\n"
+        f"### 检测到的异动\n" + "\n".join(f"- {d}" for d in deltas) + "\n\n"
+        f"### 当前走地主盘口\n{live_lines}\n"
+    )
     return _call_llm(system, user)
 
 
