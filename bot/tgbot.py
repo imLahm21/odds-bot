@@ -452,6 +452,11 @@ def _cmd_odds(chat_id: int, args: list[str]) -> None:
 def _build_csv(fid: int):
     """查某场盘口快照，生成对齐旧 main.py 的 19 列 CSV 字符串。
     返回 (csv_str, meta)；无数据返回 (None, None)。meta 含 home/away/league/rows。
+
+    ⚠️ 按 SOP「10 节点」去重：任务 C 每 15 分钟抓一次，同一节点会被重复采
+    （曾见单场 3855 行 / 50 次快照），全量喂 LLM 会撑爆上下文窗（实测 prompt
+    达 39 万 token → completion_tokens=0、finish_reason=stop 空内容）。故每个
+    (节点 × 庄家 × market × 让球) 只取该节点最新一条，行数压到约 1/10，恰合 SOP 语义。
     """
     import csv
     import io
@@ -465,7 +470,12 @@ def _build_csv(fid: int):
             "SELECT snapshot_utc, node_label, bookmaker, market, "
             "home_odds, draw_odds, away_odds, kelly_home, kelly_draw, kelly_away, "
             "handicap, home_water, away_water, kelly_h_water, kelly_a_water "
-            "FROM odds_history WHERE fixture_id=? "
+            "FROM ("
+            "  SELECT *, ROW_NUMBER() OVER ("
+            "    PARTITION BY node_label, bookmaker_id, market, handicap "
+            "    ORDER BY snapshot_utc DESC) AS rn "
+            "  FROM odds_history WHERE fixture_id=?"
+            ") WHERE rn=1 "
             "ORDER BY snapshot_utc, bookmaker, market, handicap", (fid,)).fetchall()
     finally:
         conn.close()
