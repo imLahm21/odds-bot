@@ -169,7 +169,7 @@ def setup_commands() -> None:
         {"command": "leagues", "description": "联赛抓取开关面板"},
         {"command": "bookmakers", "description": "庄家抓取开关面板"},
         {"command": "status", "description": "当前启用了哪些联赛/庄家"},
-        {"command": "add", "description": "按 league_id 新增关注联赛"},
+        {"command": "add", "description": "加联赛：/add 关键词 搜了点 或 /add id season"},
         {"command": "remove", "description": "删除关注联赛"},
     ]
     resp = _post("setMyCommands", {"commands": commands})
@@ -197,22 +197,51 @@ def _is_admin(chat_id: int) -> bool:
 
 
 # ─── 内联键盘构建 ────────────────────────────────────────────────────────────
-def _leagues_keyboard() -> dict:
+LEAGUES_PER_PAGE = 10          # /leagues 每页联赛数（5 行 × 2）
+
+
+def _leagues_keyboard(page: int = 0) -> dict:
+    """联赛开关面板（分页）。每个按钮 callback=tl:<id>:<page>，翻转后停在本页；
+    底部一行翻页按钮 lp:<page>。"""
     conn = db.get_conn()
     try:
         rows = db.list_leagues(conn)
     finally:
         conn.close()
+    total = len(rows)
+    pages = max(1, (total + LEAGUES_PER_PAGE - 1) // LEAGUES_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * LEAGUES_PER_PAGE:(page + 1) * LEAGUES_PER_PAGE]
+
     buttons, line = [], []
-    for lid, name, season, enabled in rows:
+    for lid, name, season, enabled in chunk:
         mark = "✅" if enabled else "⬜"
         line.append({"text": f"{mark} {name}",
-                     "callback_data": f"tl:{lid}"})
+                     "callback_data": f"tl:{lid}:{page}"})
         if len(line) >= config.TG_LEAGUES_PER_ROW:
             buttons.append(line)
             line = []
     if line:
         buttons.append(line)
+
+    # 翻页行：‹ 上一页 | 页码 | 下一页 ›（首/末页对应按钮换成占位）
+    nav = []
+    nav.append({"text": "‹ 上一页", "callback_data": f"lp:{page - 1}"}
+               if page > 0 else {"text": " ", "callback_data": "lp:noop"})
+    nav.append({"text": f"{page + 1}/{pages}", "callback_data": "lp:noop"})
+    nav.append({"text": "下一页 ›", "callback_data": f"lp:{page + 1}"}
+               if page < pages - 1 else {"text": " ", "callback_data": "lp:noop"})
+    buttons.append(nav)
+    return {"inline_keyboard": buttons}
+
+
+def _search_leagues_keyboard(results: list[tuple]) -> dict:
+    """/add 关键词搜索结果键盘。results=[(league_id, 显示名, season)]，
+    每个按钮 callback=ag:<id>:<season>，点击即添加并启用。"""
+    buttons = []
+    for lid, label, season in results:
+        buttons.append([{"text": label,
+                         "callback_data": f"ag:{lid}:{season}"}])
     return {"inline_keyboard": buttons}
 
 
@@ -250,9 +279,9 @@ _HELP_VISITOR = (
 # 管理员附加的配置类命令
 _HELP_ADMIN_EXTRA = (
     "\n<b>管理员命令</b>\n"
-    "/leagues — 联赛开关面板\n"
+    "/leagues — 联赛开关面板（分页，点 ✅/⬜ 切换，‹ › 翻页）\n"
     "/bookmakers — 庄家开关面板\n"
-    "/add &lt;id&gt; &lt;season&gt; [名称] — 按 ID 加联赛\n"
+    "/add &lt;关键词&gt; — 搜联赛点按钮加（如 /add 瑞典）；或 /add &lt;id&gt; &lt;season&gt;\n"
     "/remove &lt;id&gt; — 删联赛\n"
 )
 HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
@@ -276,24 +305,66 @@ def _cmd_status(chat_id: int) -> None:
 
 
 def _cmd_add(chat_id: int, args: list[str]) -> None:
-    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
-        send(chat_id, "用法：/add &lt;league_id&gt; &lt;season&gt; [名称]\n"
-                      "例：/add 207 2026 瑞超")
+    """三种用法：
+      /add                      → 提示用法
+      /add <关键词>             → 调 API 搜全球联赛，列按钮点选添加（推荐，不用记编号）
+      /add <id> <season> [名称] → 已知编号时直接添加（旧用法保留）
+    """
+    if not args:
+        send(chat_id, "用法：\n"
+                      "① <b>/add 关键词</b> — 搜联赛点按钮添加（不用记编号）\n"
+                      "　 例：/add 瑞典　/add sweden　/add J联赛\n"
+                      "② <b>/add &lt;id&gt; &lt;season&gt; [名称]</b> — 已知编号直接加\n"
+                      "　 例：/add 207 2026 瑞超\n\n"
+                      "（常用联赛也可直接 /leagues 翻页点开，无需 /add）")
         return
-    lid, season = int(args[0]), int(args[1])
-    name = " ".join(args[2:]) if len(args) > 2 else None
-    # 没给名称时，调 API 查真实联赛名
-    if not name:
-        data = api_client.api_get("/leagues", {"id": lid})
-        resp = (data or {}).get("response", [])
-        name = resp[0]["league"]["name"] if resp else f"League {lid}"
-    conn = db.get_conn()
-    try:
-        db.add_league(conn, lid, name, season)
-    finally:
-        conn.close()
-    send(chat_id, f"已添加并启用：<b>{name}</b> (id={lid}, season={season})\n"
-                  f"下次抓取生效。")
+
+    # 旧用法：纯数字 id + season
+    if args[0].isdigit() and len(args) >= 2 and args[1].isdigit():
+        lid, season = int(args[0]), int(args[1])
+        name = " ".join(args[2:]) if len(args) > 2 else None
+        if not name:
+            data = api_client.api_get("/leagues", {"id": lid})
+            resp = (data or {}).get("response", [])
+            name = resp[0]["league"]["name"] if resp else f"League {lid}"
+        conn = db.get_conn()
+        try:
+            db.add_league(conn, lid, name, season)
+        finally:
+            conn.close()
+        send(chat_id, f"已添加并启用：<b>{name}</b> (id={lid}, season={season})\n"
+                      f"下次抓取生效。")
+        return
+
+    # 关键词搜索：/add 瑞典 / /add sweden
+    keyword = " ".join(args)
+    send(chat_id, f"🔍 正在搜索联赛「{keyword}」…")
+    data = api_client.api_get("/leagues", {"search": keyword})
+    resp = (data or {}).get("response", []) if data else []
+    if not resp:
+        send(chat_id, f"没搜到「{keyword}」。换个关键词试试（支持中/英文，"
+                      "如 sweden / 瑞典 / J1）。若已知数字编号可用：/add &lt;id&gt; &lt;season&gt;")
+        return
+
+    # 整理结果：每项取 league_id、国家+名称、当前赛季（current=true，没有则取最大年份）
+    results = []
+    for item in resp[:24]:                      # 上限 24 个，避免按钮过多
+        lg = item.get("league", {})
+        country = item.get("country", {}).get("name", "")
+        lid = lg.get("id")
+        lname = lg.get("name", "")
+        seasons = item.get("seasons", []) or []
+        cur = next((s for s in seasons if s.get("current")), None)
+        season = (cur or (seasons[-1] if seasons else {})).get("year")
+        if lid and season:
+            label = f"{lname}" + (f"（{country}）" if country else "")
+            results.append((lid, label[:60], season))
+    if not results:
+        send(chat_id, f"搜到「{keyword}」但无可用赛季信息，请用 /add &lt;id&gt; &lt;season&gt; 手动添加。")
+        return
+
+    send(chat_id, f"搜到 {len(results)} 个联赛，点击即添加并启用：",
+         _search_leagues_keyboard(results))
 
 
 def _cmd_remove(chat_id: int, args: list[str]) -> None:
@@ -1034,8 +1105,9 @@ def handle_message(msg: dict) -> None:
 
 def handle_callback(cb: dict) -> None:
     """处理内联按钮点击：
-    tl:<league_id> / tb:<bookmaker_id> / az:<fixture_id>(预设精算) /
-    ac:<fixture_id>(自定义侧重，引导用户回复后再跑)
+    tl:<league_id>[:<page>] 联赛开关 / lp:<page> 联赛翻页 /
+    ag:<league_id>:<season> 搜索结果添加 / tb:<bookmaker_id> 庄家开关 /
+    az:<fixture_id> 预设精算 / ac:<fixture_id> 自定义侧重
     """
     cb_id = cb.get("id")
     data = cb.get("data", "")
@@ -1071,18 +1143,39 @@ def handle_callback(cb: dict) -> None:
              {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
         return
 
-    # 配置类按钮（联赛/庄家开关）仅管理员可点
-    if data.startswith(("tl:", "tb:")) and not _is_admin(chat_id):
+    # 配置类按钮（联赛/庄家开关、翻页、搜索添加）仅管理员可点
+    if data.startswith(("tl:", "tb:", "lp:", "ag:")) and not _is_admin(chat_id):
         answer_callback(cb_id, "仅管理员可改配置")
         return
 
     conn = db.get_conn()
     try:
         if data.startswith("tl:"):
-            lid = int(data[3:])
+            # tl:<id> 或 tl:<id>:<page>（带页码则翻转后停在该页）
+            rest = data[3:].split(":")
+            lid = int(rest[0])
+            page = int(rest[1]) if len(rest) > 1 else 0
             new = db.toggle_league(conn, lid)
             answer_callback(cb_id, "已启用" if new else "已停用")
-            edit_markup(chat_id, message_id, _leagues_keyboard())
+            edit_markup(chat_id, message_id, _leagues_keyboard(page))
+        elif data.startswith("lp:"):
+            arg = data[3:]
+            if arg == "noop":
+                answer_callback(cb_id)
+            else:
+                answer_callback(cb_id)
+                edit_markup(chat_id, message_id, _leagues_keyboard(int(arg)))
+        elif data.startswith("ag:"):
+            # ag:<league_id>:<season> 搜索结果点选 → 添加并启用
+            _, sid, sseason = data.split(":")
+            lid, season = int(sid), int(sseason)
+            ld = api_client.api_get("/leagues", {"id": lid})
+            lresp = (ld or {}).get("response", [])
+            name = lresp[0]["league"]["name"] if lresp else f"League {lid}"
+            db.add_league(conn, lid, name, season)
+            answer_callback(cb_id, f"已添加 {name}")
+            send(chat_id, f"✅ 已添加并启用：<b>{name}</b> "
+                          f"(id={lid}, season={season})，下次抓取生效。")
         elif data.startswith("tb:"):
             bid = int(data[3:])
             new = db.toggle_bookmaker(conn, bid)
