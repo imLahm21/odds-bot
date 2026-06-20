@@ -11,12 +11,12 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
   /start /help        帮助
   /leagues            联赛开关面板（内联按钮）
   /bookmakers         庄家开关面板（内联按钮）
-  /add <id> <season> [名称]   按 league_id 新增关注联赛
+  /add <关键词>|<id> <season>   搜索或按编号新增关注联赛
   /remove <id>        删除关注联赛
   /status             当前启用了哪些联赛/庄家
   /fixtures           过去 3 天 ~ 未来 3 天赛程
   /coverage <fixture_id>  某场数据采集进度（10 节点缺漏一览）
-  /odds <fixture_id>  某场最新盘口（Pinnacle/Bet365）
+  /export <fixture_id>    导出某场全部盘口为 CSV
 """
 
 import os
@@ -164,7 +164,6 @@ def setup_commands() -> None:
         {"command": "coverage", "description": "看某场数据采集进度（10节点缺漏）"},
         {"command": "analyze", "description": "对某场跑 SOP 精算预测"},
         {"command": "review", "description": "对已结束的比赛做盘口复盘"},
-        {"command": "odds", "description": "查某场最新盘口"},
         {"command": "export", "description": "导出某场全部盘口为 CSV"},
         {"command": "leagues", "description": "联赛抓取开关面板"},
         {"command": "bookmakers", "description": "庄家抓取开关面板"},
@@ -270,7 +269,6 @@ _HELP_VISITOR = (
     "<b>赔率轮询 bot</b>\n\n"
     "/fixtures — 过去 3 天 ~ 未来 3 天赛程（✅已开赛可复盘 / 🔵未来可精算）\n"
     "/coverage &lt;fixture_id&gt; — 看某场数据采集进度（10 节点抓了几个、缺哪些）\n"
-    "/odds &lt;fixture_id&gt; — 某场最新盘口\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
     "/review &lt;fixture_id&gt; — 对已结束的比赛做盘口复盘（盘口走势+实际比分）\n"
@@ -398,7 +396,12 @@ def _cmd_fixtures(chat_id: int) -> None:
     end = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = db.get_conn()
     try:
-        fixtures = db.get_fixtures_between(conn, start, end)
+        # 直接查，多带一列 league_name（不动 db.get_fixtures_between 的 4 列结构，
+        # 那个被调度器解包复用）
+        fixtures = conn.execute(
+            "SELECT fixture_id, commence_utc, home_team, away_team, league_name "
+            "FROM fixtures WHERE commence_utc BETWEEN ? AND ? "
+            "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
         conn.close()
     if not fixtures:
@@ -422,9 +425,11 @@ def _cmd_fixtures(chat_id: int) -> None:
 
     lines = ["<b>赛程（过去 3 天 ~ 未来 3 天）</b>",
              "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
-    for fid, commence, home, away in fixtures[:40]:
+    for fid, commence, home, away, league in fixtures[:40]:
         mark = "✅" if kicked_off(commence) else "🔵"
-        lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  {home} vs {away}")
+        lg = f"（{league}）" if league else ""
+        lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  "
+                     f"{home} vs {away}{lg}")
     send(chat_id, "\n".join(lines))
 
 
@@ -501,33 +506,6 @@ def _cmd_coverage(chat_id: int, args: list[str]) -> None:
     if got < total:
         lines.append("\n数据越全 SOP 定性越准；缺初盘段会影响开盘深浅判断。")
     send(chat_id, "\n".join(lines))
-
-
-def _cmd_odds(chat_id: int, args: list[str]) -> None:
-    if not args or not args[0].isdigit():
-        send(chat_id, "用法：/odds &lt;fixture_id&gt;（id 见 /fixtures）")
-        return
-    fid = int(args[0])
-    conn = db.get_conn()
-    try:
-        latest = conn.execute(
-            "SELECT bookmaker, market, home_odds, draw_odds, away_odds, "
-            "handicap, home_water, away_water, snapshot_utc "
-            "FROM odds_history WHERE fixture_id=? AND bookmaker_id IN (4,8) "
-            "AND snapshot_utc=(SELECT MAX(snapshot_utc) FROM odds_history WHERE fixture_id=?) "
-            "ORDER BY bookmaker, market, handicap", (fid, fid)).fetchall()
-    finally:
-        conn.close()
-    if not latest:
-        send(chat_id, f"fixture {fid} 暂无盘口数据")
-        return
-    lines = [f"<b>fixture {fid} 最新盘口（Pinnacle/Bet365）</b>"]
-    for bm, market, ho, do, ao, hc, hw, aw, snap in latest:
-        if market == "h2h":
-            lines.append(f"{bm} 欧赔: 主{ho} 平{do} 客{ao}")
-        else:
-            lines.append(f"{bm} 亚盘{hc:+}: 主水{hw} 客水{aw}")
-    send(chat_id, "\n".join(lines[:40]))
 
 
 def _build_csv(fid: int):
@@ -1101,8 +1079,6 @@ def handle_message(msg: dict) -> None:
         _cmd_fixtures(chat_id)
     elif cmd == "coverage":
         _cmd_coverage(chat_id, args)
-    elif cmd == "odds":
-        _cmd_odds(chat_id, args)
     elif cmd == "export":
         _cmd_export(chat_id, args)
     elif cmd == "analyze":
