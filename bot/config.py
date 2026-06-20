@@ -178,7 +178,10 @@ CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
 #   LLM_API_KEY=sk-xxx
 LLM_MODEL = "gpt-5.5"
 LLM_TIMEOUT = 300             # 秒，gpt-5.5 high 推理 + 长报告，给足超时
-LLM_MAX_TOKENS = 8000         # 报告输出上限
+LLM_MAX_TOKENS = 32000        # 报告输出上限。gpt-5.5 是推理模型，先消耗大量
+                              # reasoning token 再写正文；规则 system prompt 约
+                              # 7万字符，上限太低（曾设8000）会在推理阶段就被吃光、
+                              # 正文为空 → "LLM 返回空内容"。放宽到 32000 留足空间。
 # 全量规则文件（相对项目根），按顺序拼接成 system prompt
 ANALYZE_RULE_FILES = [
     "CLAUDE.md",

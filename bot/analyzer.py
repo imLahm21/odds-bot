@@ -118,6 +118,9 @@ def _stream_llm(system: str, user: str):
         "Content-Type": "application/json",
     }
     acc = ""
+    reasoning_acc = ""          # 推理模型把思考放 delta.reasoning_content
+    finish_reason = None
+    usage = None
     try:
         r = requests.post(f"{LLM_BASE_URL}/chat/completions",
                           json=payload, headers=headers, stream=True,
@@ -140,16 +143,39 @@ def _stream_llm(system: str, user: str):
                 d = json.loads(body)
             except json.JSONDecodeError:
                 continue
+            if d.get("usage"):
+                usage = d["usage"]
             # 末尾常有只带 usage、choices 为空的收尾帧；choices[0] 前必须判空
             choices = d.get("choices") or []
             if not choices:
                 continue
-            delta = (choices[0].get("delta") or {}).get("content", "")
-            if delta:
-                acc += delta
+            if choices[0].get("finish_reason"):
+                finish_reason = choices[0]["finish_reason"]
+            delta = choices[0].get("delta") or {}
+            # 推理模型的思考过程：常见字段名 reasoning_content / reasoning
+            reasoning_acc += (delta.get("reasoning_content")
+                              or delta.get("reasoning") or "")
+            content = delta.get("content", "")
+            if content:
+                acc += content
                 yield ("delta", acc)
         if not acc.strip():
-            yield ("error", "LLM 返回空内容")
+            # 空正文：把能拿到的诊断信息全记下来，定位是 length(推理吃光额度)/
+            # content_filter(被审查)/还是只产出了推理无正文。
+            log.error("LLM 空正文 finish_reason=%s usage=%s reasoning_len=%d",
+                      finish_reason, usage, len(reasoning_acc))
+            hint = ""
+            if finish_reason == "length":
+                hint = ("（finish_reason=length：推理把 max_tokens 吃光了，正文没产出。"
+                        "已建议调高 LLM_MAX_TOKENS 或缩短规则。）")
+            elif finish_reason == "content_filter":
+                hint = "（finish_reason=content_filter：被内容审查拦截。）"
+            elif reasoning_acc.strip():
+                hint = ("（只产出了推理内容、无正文，可能 max_tokens 不足或网关吞了"
+                        " content 字段。）")
+            elif finish_reason:
+                hint = f"（finish_reason={finish_reason}）"
+            yield ("error", f"LLM 返回空内容{hint}")
             return
         yield ("done", acc.strip())
     except requests.exceptions.Timeout:
