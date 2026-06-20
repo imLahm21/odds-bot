@@ -653,7 +653,7 @@ def _cmd_unlive(chat_id: int, args: list[str]) -> None:
 
 
 def _cmd_lives(chat_id: int) -> None:
-    """列出本人当前订阅的走地比赛。"""
+    """列出本人当前订阅的走地比赛，每场带退订按钮。"""
     conn = db.get_conn()
     try:
         subs = db.list_live_subs_for_chat(conn, chat_id)
@@ -662,12 +662,14 @@ def _cmd_lives(chat_id: int) -> None:
     if not subs:
         send(chat_id, "你当前没有订阅任何走地比赛。用 /live &lt;fixture_id&gt; 订阅。")
         return
-    lines = ["你订阅的走地比赛："]
+    lines = ["你订阅的走地比赛（点按钮退订）："]
+    buttons = []
     for (fid, home, away, league, commence) in subs:
         lg = f"（{league}）" if league else ""
         lines.append(f"<code>{fid}</code> {home or '?'} vs {away or '?'}{lg}")
-    lines.append("\n/unlive &lt;id&gt; 退订")
-    send(chat_id, "\n".join(lines))
+        buttons.append([{"text": f"❌ 退订 {home or fid} vs {away or ''}".strip(),
+                         "callback_data": f"ul:{fid}"}])
+    send(chat_id, "\n".join(lines), {"inline_keyboard": buttons})
 
 
 def _fmt_live_lines(rows: list[dict]) -> str:
@@ -1233,6 +1235,36 @@ def handle_callback(cb: dict) -> None:
     message_id = msg.get("message_id")
     if not _authorized(chat_id):
         answer_callback(cb_id, "未授权")
+        return
+
+    # 走地退订按钮（访客可点，退自己的订阅）
+    if data.startswith("ul:"):
+        fid = int(data[3:])
+        conn = db.get_conn()
+        try:
+            ok = db.disable_live_sub(conn, chat_id, fid)
+        finally:
+            conn.close()
+        answer_callback(cb_id, "已退订" if ok else "未找到该订阅")
+        # 刷新列表（点完即更新这条消息）
+        conn = db.get_conn()
+        try:
+            subs = db.list_live_subs_for_chat(conn, chat_id)
+        finally:
+            conn.close()
+        if subs:
+            lines = ["你订阅的走地比赛（点按钮退订）："]
+            buttons = []
+            for (sfid, home, away, league, commence) in subs:
+                lg = f"（{league}）" if league else ""
+                lines.append(f"<code>{sfid}</code> {home or '?'} vs {away or '?'}{lg}")
+                buttons.append([{"text": f"❌ 退订 {home or sfid} vs {away or ''}".strip(),
+                                 "callback_data": f"ul:{sfid}"}])
+            edit_text(chat_id, message_id, "\n".join(lines))
+            edit_markup(chat_id, message_id, {"inline_keyboard": buttons})
+        else:
+            edit_text(chat_id, message_id, "已全部退订，当前无走地订阅。")
+            edit_markup(chat_id, message_id, {"inline_keyboard": []})
         return
 
     # 精算按钮：先应答消除转圈，再同步跑 SOP（耗时 1~3 分钟）
