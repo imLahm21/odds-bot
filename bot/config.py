@@ -195,3 +195,32 @@ ANALYZE_RULE_FILES = [
 FUND_RECENT_N = 10            # 各队近 N 场
 FUND_H2H_N = 10               # 交锋近 N 场
 FUND_UPCOMING_N = 5           # 各队未来 N 场赛程（判赛程密度/双线/轮换风险）
+
+# ─── /add 联赛搜索：中文→英文关键词映射 ──────────────────────────────────────
+# API-Football 的 /leagues?search= 只认英文，中文搜不到（如「足协杯」返回空）。
+# 这里把常用中文名/简称映射到 API 库里的英文关键词；命中则用英文去搜。
+# 搜国家名（如 China）会返回该国全部联赛+杯赛，足够覆盖。
+LEAGUE_SEARCH_ALIASES: dict[str, str] = {
+    # 杯赛（API 多叫 "FA Cup"/"Cup"，搭配国家名搜更准 → 直接映射到国家名）
+    "足协杯": "China", "中国足协杯": "China", "中国杯": "China",
+    "英格兰足总杯": "England", "足总杯": "England",
+    "国王杯": "Spain", "西班牙国王杯": "Spain",
+    "德国杯": "Germany", "意大利杯": "Italy", "法国杯": "France",
+    # 国家（搜国家名会列出该国所有赛事）
+    "中国": "China", "英格兰": "England", "英国": "England",
+    "西班牙": "Spain", "德国": "Germany", "意大利": "Italy",
+    "法国": "France", "荷兰": "Netherlands", "葡萄牙": "Portugal",
+    "瑞典": "Sweden", "挪威": "Norway", "丹麦": "Denmark",
+    "日本": "Japan", "韩国": "South-Korea", "美国": "USA",
+    "巴西": "Brazil", "阿根廷": "Argentina", "墨西哥": "Mexico",
+    "沙特": "Saudi-Arabia", "土耳其": "Turkey", "俄罗斯": "Russia",
+    "比利时": "Belgium", "苏格兰": "Scotland", "瑞士": "Switzerland",
+    "奥地利": "Austria", "希腊": "Greece", "波兰": "Poland",
+    "冰岛": "Iceland", "澳大利亚": "Australia", "澳洲": "Australia",
+    # 联赛常用简称
+    "中超": "China", "英超": "England", "西甲": "Spain",
+    "德甲": "Germany", "意甲": "Italy", "法甲": "France",
+    "日职": "Japan", "韩K联": "South-Korea", "美职联": "USA",
+    "世界杯": "World Cup", "欧冠": "UEFA Champions",
+    "欧联": "UEFA Europa", "欧国联": "UEFA Nations",
+}
