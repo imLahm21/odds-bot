@@ -313,7 +313,8 @@ def _cmd_add(chat_id: int, args: list[str]) -> None:
     if not args:
         send(chat_id, "用法：\n"
                       "① <b>/add 关键词</b> — 搜联赛点按钮添加（不用记编号）\n"
-                      "　 例：/add 瑞典　/add sweden　/add J联赛\n"
+                      "　 例：/add 足协杯　/add 瑞典　/add China　/add FA Cup\n"
+                      "　 （中文常用名会自动转英文搜；API 搜索本身只认英文）\n"
                       "② <b>/add &lt;id&gt; &lt;season&gt; [名称]</b> — 已知编号直接加\n"
                       "　 例：/add 207 2026 瑞超\n\n"
                       "（常用联赛也可直接 /leagues 翻页点开，无需 /add）")
@@ -336,14 +337,23 @@ def _cmd_add(chat_id: int, args: list[str]) -> None:
                       f"下次抓取生效。")
         return
 
-    # 关键词搜索：/add 瑞典 / /add sweden
-    keyword = " ".join(args)
-    send(chat_id, f"🔍 正在搜索联赛「{keyword}」…")
+    # 关键词搜索：/add 瑞典 / /add sweden / /add 足协杯
+    raw_kw = " ".join(args)
+    # API search 只认英文：先查中文别名映射；命中则用英文词搜，并告知实际搜的词
+    mapped = config.LEAGUE_SEARCH_ALIASES.get(raw_kw.strip())
+    keyword = mapped or raw_kw
+    note = f"（中文「{raw_kw}」→ 按英文「{keyword}」搜）\n" if mapped else ""
+    send(chat_id, f"🔍 {note}正在搜索联赛「{keyword}」…")
     data = api_client.api_get("/leagues", {"search": keyword})
     resp = (data or {}).get("response", []) if data else []
     if not resp:
-        send(chat_id, f"没搜到「{keyword}」。换个关键词试试（支持中/英文，"
-                      "如 sweden / 瑞典 / J1）。若已知数字编号可用：/add &lt;id&gt; &lt;season&gt;")
+        has_cjk = any('一' <= c <= '鿿' for c in raw_kw)
+        tip = ("\n⚠️ API 搜索只认<b>英文</b>，中文词常搜不到。"
+               "试试国家英文名（China / Sweden / Japan）或联赛英文名（FA Cup）。"
+               if has_cjk else
+               "换个关键词试试（如 China / Sweden / FA Cup）。")
+        send(chat_id, f"没搜到「{raw_kw}」。{tip}\n"
+                      "若已知数字编号：/add &lt;id&gt; &lt;season&gt;")
         return
 
     # 整理结果：每项取 league_id、国家+名称、当前赛季（current=true，没有则取最大年份）
