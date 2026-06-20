@@ -110,6 +110,50 @@ def extract_asian_handicap(values: list[dict]) -> dict[float, dict]:
             if "home_water" in r and "away_water" in r}
 
 
+# ─── 大小球 value 文本解析 ───────────────────────────────────────────────────
+def parse_ou_value(value_str: str) -> tuple[str, float] | None:
+    """
+    解析大小球 value 文本 → (side, line)
+      "Over 2.5"  → ("over", 2.5)
+      "Under 2.75" → ("under", 2.75)
+    side ∈ {"over", "under"}，line 为总进球盘口线。
+    """
+    parts = value_str.strip().split()
+    if len(parts) != 2:
+        return None
+    side = parts[0].lower()
+    num = _to_float(parts[1])
+    if num is None or side not in ("over", "under"):
+        return None
+    return side, num
+
+
+def extract_over_under(values: list[dict]) -> dict[float, dict]:
+    """
+    将一家庄的大小球 values 列表，按盘口线聚合大/小球水位。
+    返回 {line: {"over_water":x, "under_water":y}}
+
+    与亚盘同构：同一盘口线（如 2.5）API 给 "Over 2.5" 与 "Under 2.5" 两条，
+    分别是大球/小球两侧水位。只保留两侧都齐的盘口线。
+    """
+    by_line: dict[float, dict] = {}
+    for v in values:
+        parsed = parse_ou_value(v.get("value", ""))
+        if not parsed:
+            continue
+        side, line = parsed
+        odd = _to_float(v.get("odd"))
+        if odd is None:
+            continue
+        rec = by_line.setdefault(line, {})
+        if side == "over":
+            rec["over_water"] = odd
+        else:
+            rec["under_water"] = odd
+    return {ln: r for ln, r in by_line.items()
+            if "over_water" in r and "under_water" in r}
+
+
 # ─── 主解析：单场 odds → 行列表 ──────────────────────────────────────────────
 def parse_odds_response(entry: dict, snapshot_utc: str,
                         commence_utc: str,
@@ -131,6 +175,8 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
     h2h_all = {"home": [], "draw": [], "away": []}
     # 亚盘按盘口线聚合水位
     ah_all: dict[float, dict[str, list]] = {}
+    # 大小球按盘口线聚合水位
+    ou_all: dict[float, dict[str, list]] = {}
 
     parsed_per_bm: dict[int, dict] = {}  # 缓存每家解析结果，避免二次解析
 
@@ -140,6 +186,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
             continue
         h2h = None
         ah = None
+        ou = None
         for bet in bm.get("bets", []):
             if bet.get("id") == config.BET_MATCH_WINNER:
                 vals = {v.get("value", "").lower(): _to_float(v.get("odd"))
@@ -156,11 +203,19 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                     slot = ah_all.setdefault(hc, {"home": [], "away": []})
                     slot["home"].append(rec["home_water"])
                     slot["away"].append(rec["away_water"])
-        parsed_per_bm[bid] = {"h2h": h2h, "ah": ah}
+            elif bet.get("id") == config.BET_OVER_UNDER:
+                ou = extract_over_under(bet.get("values", []))
+                for ln, rec in ou.items():
+                    slot = ou_all.setdefault(ln, {"over": [], "under": []})
+                    slot["over"].append(rec["over_water"])
+                    slot["under"].append(rec["under_water"])
+        parsed_per_bm[bid] = {"h2h": h2h, "ah": ah, "ou": ou}
 
     avg_h = {k: _avg(v) for k, v in h2h_all.items()}
     avg_ah = {hc: {"home": _avg(s["home"]), "away": _avg(s["away"])}
               for hc, s in ah_all.items()}
+    avg_ou = {ln: {"over": _avg(s["over"]), "under": _avg(s["under"])}
+              for ln, s in ou_all.items()}
 
     # ── 第二轮：生成行 ──
     rows = []
@@ -205,6 +260,118 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                     "kelly_a_water": _kelly(rec["away_water"], mavg.get("away")),
                 })
 
+        # 大小球行（每条盘口线一行）
+        # 复用通用列：handicap=盘口线(如 2.5)，home_water=大球水位，away_water=小球水位，
+        # kelly_h_water=大球凯利，kelly_a_water=小球凯利；market='ou' 区分语义。
+        ou = pdata["ou"]
+        if ou:
+            for ln, rec in ou.items():
+                mavg = avg_ou.get(ln, {})
+                rows.append({
+                    "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                    "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
+                    "market": "ou",
+                    "home_odds": None, "draw_odds": None, "away_odds": None,
+                    "kelly_home": None, "kelly_draw": None, "kelly_away": None,
+                    "handicap": ln,
+                    "home_water": rec["over_water"],
+                    "away_water": rec["under_water"],
+                    "kelly_h_water": _kelly(rec["over_water"], mavg.get("over")),
+                    "kelly_a_water": _kelly(rec["under_water"], mavg.get("under")),
+                })
+
+    return rows
+
+
+# ─── 走地(滚球)解析：单场 live odds → 行列表 ───────────────────────────────
+def _live_main_line(values: list[dict], a_side: str, b_side: str) -> dict | None:
+    """从 live 亚盘/大小球 values 里取 main:true 的主盘口线两侧。
+    a_side/b_side 为两侧 value 文本(小写)，如 ('home','away') 或 ('over','under')。
+    返回 {"handicap":线, "a_water":x, "b_water":y, "suspended":bool}；无 main 则 None。
+    """
+    rec: dict = {}
+    for v in values:
+        if not v.get("main"):
+            continue
+        side = str(v.get("value", "")).lower()
+        odd = _to_float(v.get("odd"))
+        if odd is None:
+            continue
+        hc = _to_float(v.get("handicap"))
+        if side == a_side:
+            rec["a_water"] = odd
+            rec["handicap"] = hc
+            rec["suspended"] = bool(v.get("suspended"))
+        elif side == b_side:
+            rec["b_water"] = odd
+            rec.setdefault("handicap", hc)
+            rec.setdefault("suspended", bool(v.get("suspended")))
+    if "a_water" in rec and "b_water" in rec:
+        return rec
+    return None
+
+
+def parse_live_response(entry: dict, snapshot_utc: str,
+                        pool_ids: set[int] | None = None) -> list[dict]:
+    """
+    解析 /odds/live 的单场 entry → live_odds_history 行列表。
+    只保留 main:true 的主盘口线(走地只看主盘，多线全存会爆量)。
+
+    ⚠️ live 结构与盘前 /odds 完全不同(已用真实数据验证)：
+      - entry['odds'] 是【盘口类型列表】(非庄家列表)：每元素 {id, name, values}，
+        id 即 bet id。走地数据是聚合盘，【不分庄家】，无 bookmaker 层。
+      - 盘口线在独立 'handicap' 字段，value 仅 Over/Under/Home/Away
+      - 亚盘(33)/大小球(36) 每盘多条线，带 main:true 标主盘口
+      - 欧赔(59 Fulltime Result) 无 main、无 handicap，三条 value 直取
+      - 每条 value 带 suspended(进球/VAR 时临时封盘)
+    走地无庄家维度，故 bookmaker_id 统一记为 0、bookmaker 记 'LIVE'。
+    pool_ids 参数保留以兼容调用签名，走地不使用。
+    """
+    fixture_id = entry.get("fixture", {}).get("id")
+    if not fixture_id:
+        return []
+    status = entry.get("fixture", {}).get("status", {})
+    elapsed = status.get("elapsed")
+    teams = entry.get("teams", {})
+    home_goals = teams.get("home", {}).get("goals")
+    away_goals = teams.get("away", {}).get("goals")
+
+    base = {
+        "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+        "elapsed": elapsed, "home_goals": home_goals, "away_goals": away_goals,
+        "bookmaker_id": 0, "bookmaker": "LIVE",
+    }
+    rows = []
+    for bet in entry.get("odds", []):
+        betid = bet.get("id")
+        values = bet.get("values", [])
+        if betid == config.BET_LIVE_1X2:
+            # 欧赔：无 main、无 handicap，三条 value 直取
+            vals = {str(v.get("value", "")).lower(): v for v in values}
+            h = _to_float(vals.get("home", {}).get("odd"))
+            d = _to_float(vals.get("draw", {}).get("odd"))
+            a = _to_float(vals.get("away", {}).get("odd"))
+            if h and a:
+                susp = bool(vals.get("home", {}).get("suspended"))
+                rows.append({**base, "market": "h2h", "handicap": None,
+                             "home_water": h, "away_water": a, "draw_odds": d,
+                             "suspended": 1 if susp else 0})
+        elif betid == config.BET_LIVE_ASIAN_HANDICAP:
+            main = _live_main_line(values, "home", "away")
+            if main:
+                rows.append({**base, "market": "ah",
+                             "handicap": main["handicap"],
+                             "home_water": main["a_water"],
+                             "away_water": main["b_water"], "draw_odds": None,
+                             "suspended": 1 if main["suspended"] else 0})
+        elif betid == config.BET_LIVE_OVER_UNDER:
+            main = _live_main_line(values, "over", "under")
+            if main:
+                rows.append({**base, "market": "ou",
+                             "handicap": main["handicap"],
+                             "home_water": main["a_water"],
+                             "away_water": main["b_water"], "draw_odds": None,
+                             "suspended": 1 if main["suspended"] else 0})
     return rows
 
 

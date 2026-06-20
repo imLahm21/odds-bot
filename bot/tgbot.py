@@ -165,6 +165,9 @@ def setup_commands() -> None:
         {"command": "analyze", "description": "对某场跑 SOP 精算预测"},
         {"command": "review", "description": "对已结束的比赛做盘口复盘"},
         {"command": "export", "description": "导出某场全部盘口为 CSV"},
+        {"command": "live", "description": "订阅某场走地实时播报：/live fixture_id"},
+        {"command": "unlive", "description": "退订某场走地播报：/unlive fixture_id"},
+        {"command": "lives", "description": "查看我当前订阅的走地比赛"},
         {"command": "leagues", "description": "联赛抓取开关面板"},
         {"command": "bookmakers", "description": "庄家抓取开关面板"},
         {"command": "status", "description": "当前启用了哪些联赛/庄家"},
@@ -270,6 +273,8 @@ _HELP_VISITOR = (
     "/fixtures — 过去 3 天 ~ 未来 3 天赛程（✅已开赛可复盘 / 🔵未来可精算）\n"
     "/coverage &lt;fixture_id&gt; — 看某场数据采集进度（10 节点抓了几个、缺哪些）\n"
     "/export &lt;fixture_id&gt; — 导出某场全部盘口为 CSV 文件\n"
+    "/live &lt;fixture_id&gt; — 订阅走地实时播报（进行中有异动自动推送）\n"
+    "/unlive &lt;fixture_id&gt; — 退订走地播报；/lives — 看我的订阅\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
     "/review &lt;fixture_id&gt; — 对已结束的比赛做盘口复盘（盘口走势+实际比分）\n"
     "/status — 当前启用项\n"
@@ -556,7 +561,7 @@ def _build_csv(fid: int):
     away = fx[1] if fx else ""
     league = fx[2] if fx else ""
     kick_cst = to_cst(fx[3]) if fx else ""
-    market_zh = {"h2h": "欧指", "ah": "亚盘"}
+    market_zh = {"h2h": "欧指", "ah": "亚盘", "ou": "大小球"}
 
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -598,6 +603,126 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
     caption = f"{meta['league']} {meta['home']} vs {meta['away']}\n共 {meta['rows']} 行快照"
     send_document(chat_id, f"{teams}_stages.csv", content, caption)
+
+
+# ─── 走地实时播报：订阅 / 退订 / 列表 / 推送 ─────────────────────────────────
+_LIVE_MARKET_ZH = {"ah": "亚盘", "ou": "大小球", "h2h": "欧赔"}
+
+
+def _cmd_live(chat_id: int, args: list[str]) -> None:
+    """订阅某场走地实时播报。/live <fixture_id>"""
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/live &lt;fixture_id&gt;（id 见 /fixtures）。"
+                      "订阅后比赛进行中有显著异动会自动推送。")
+        return
+    fid = int(args[0])
+    conn = db.get_conn()
+    try:
+        meta = db.get_fixture_meta(conn, fid)
+        if not meta:
+            send(chat_id, f"未找到 fixture {fid}，请先 /fixtures 查 id。")
+            return
+        # 限额校验（已订阅同一场不占新增名额）
+        already = db.count_live_subs_for_chat(conn, chat_id)
+        existing = {r[0] for r in db.list_live_subs_for_chat(conn, chat_id)}
+        if fid not in existing and already >= config.LIVE_MAX_SUBS_PER_CHAT:
+            send(chat_id, f"⚠️ 最多同时订阅 {config.LIVE_MAX_SUBS_PER_CHAT} 场走地，"
+                          f"请先 /unlive 退订一些。")
+            return
+        home, away = meta[4], meta[5]
+        db.add_live_sub(conn, chat_id, fid)
+    finally:
+        conn.close()
+    send(chat_id, f"✅ 已订阅走地播报：{home} vs {away}\n"
+                  f"比赛进行中每 {config.LIVE_MINUTES} 分钟检测一次，"
+                  f"有进球/盘口线/水位/封盘异动才推送。结束自动退订。", plain=True)
+
+
+def _cmd_unlive(chat_id: int, args: list[str]) -> None:
+    """退订某场走地播报。/unlive <fixture_id>"""
+    if not args or not args[0].isdigit():
+        send(chat_id, "用法：/unlive &lt;fixture_id&gt;（看 /lives 查当前订阅）")
+        return
+    fid = int(args[0])
+    conn = db.get_conn()
+    try:
+        ok = db.disable_live_sub(conn, chat_id, fid)
+    finally:
+        conn.close()
+    send(chat_id, f"已退订 fixture {fid}。" if ok else f"你没有订阅 fixture {fid}。")
+
+
+def _cmd_lives(chat_id: int) -> None:
+    """列出本人当前订阅的走地比赛。"""
+    conn = db.get_conn()
+    try:
+        subs = db.list_live_subs_for_chat(conn, chat_id)
+    finally:
+        conn.close()
+    if not subs:
+        send(chat_id, "你当前没有订阅任何走地比赛。用 /live &lt;fixture_id&gt; 订阅。")
+        return
+    lines = ["你订阅的走地比赛："]
+    for (fid, home, away, league, commence) in subs:
+        lg = f"（{league}）" if league else ""
+        lines.append(f"<code>{fid}</code> {home or '?'} vs {away or '?'}{lg}")
+    lines.append("\n/unlive &lt;id&gt; 退订")
+    send(chat_id, "\n".join(lines))
+
+
+def _fmt_live_lines(rows: list[dict]) -> str:
+    """把走地快照行格式化成简短盘口快报文本。"""
+    out = []
+    for r in rows:
+        zh = _LIVE_MARKET_ZH.get(r["market"], r["market"])
+        susp = "（封盘）" if r.get("suspended") else ""
+        if r["market"] == "h2h":
+            out.append(f"{zh}: 主 {r['home_water']} / 平 {r.get('draw_odds')} "
+                       f"/ 客 {r['away_water']}{susp}")
+        elif r["market"] == "ah":
+            out.append(f"{zh}(让 {r['handicap']}): 主 {r['home_water']} "
+                       f"/ 客 {r['away_water']}{susp}")
+        else:  # ou
+            out.append(f"{zh}({r['handicap']}): 大 {r['home_water']} "
+                       f"/ 小 {r['away_water']}{susp}")
+    return "\n".join(out)
+
+
+def push_live_update(chat_id: int, fid: int, entry: dict,
+                     rows: list[dict], deltas: list[str]) -> None:
+    """走地异动推送：盘口快报 + 检测到的异动 + LLM 一句话研判。
+    供 scheduler.task_e_live_broadcast 后台调用。"""
+    status = entry.get("fixture", {}).get("status", {})
+    elapsed = status.get("elapsed")
+    teams = entry.get("teams", {})
+    hg = teams.get("home", {}).get("goals")
+    ag = teams.get("away", {}).get("goals")
+    conn = db.get_conn()
+    try:
+        meta = db.get_fixture_meta(conn, fid)
+    finally:
+        conn.close()
+    home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
+    score = f"{hg}-{ag}"
+
+    parts = [f"🔴 走地 | {home} vs {away}",
+             f"第 {elapsed}′  比分 {score}", "",
+             "异动："]
+    parts += [f"  {d}" for d in deltas]
+    parts.append("")
+    parts.append(_fmt_live_lines(rows))
+
+    # LLM 走地研判（失败/未配置则跳过，不阻塞盘口快报）
+    try:
+        brief = analyzer.live_brief(_fmt_live_lines(rows), deltas, home, away,
+                                    elapsed, score)
+    except Exception as e:
+        log.warning("走地研判失败 fixture %d: %s", fid, e)
+        brief = ""
+    if brief and not brief.startswith(("LLM", "未配置")):
+        parts.append("")
+        parts.append(f"💡 {brief}")
+    send(chat_id, "\n".join(parts), plain=True)
 
 
 # 复盘主盘口取盘优先级：Pinnacle > Bet365（与凯利锚一致）
@@ -1081,6 +1206,12 @@ def handle_message(msg: dict) -> None:
         _cmd_coverage(chat_id, args)
     elif cmd == "export":
         _cmd_export(chat_id, args)
+    elif cmd == "live":
+        _cmd_live(chat_id, args)
+    elif cmd == "unlive":
+        _cmd_unlive(chat_id, args)
+    elif cmd == "lives":
+        _cmd_lives(chat_id)
     elif cmd == "analyze":
         _cmd_analyze(chat_id, args)
     elif cmd == "review":

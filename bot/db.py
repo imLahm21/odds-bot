@@ -70,6 +70,37 @@ CREATE TABLE IF NOT EXISTS analyze_usage (
     used     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, day)
 );
+
+-- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
+-- 避免污染赛前 SOP 的 CSV。只存 main:true 主盘口线(走地只看主盘)。
+CREATE TABLE IF NOT EXISTS live_odds_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    fixture_id    INTEGER NOT NULL,
+    snapshot_utc  TEXT NOT NULL,
+    elapsed       INTEGER,                  -- 进行分钟数(走地节点语义)
+    home_goals    INTEGER, away_goals INTEGER,  -- 抓取瞬间实时比分
+    bookmaker_id  INTEGER, bookmaker TEXT,
+    market        TEXT NOT NULL,            -- 'h2h' | 'ah' | 'ou'
+    handicap      REAL,                     -- 主盘口线(h2h 为 NULL)
+    home_water    REAL, away_water REAL,    -- ah:主/客水位 ou:大/小球水位 h2h:主/客胜赔率
+    draw_odds     REAL,                     -- 仅 h2h 用(平局赔率)
+    suspended     INTEGER DEFAULT 0
+    -- 不设 fixtures 外键：进行中比赛未必在 fixtures 表(联赛未开启时无赛程)，
+    -- 外键会让 insert_live_odds 失败。走地表本就独立。
+);
+CREATE INDEX IF NOT EXISTS idx_live_fix_time ON live_odds_history(fixture_id, snapshot_utc);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_live_dedup
+    ON live_odds_history(fixture_id, snapshot_utc, bookmaker_id, market);
+
+-- 走地订阅：谁订阅了哪场比赛的实时播报
+CREATE TABLE IF NOT EXISTS live_subscriptions (
+    chat_id       INTEGER NOT NULL,
+    fixture_id    INTEGER NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    last_push_utc TEXT,                     -- 上次推送时间(节流用)
+    created_utc   TEXT,
+    PRIMARY KEY (chat_id, fixture_id)
+);
 """
 
 # odds_history 批量插入用的列顺序（与 parser 产出的行字典对齐）
@@ -78,6 +109,13 @@ ODDS_COLS = [
     "market", "home_odds", "draw_odds", "away_odds",
     "kelly_home", "kelly_draw", "kelly_away",
     "handicap", "home_water", "away_water", "kelly_h_water", "kelly_a_water",
+]
+
+# live_odds_history 批量插入列顺序（与 parser.parse_live_response 产出对齐）
+LIVE_ODDS_COLS = [
+    "fixture_id", "snapshot_utc", "elapsed", "home_goals", "away_goals",
+    "bookmaker_id", "bookmaker", "market",
+    "handicap", "home_water", "away_water", "draw_odds", "suspended",
 ]
 
 
@@ -318,3 +356,94 @@ def remove_league(conn: sqlite3.Connection, league_id: int) -> bool:
                        (league_id,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# ─── 走地(滚球)快照与订阅 ──────────────────────────────────────────────────
+def insert_live_odds(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    """批量插入走地快照。重复（唯一索引命中）自动忽略。返回实际新增行数。"""
+    if not rows:
+        return 0
+    placeholders = ",".join("?" * len(LIVE_ODDS_COLS))
+    payload = [tuple(r.get(c) for c in LIVE_ODDS_COLS) for r in rows]
+    before = conn.total_changes
+    conn.executemany(
+        f"INSERT OR IGNORE INTO live_odds_history ({','.join(LIVE_ODDS_COLS)}) "
+        f"VALUES ({placeholders})",
+        payload,
+    )
+    conn.commit()
+    return conn.total_changes - before
+
+
+def get_latest_live_snapshot(conn: sqlite3.Connection, fixture_id: int,
+                             bookmaker_id: int) -> list[tuple]:
+    """取某场某庄最近一次走地快照的全部 market 行（异动对比用）。
+    返回 [(market, handicap, home_water, away_water, draw_odds, suspended,
+           elapsed, home_goals, away_goals), ...]；无则空列表。"""
+    row = conn.execute(
+        "SELECT snapshot_utc FROM live_odds_history "
+        "WHERE fixture_id=? AND bookmaker_id=? "
+        "ORDER BY snapshot_utc DESC LIMIT 1", (fixture_id, bookmaker_id)).fetchone()
+    if not row:
+        return []
+    return conn.execute(
+        "SELECT market, handicap, home_water, away_water, draw_odds, suspended, "
+        "elapsed, home_goals, away_goals FROM live_odds_history "
+        "WHERE fixture_id=? AND bookmaker_id=? AND snapshot_utc=?",
+        (fixture_id, bookmaker_id, row[0])).fetchall()
+
+
+def add_live_sub(conn: sqlite3.Connection, chat_id: int, fixture_id: int) -> None:
+    """新增/重新启用一条走地订阅。"""
+    now = _now_utc_iso()
+    conn.execute(
+        "INSERT INTO live_subscriptions (chat_id, fixture_id, enabled, created_utc) "
+        "VALUES (?,?,1,?) ON CONFLICT(chat_id, fixture_id) DO UPDATE SET enabled=1",
+        (chat_id, fixture_id, now))
+    conn.commit()
+
+
+def disable_live_sub(conn: sqlite3.Connection, chat_id: int,
+                     fixture_id: int) -> bool:
+    """停用一条走地订阅。返回是否有匹配行。"""
+    cur = conn.execute(
+        "UPDATE live_subscriptions SET enabled=0 "
+        "WHERE chat_id=? AND fixture_id=? AND enabled=1", (chat_id, fixture_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def disable_live_sub_all(conn: sqlite3.Connection, fixture_id: int) -> list[int]:
+    """停用某场比赛的全部订阅（比赛结束自动退订用）。返回受影响的 chat_id 列表。"""
+    chats = [r[0] for r in conn.execute(
+        "SELECT chat_id FROM live_subscriptions "
+        "WHERE fixture_id=? AND enabled=1", (fixture_id,)).fetchall()]
+    if chats:
+        conn.execute("UPDATE live_subscriptions SET enabled=0 WHERE fixture_id=?",
+                     (fixture_id,))
+        conn.commit()
+    return chats
+
+
+def get_active_live_subs(conn: sqlite3.Connection) -> list[tuple]:
+    """取全部启用的走地订阅，返回 [(chat_id, fixture_id), ...]。"""
+    return conn.execute(
+        "SELECT chat_id, fixture_id FROM live_subscriptions WHERE enabled=1"
+    ).fetchall()
+
+
+def list_live_subs_for_chat(conn: sqlite3.Connection, chat_id: int) -> list[tuple]:
+    """列出某 chat 的启用订阅，含比赛信息。供 /lives 展示。
+    返回 [(fixture_id, home_team, away_team, league_name, commence_utc), ...]。"""
+    return conn.execute(
+        "SELECT s.fixture_id, f.home_team, f.away_team, f.league_name, f.commence_utc "
+        "FROM live_subscriptions s LEFT JOIN fixtures f ON s.fixture_id=f.fixture_id "
+        "WHERE s.chat_id=? AND s.enabled=1 ORDER BY f.commence_utc",
+        (chat_id,)).fetchall()
+
+
+def count_live_subs_for_chat(conn: sqlite3.Connection, chat_id: int) -> int:
+    """某 chat 当前启用的订阅数（防滥用上限校验用）。"""
+    return conn.execute(
+        "SELECT COUNT(*) FROM live_subscriptions WHERE chat_id=? AND enabled=1",
+        (chat_id,)).fetchone()[0]

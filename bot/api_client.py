@@ -34,6 +34,14 @@ if not _API_KEYS:
 
 _current = 0
 
+# 最近一次响应头里的当日剩余额度（供走地额度护栏读取）
+_last_remaining: int | None = None
+
+
+def last_remaining() -> int | None:
+    """返回最近一次 API 响应头里的当日剩余额度（无则 None）。"""
+    return _last_remaining
+
 
 def _cur_key() -> str:
     return _API_KEYS[_current]["key"]
@@ -70,6 +78,10 @@ def api_get(endpoint: str, params: dict | None = None,
             # 额度日志（debug 级，不刷屏）
             remain = resp.headers.get("x-ratelimit-requests-remaining", "?")
             log.debug("%s 今日剩余额度 %s", endpoint, remain)
+            # 缓存剩余额度供走地护栏读取
+            if isinstance(remain, str) and remain.isdigit():
+                global _last_remaining
+                _last_remaining = int(remain)
 
             if resp.status_code in (429, 401):
                 reason = "额度耗尽" if resp.status_code == 429 else "Key无效"
@@ -122,6 +134,14 @@ def fetch_fixtures(league_id: int, season: int,
 def fetch_odds(fixture_id: int) -> list:
     """拉单场比赛的当前盘口。返回 response 列表（通常 1 个元素）。"""
     data = api_get("/odds", {"fixture": fixture_id})
+    return (data or {}).get("response", []) if data else []
+
+
+def fetch_live_odds() -> list:
+    """拉【全部】进行中比赛的实时滚球盘(走地)。Bulk：一次请求拿全量，
+    由调用方按订阅 fixture_id 过滤。返回 response 列表（每元素一场）。
+    成本与订阅数无关——每轮恒定 1 个请求。"""
+    data = api_get("/odds/live")
     return (data or {}).get("response", []) if data else []
 
 
