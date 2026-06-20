@@ -101,19 +101,55 @@ def _standings(league_id: int, season: int,
         return (f"  {row.get('rank')}. {name} 积分{row.get('points')} "
                 f"{all_.get('win')}-{all_.get('draw')}-{all_.get('lose')}{mark}")
 
-    # 世界杯/杯赛分小组：每个 table 是一个小组。只列两队所在小组的完整排名，
-    # 组内比较才有意义——把所有组拉平成一张表会误导（小组赛积分不跨组可比）。
-    focus_tables = [t for t in tables
-                    if any(r.get("team", {}).get("name") in focus for r in t)]
+    def _has(t, names) -> bool:
+        if isinstance(names, str):
+            names = {names}
+        return any(r.get("team", {}).get("name") in names for r in t)
 
-    if len(tables) > 1 and focus_tables:
-        # 分组赛制：只展示两队所在小组（同场比赛通常同组），列出整组
-        lines = ["【积分榜（两队所在小组完整排名，仅组内可比）】"]
-        for table in focus_tables:
-            grp = (table[0].get("group") if table else None) or "本组"
-            lines.append(f"〔{grp}〕")
-            lines += [_row_line(r) for r in table]
-        return "\n".join(lines)
+    def _played(row: dict) -> int:
+        all_ = row.get("all", {})
+        p = all_.get("played")
+        if p is not None:
+            return p
+        return ((all_.get("win") or 0) + (all_.get("draw") or 0)
+                + (all_.get("lose") or 0))
+
+    # 分组赛制（世界杯/杯赛小组赛）：standings 是多张表。
+    #   · 真小组表恒为 4 队 → 只列两队所在那张（组内比积分才有意义）。
+    #   · 48 队世界杯还会多返回一张「最佳第三名」聚合表（>4 队，各组第 3 横向排）。
+    #     规则：各组前 2 + 8 个最好的小组第 3 共 32 队晋级。故这张表【有条件】才显示——
+    #     仅当已打到第 2/3 轮（两队已赛≥1 场、出线形势明朗）且两队中有人正排小组第 3
+    #     （出线生死线）时才附上并标注「前8晋级」；否则（第1轮/都在前二或垫底）不列，
+    #     免得跨组数据干扰单场研判。
+    if len(tables) > 1:
+        group_tables = [t for t in tables if len(t) <= 4]   # 排除聚合表
+        both = [t for t in group_tables
+                if _has(t, home_name) and _has(t, away_name)]
+        if not both:                       # 淘汰赛两队不同组：各列其首张组表
+            for nm in (home_name, away_name):
+                for t in group_tables:
+                    if _has(t, nm) and t not in both:
+                        both.append(t)
+                        break
+        if both:
+            lines = ["【积分榜（两队所在小组完整排名，仅组内可比）】"]
+            for table in both:
+                grp = (table[0].get("group") if table else None) or "本组"
+                lines.append(f"〔{grp}〕")
+                lines += [_row_line(r) for r in table]
+            # 轮次 = 组内各队已赛场次最大值（0=第1轮前,1=第2轮,2=第3轮）
+            rnd = max((_played(r) for t in both for r in t), default=0)
+            focus_is_third = any(
+                r.get("rank") == 3 and r.get("team", {}).get("name") in focus
+                for t in both for r in t)
+            if rnd >= 1 and focus_is_third:
+                third = next((t for t in tables
+                              if len(t) > 4 and _has(t, focus)), None)
+                if third:
+                    lines.append("〔最佳第三名排名（前8晋级淘汰赛）〕")
+                    lines += [_row_line(r) for r in third]
+            return "\n".join(lines)
+        # group_tables 找不到两队（数据异常）→ 落到下方单表逻辑
 
     # 单表联赛（非分组）：列两队 + 前4
     lines = ["【积分榜（仅列两队及前4）】"]
