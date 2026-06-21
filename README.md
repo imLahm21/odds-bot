@@ -261,6 +261,22 @@ sudo systemctl enable --now odds-bot
 journalctl -u odds-bot -f      # 看日志
 ```
 
+### 改 .env 自动重启（白名单保存即生效）
+
+改 `.env`（尤其是 TG 白名单）后必须重启 bot 才生效，手动 `systemctl restart` 容易忘，导致已授权用户被当未授权访客挡掉。用 `setup_env_watch.sh` 让 systemd 监听 `.env`，保存即自动重启：
+
+```bash
+cd ~/odds_bot
+bash setup_env_watch.sh          # 安装并自检
+bash setup_env_watch.sh --remove # 卸载
+```
+
+原理：一个 systemd `path` 单元（`odds-bot-env.path`）盯住 `.env`，文件一变就触发一次性 service `odds-bot-restart.service` 去 `restart odds-bot`。配一次永久生效，换服务器/重装跑一次即可。
+
+- 若发现保存后没自动重启：把 `/etc/systemd/system/odds-bot-env.path` 里的 `PathModified` 改成 `PathChanged`，再 `sudo systemctl daemon-reload && sudo systemctl restart odds-bot-env.path`（vim 改名覆盖写入偶尔只触发 `PathChanged`）。
+- 短时间反复存盘被限流报 `start-limit`：`sudo systemctl reset-failed odds-bot`。
+
+
 ---
 
 ## 增删联赛
