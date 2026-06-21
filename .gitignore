@@ -16,6 +16,7 @@ report/
 *.log
 *.db-wal
 *.db-shm
+*.bak
 
 # ===== Python =====
 __pycache__/
