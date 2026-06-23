@@ -57,18 +57,43 @@ def task_a_update_fixtures() -> int:
 
 
 # ─── 共用：抓一批比赛的赔率 ──────────────────────────────────────────────────
-def _fetch_odds_for(conn, fixtures: list[tuple]) -> int:
-    """对给定 (fixture_id, commence_utc, home, away) 列表抓盘存库。返回新增行数。"""
+def _fetch_odds_for(conn, fixtures: list[tuple], task: str = "B",
+                    floor: int | None = None) -> int:
+    """对给定 (fixture_id, commence_utc, home, away) 列表抓盘存库。返回新增行数。
+    额度护栏：每场抓取前检查当日剩余额度，低于 floor 则提前中止本轮
+    （不再无意义地撞 429），并给管理员推一条当日去重的 TG 告警。
+    floor 默认取 config.ODDS_QUOTA_FLOOR；分级护栏让 B 先停、C/D 后停，
+    优先保住临场高频抓取。task 仅用于日志/告警文案。
+    """
+    if floor is None:
+        floor = config.ODDS_QUOTA_FLOOR
     snapshot = _iso(_utc_now())
     pool_ids = db.get_enabled_bookmaker_ids(conn)   # 动态庄家池
     total_rows = 0
+    done = 0
     for fid, commence, home, away in fixtures:
+        remaining = api_client.last_remaining()
+        if remaining is not None and remaining < floor:
+            log.warning("【任务%s】当日剩余额度 %d < 护栏 %d，本轮提前中止"
+                        "（已抓 %d/%d 场）",
+                        task, remaining, floor, done, len(fixtures))
+            try:
+                from . import tgbot
+                tgbot.alert_admins(
+                    f"⚠️ API 额度护栏触发：当日剩余 {remaining} < {floor}，"
+                    f"赛前抓取(任务{task})本轮提前中止，已抓 {done}/{len(fixtures)} 场。"
+                    f"高频临场/走地优先保留。",
+                    dedup_key=f"odds_quota_floor_{task}")
+            except Exception as e:  # 告警失败不能拖垮抓取
+                log.warning("额度告警推送失败：%s", e)
+            break
         resp = api_client.fetch_odds(fid)
         if resp:
             rows = parser.parse_odds_response(resp[0], snapshot, commence,
                                               pool_ids=pool_ids)
             n = db.insert_odds(conn, rows)
             total_rows += n
+        done += 1
         time.sleep(config.REQUEST_THROTTLE_SEC)
     return total_rows
 
@@ -84,7 +109,7 @@ def task_b_regular_odds() -> int:
         end = _iso(now + timedelta(days=config.ODDS_DAYS_AHEAD))
         fixtures = db.get_fixtures_between(conn, start, end)
         log.info("  未来 %d 天共 %d 场待抓", config.ODDS_DAYS_AHEAD, len(fixtures))
-        n = _fetch_odds_for(conn, fixtures)
+        n = _fetch_odds_for(conn, fixtures, task="B")
         db.checkpoint_wal(conn)
     finally:
         conn.close()
@@ -105,7 +130,8 @@ def task_c_near_kickoff() -> int:
             log.debug("【任务C】当前无临场比赛")
             return 0
         log.info("【任务C】%d 场临场比赛", len(fixtures))
-        n = _fetch_odds_for(conn, fixtures)
+        n = _fetch_odds_for(conn, fixtures, task="C",
+                            floor=config.ODDS_QUOTA_FLOOR_NEAR)
         db.checkpoint_wal(conn)
     finally:
         conn.close()
@@ -128,7 +154,8 @@ def task_d_sprint() -> int:
             log.debug("【任务D】当前无冲刺窗口比赛")
             return 0
         log.info("【任务D】%d 场冲刺窗口比赛", len(fixtures))
-        n = _fetch_odds_for(conn, fixtures)
+        n = _fetch_odds_for(conn, fixtures, task="D",
+                            floor=config.ODDS_QUOTA_FLOOR_NEAR)
         db.checkpoint_wal(conn)
     finally:
         conn.close()
