@@ -140,6 +140,27 @@ def answer_callback(callback_id: str, text: str = "") -> None:
     _post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
 
+# ─── 管理员告警（额度等运维信号）────────────────────────────────────────────
+# 记录"已告警的日期"做去重，避免一天内反复推送同一类告警刷屏。
+# key = 告警类别字符串, value = 已告警的北京日期（YYYY-MM-DD）
+_alerted_on: dict[str, str] = {}
+
+
+def alert_admins(text: str, dedup_key: str | None = None) -> None:
+    """给所有管理员推一条运维告警。
+    dedup_key 给定时，同一 key 当日只推一次（跨北京日期自然重置）。
+    无管理员配置时退化为推给全体 ALLOWED，避免告警彻底没人收到。
+    """
+    if dedup_key is not None:
+        today = _today_cst()
+        if _alerted_on.get(dedup_key) == today:
+            return
+        _alerted_on[dedup_key] = today
+    targets = ADMIN_CHAT_IDS or ALLOWED_CHAT_IDS
+    for cid in targets:
+        send(cid, text, plain=True)
+
+
 def send_document(chat_id: int, filename: str, content: bytes,
                   caption: str = "") -> None:
     """以文件形式发送（multipart 上传）。content 为文件字节。"""
