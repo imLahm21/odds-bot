@@ -298,7 +298,8 @@ def _help_for(chat_id: int) -> str:
 def _cmd_status(chat_id: int) -> None:
     conn = db.get_conn()
     try:
-        leagues = [n for _, n, _, e in db.list_leagues(conn) if e]
+        leagues = [config.league_label(lid, n)
+                   for lid, n, _, e in db.list_leagues(conn) if e]
         bms = [n for _, n, e in db.list_bookmakers(conn) if e]
     finally:
         conn.close()
@@ -404,7 +405,7 @@ def _cmd_fixtures(chat_id: int) -> None:
         # 直接查，多带一列 league_name（不动 db.get_fixtures_between 的 4 列结构，
         # 那个被调度器解包复用）
         fixtures = conn.execute(
-            "SELECT fixture_id, commence_utc, home_team, away_team, league_name "
+            "SELECT fixture_id, commence_utc, home_team, away_team, league_name, league_id "
             "FROM fixtures WHERE commence_utc BETWEEN ? AND ? "
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
@@ -430,9 +431,10 @@ def _cmd_fixtures(chat_id: int) -> None:
 
     lines = ["<b>赛程（过去 3 天 ~ 未来 3 天）</b>",
              "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
-    for fid, commence, home, away, league in fixtures[:40]:
+    for fid, commence, home, away, league, league_id in fixtures[:40]:
         mark = "✅" if kicked_off(commence) else "🔵"
-        lg = f"（{league}）" if league else ""
+        label = config.league_label(league_id, league)
+        lg = f"（{label}）" if label else ""
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  "
                      f"{home} vs {away}{lg}")
     send(chat_id, "\n".join(lines))
