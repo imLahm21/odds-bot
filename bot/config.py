@@ -254,3 +254,35 @@ LEAGUE_SEARCH_ALIASES: dict[str, str] = {
     "世界杯": "World Cup", "欧冠": "UEFA Champions",
     "欧联": "UEFA Europa", "欧国联": "UEFA Nations",
 }
+
+# ─── league_id → 中文名：/status、/fixtures 等展示时给英文库名加中文注释 ────────
+# 服务器库里 league_name 多为英文（如 "Premier League"、"Super League"），
+# 展示时按 league_id 查这张表，渲染成「中文 英文」便于辨认。
+# 同名英文联赛（Super League / Premiership / Premier Division）必须靠 id 区分国家。
+# 维护：新增启用联赛时把它的 league_id 补进来即可；查不到则原样显示英文。
+LEAGUE_ZH_NAMES: dict[int, str] = {
+    # 五大联赛
+    39:  "英超", 140: "西甲", 78: "德甲", 135: "意甲", 61: "法甲",
+    # 其他顶级国内联赛
+    88:  "荷甲", 94: "葡超", 144: "比甲", 164: "冰岛超", 244: "芬兰超",
+    169: "中超", 179: "苏超", 357: "爱尔兰超", 307: "沙特联",
+    98:  "日职联", 292: "韩K联", 188: "澳超", 253: "美职联",
+    71:  "巴西甲", 262: "墨超",
+    # 顶级杯赛
+    45:  "英格兰足总杯", 171: "英格兰足总杯", 143: "西班牙国王杯",
+    81:  "德国杯", 137: "意大利杯", 66: "法国杯",
+    # 跨国/国家队
+    2:   "欧冠", 3: "欧联", 848: "欧协联", 1: "世界杯", 5: "欧国联",
+}
+
+
+def league_label(league_id: int | None, league_name: str | None) -> str:
+    """把英文库名渲染成「中文 英文」；查不到中文或库名已含中文则原样返回。"""
+    name = (league_name or "").strip()
+    zh = LEAGUE_ZH_NAMES.get(league_id) if league_id is not None else None
+    if not zh:
+        return name or (str(league_id) if league_id is not None else "")
+    # 库名本身已带中文（如「冰岛超 Úrvalsdeild」）就不重复加
+    if any('一' <= c <= '鿿' for c in name):
+        return name
+    return f"{zh} {name}".strip() if name else zh
