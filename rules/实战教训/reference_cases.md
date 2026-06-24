@@ -21,6 +21,7 @@
 | 18 | 浙江 4-1 山东泰山 | 2026-05-20 | 中超 | 上盘大胜 | 十三、十四、十五 | [20260520_case_01_zhejiang_vs_shandong.md](20260520_case_01_zhejiang_vs_shandong.md) |
 | 19 | Chelsea 2-1 Tottenham | 2026-05-20 | 英超 | 上盘赢球赢盘 | 十六、十七 | 见下方详细条目 |
 | 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局走盘 | — | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
+| 21 | England 0-0 Ghana | 2026-06-24 | 世界杯小组赛 | 深盘上盘全输，冷平 | feedback_14 | [England_vs_Ghana_review.md](../../report/2026-06-24/England_vs_Ghana_review.md) |
 
 > 案例 11~17 的完整论证已并入 [reference_case_lessons.md](reference_case_lessons.md) 对应章节，此处仅保留索引。
 > 案例 18~20 因衍生独立 feedback / case 文件，详细内容见各文件。
@@ -42,6 +43,9 @@
 - 案例 16（中超，第十一章）— 长期给水+临场④协同压主胜=诱上变体
 - 案例 17（意甲，第十二章）— 碾压级基本面下"诱上信号"的过滤
 - 案例 20（英超）— 平局赔率持续上升+冠军压力客场保平争胜
+
+### 强队深盘 / 杯赛冷平类
+- 案例 21（世界杯，feedback_14）— 强队升盘至 -1.75/-2.0 深盘诱上 + 高平赔冷平；2.5大球低水与3.5小球低水并存须收敛比分
 
 ### 基本面权重类
 - 案例 12（中超，第五、六章）— 连续降盘+主场反弹+对手质量量化
