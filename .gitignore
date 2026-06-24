@@ -7,6 +7,9 @@ auth.json
 secrets.*
 
 # ===== 数据资产 (用备份，不进 git) =====
+# data/ 与 report/ 均不进 git：本地和服务器都各自跑 main.py 抓取，
+# 两边写同一路径 data/<日期>/<主队>_vs_<客队>_stages.csv，纳入 git 会导致 pull 撞名失败。
+data/
 report/
 *.db
 *.sqlite
