@@ -79,8 +79,10 @@ def available() -> bool:
     return bool(LLM_BASE_URL and LLM_API_KEY)
 
 
-def _call_llm(system: str, user: str) -> str:
-    """统一的 chat/completions 调用 + 错误处理；失败返回错误说明串。"""
+def _call_llm(system: str, user: str, effort: str = "") -> str:
+    """统一的 chat/completions 调用 + 错误处理；失败返回错误说明串。
+    effort 非空时附带 reasoning_effort（low/medium/high/xhigh）；空则不传（旧行为）。
+    """
     payload = {
         "model": config.LLM_MODEL,
         "messages": [
@@ -89,6 +91,8 @@ def _call_llm(system: str, user: str) -> str:
         ],
         "max_tokens": config.LLM_MAX_TOKENS,
     }
+    if effort:
+        payload["reasoning_effort"] = effort
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "Content-Type": "application/json",
@@ -117,9 +121,10 @@ def _call_llm(system: str, user: str) -> str:
         return f"LLM 网络错误：{e}"
 
 
-def _stream_llm(system: str, user: str):
+def _stream_llm(system: str, user: str, effort: str = ""):
     """流式 chat/completions。逐增量 yield ('delta', 累积全文)；
     正常结束 yield ('done', 全文)，出错 yield ('error', 错误串)。
+    effort 非空时附带 reasoning_effort（low/medium/high/xhigh）；空则不传。
     """
     import json
     payload = {
@@ -131,6 +136,8 @@ def _stream_llm(system: str, user: str):
         "max_tokens": config.LLM_MAX_TOKENS,
         "stream": True,
     }
+    if effort:
+        payload["reasoning_effort"] = effort
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "Content-Type": "application/json",
@@ -241,13 +248,13 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
 
 def analyze(csv_text: str, fundamentals: str,
             home: str, away: str, league: str,
-            extra_instruction: str = "") -> str:
+            extra_instruction: str = "", effort: str = "") -> str:
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
-    return _call_llm(system, user)
+    return _call_llm(system, user, effort)
 
 
 def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
@@ -289,13 +296,14 @@ _TOTAL_STAGES = 7
 
 def analyze_stream(csv_text: str, fundamentals: str,
                    home: str, away: str, league: str,
-                   extra_instruction: str = ""):
+                   extra_instruction: str = "", effort: str = ""):
     """流式精算。yield 进度/结果事件，供 bot 实时播报：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
       ('done', 完整报告)
       ('error', 错误串)
     阶段识别：检测累积全文里新出现的 `### N.` 主段标题。
     extra_instruction: 用户自定义侧重，透传给 _analyze_prompts。
+    effort: 推理强度（low/medium/high/xhigh），透传给 _stream_llm。
     """
     import re
     if not available():
@@ -306,7 +314,7 @@ def analyze_stream(csv_text: str, fundamentals: str,
     # 匹配行首的 "### 3." / "###3." 等主段标题，捕获段号
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
-    for kind, payload in _stream_llm(system, user):
+    for kind, payload in _stream_llm(system, user, effort):
         if kind == "delta":
             for m in head_re.finditer(payload):
                 n = int(m.group(1))
