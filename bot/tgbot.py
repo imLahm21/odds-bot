@@ -53,9 +53,9 @@ _ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
-# 等待用户回复自定义侧重的会话状态：chat_id -> fixture_id
-# 用户点「✍️ 自定义侧重」后置位，下一条非命令文本被当作侧重消费后清除。
-_pending_custom: dict[int, int] = {}
+# 等待用户回复自定义侧重的会话状态：chat_id -> (fixture_id, effort)
+# 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
+_pending_custom: dict[int, tuple[int, str]] = {}
 
 # 访客每日 /analyze 计数：持久化在 odds.db 的 analyze_usage 表（重启不清零，
 # 跨北京日期自然分行）。管理员不计数、不受限。
@@ -920,6 +920,20 @@ def _archive_report(meta: dict, report: str, suffix: str = "report",
         return None
 
 
+def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
+    """构造推理强度选择键盘。mode='p'(预设)/'c'(自定义)。
+    管理员显示全部 4 档；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/中）。
+    回调格式 ae:<mode>:<fid>:<effort>。
+    """
+    admin = _is_admin(chat_id)
+    row = []
+    for eff, label in config.LLM_EFFORT_LABELS.items():
+        if not admin and eff not in config.LLM_EFFORT_VISITOR_ALLOWED:
+            continue
+        row.append({"text": label, "callback_data": f"ae:{mode}:{fid}:{eff}"})
+    return {"inline_keyboard": [row]}
+
+
 def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     """第一步：展示某场基本面 + 盘口走势预览，附【开始SOP精算】按钮。
 
@@ -969,12 +983,15 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     send(chat_id, "以上为该场的基本面与盘口数据。是否用 SOP 跑结果预测？\n"
                   "🎯 预设精算 = 直接按标准 SOP 跑；\n"
                   "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
-                  "（gpt-5.5 推理较慢，约 1~3 分钟）", kb)
+                  "选完后再选推理强度（低/中/高/超高）。\n"
+                  "（gpt-5.5 推理较慢，约 1~3 分钟；强度越高越慢）", kb)
 
 
-def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
+def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
+             effort: str = "") -> None:
     """第二步：真正跑 SOP 精算。
     extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
+    effort 为推理强度（low/medium/high/xhigh），透传给 analyzer。
     """
     from . import fundamentals
     if not analyzer.available():
@@ -1008,6 +1025,9 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
 
     # 流式精算 + 原地进度播报
     tag = "✍️自定义" if extra_instruction.strip() else "🎯预设"
+    eff_label = config.LLM_EFFORT_LABELS.get(effort, "")
+    if eff_label:
+        tag += f"·{eff_label}"
     title = (f"⏳ 正在精算 {meta['home']} vs {meta['away']}"
              f"（{tag}，gpt-5.5，约 1~3 分钟）")
     if extra_instruction.strip():
@@ -1031,7 +1051,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "") -> None:
     report = None
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
                                       meta["away"], meta["league"],
-                                      extra_instruction):
+                                      extra_instruction, effort):
         if ev[0] == "stage":
             _, n, name = ev
             done_stages = [analyzer._STAGE_NAMES[i] for i in range(1, n)]
@@ -1186,7 +1206,7 @@ def handle_message(msg: dict) -> None:
 
     # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
     if chat_id in _pending_custom:
-        fid = _pending_custom.pop(chat_id)
+        fid, eff = _pending_custom.pop(chat_id)
         if text.lstrip("/").lower() in ("cancel", "取消"):
             send(chat_id, "已取消自定义精算。")
             return
@@ -1196,7 +1216,7 @@ def handle_message(msg: dict) -> None:
         else:
             send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
             try:
-                _run_sop(chat_id, fid, extra_instruction=text)
+                _run_sop(chat_id, fid, extra_instruction=text, effort=eff)
             except Exception:
                 log.exception("自定义 SOP 精算执行出错")
                 send(chat_id, "精算执行出错，请查看服务器日志。")
@@ -1249,7 +1269,8 @@ def handle_callback(cb: dict) -> None:
     """处理内联按钮点击：
     tl:<league_id>[:<page>] 联赛开关 / lp:<page> 联赛翻页 /
     ag:<league_id>:<season> 搜索结果添加 / tb:<bookmaker_id> 庄家开关 /
-    az:<fixture_id> 预设精算 / ac:<fixture_id> 自定义侧重
+    az:<fixture_id> 预设精算 / ac:<fixture_id> 自定义侧重 /
+    ae:<mode>:<fixture_id>:<effort> 选推理强度后执行（mode=p预设/c自定义）
     """
     cb_id = cb.get("id")
     data = cb.get("data", "")
@@ -1290,29 +1311,58 @@ def handle_callback(cb: dict) -> None:
             edit_markup(chat_id, message_id, {"inline_keyboard": []})
         return
 
-    # 精算按钮：先应答消除转圈，再同步跑 SOP（耗时 1~3 分钟）
+    # 预设精算按钮：不直接跑，先弹推理强度选择（ae:p:<fid>:<effort>）
     if data.startswith("az:"):
-        answer_callback(cb_id, "已开始精算，请稍候…")
-        # 点完即移除按钮，避免重复触发
+        fid = int(data[3:])
+        answer_callback(cb_id, "请选择推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
-        try:
-            _run_sop(chat_id, int(data[3:]))
-        except Exception:
-            log.exception("SOP 精算执行出错")
-            send(chat_id, "精算执行出错，请查看服务器日志。")
+        send(chat_id, "🎯 预设精算：请选择推理强度\n"
+                      "低/中=快、省额度；高/超高=更慢更深（超高约数分钟）。",
+             _effort_keyboard(chat_id, "p", fid))
         return
 
-    # 自定义侧重按钮：置位待输入状态，引导用户回复一条侧重要求
+    # 自定义侧重按钮：也先选推理强度（ae:c:<fid>:<effort>），选完再要侧重文字
     if data.startswith("ac:"):
         fid = int(data[3:])
-        answer_callback(cb_id, "请回复你的侧重要求")
+        answer_callback(cb_id, "请选择推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
-        _pending_custom[chat_id] = fid
-        send(chat_id,
-             f"✍️ 请发一条消息，描述对 fixture {fid} 的精算侧重要求\n"
-             "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
-             "（直接发文字即可；发 /cancel 取消）",
-             {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
+        send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再发你的侧重要求。",
+             _effort_keyboard(chat_id, "c", fid))
+        return
+
+    # 推理强度选定：ae:<mode>:<fid>:<effort>
+    #   mode=p 预设 → 直接跑；mode=c 自定义 → 置位待输入侧重文字
+    if data.startswith("ae:"):
+        try:
+            _, mode, sfid, eff = data.split(":")
+            fid = int(sfid)
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        # 权限校验：访客不能选超出白名单的高强度（防伪造回调）
+        if eff not in config.LLM_EFFORT_LABELS or (
+                not _is_admin(chat_id)
+                and eff not in config.LLM_EFFORT_VISITOR_ALLOWED):
+            answer_callback(cb_id, "该强度不可用")
+            return
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        eff_label = config.LLM_EFFORT_LABELS[eff]
+        if mode == "c":
+            answer_callback(cb_id, f"强度：{eff_label}，请回复侧重要求")
+            _pending_custom[chat_id] = (fid, eff)
+            send(chat_id,
+                 f"✍️ 强度已设【{eff_label}】。请发一条消息，描述对 fixture {fid} "
+                 "的精算侧重要求\n"
+                 "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
+                 "（直接发文字即可；发 /cancel 取消）",
+                 {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
+        else:
+            answer_callback(cb_id, f"强度：{eff_label}，已开始精算…")
+            try:
+                _run_sop(chat_id, fid, effort=eff)
+            except Exception:
+                log.exception("SOP 精算执行出错")
+                send(chat_id, "精算执行出错，请查看服务器日志。")
         return
 
     # 配置类按钮（联赛/庄家开关、翻页、搜索添加）仅管理员可点
