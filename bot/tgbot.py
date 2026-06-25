@@ -1078,10 +1078,8 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
 
 
 def _cmd_review(chat_id: int, args: list[str]) -> None:
-    """对已结束的比赛做【正向盲推 + 对照】复盘：
-    第一遍只喂盘口走势(不给比分)正向跑 SOP 得预判 → 第二遍揭晓真实比分做对照归因。
-    两遍各自实时播报进度，最后两份报告都发回并归档。"""
-    from . import api_client
+    """复盘第一步：校验 + 弹推理强度选择键盘（ae:r:<fid>:<effort>）。
+    选完强度才真正开跑（见 _run_review）。强度同时用于盲推与对照两遍。"""
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/review &lt;fixture_id&gt;（对已结束的比赛复盘）")
         return
@@ -1089,6 +1087,25 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
         return
     fid = int(args[0])
+    # 盘口数据校验（读库，无 API 成本）；是否结束的校验留给 _run_review（它要拉结果）
+    csv_str, _ = _build_csv(fid)
+    if not csv_str:
+        send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
+        return
+    send(chat_id, "🔬 复盘（盲推 + 对照两遍）：请选择推理强度\n"
+                  "低/中=快、省额度；高/超高=更慢更深。该强度同时用于两遍。",
+         _effort_keyboard(chat_id, "r", fid))
+
+
+def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
+    """对已结束的比赛做【正向盲推 + 对照】复盘：
+    第一遍只喂盘口走势(不给比分)正向跑 SOP 得预判 → 第二遍揭晓真实比分做对照归因。
+    两遍各自实时播报进度，最后两份报告都发回并归档。
+    effort 为推理强度，同时用于盲推与对照两遍。"""
+    from . import api_client
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
+        return
     csv_str, meta = _build_csv(fid)
     if not csv_str:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
@@ -1127,7 +1144,8 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
     msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]))
     forecast = None
     for ev in analyzer.review_blind_stream(csv_str, meta["home"],
-                                           meta["away"], meta["league"]):
+                                           meta["away"], meta["league"],
+                                           effort):
         if ev[0] == "stage":
             if msg_a:
                 edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]))
@@ -1167,7 +1185,8 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
     msg_id = send(chat_id, progress_text(1))
     report = None
     for ev in analyzer.review_stream(csv_str, forecast, result_text,
-                                     meta["home"], meta["away"], meta["league"]):
+                                     meta["home"], meta["away"], meta["league"],
+                                     effort):
         if ev[0] == "stage":
             if msg_id:
                 edit_text(chat_id, msg_id, progress_text(ev[1]))
@@ -1270,7 +1289,7 @@ def handle_callback(cb: dict) -> None:
     tl:<league_id>[:<page>] 联赛开关 / lp:<page> 联赛翻页 /
     ag:<league_id>:<season> 搜索结果添加 / tb:<bookmaker_id> 庄家开关 /
     az:<fixture_id> 预设精算 / ac:<fixture_id> 自定义侧重 /
-    ae:<mode>:<fixture_id>:<effort> 选推理强度后执行（mode=p预设/c自定义）
+    ae:<mode>:<fixture_id>:<effort> 选推理强度后执行（mode=p预设/c自定义/r复盘）
     """
     cb_id = cb.get("id")
     data = cb.get("data", "")
@@ -1331,7 +1350,7 @@ def handle_callback(cb: dict) -> None:
         return
 
     # 推理强度选定：ae:<mode>:<fid>:<effort>
-    #   mode=p 预设 → 直接跑；mode=c 自定义 → 置位待输入侧重文字
+    #   mode=p 预设精算→直接跑；c 自定义→置位待输入侧重文字；r 复盘→直接跑两遍
     if data.startswith("ae:"):
         try:
             _, mode, sfid, eff = data.split(":")
@@ -1356,6 +1375,13 @@ def handle_callback(cb: dict) -> None:
                  "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
                  "（直接发文字即可；发 /cancel 取消）",
                  {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
+        elif mode == "r":
+            answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…")
+            try:
+                _run_review(chat_id, fid, effort=eff)
+            except Exception:
+                log.exception("复盘执行出错")
+                send(chat_id, "复盘执行出错，请查看服务器日志。")
         else:
             answer_callback(cb_id, f"强度：{eff_label}，已开始精算…")
             try:

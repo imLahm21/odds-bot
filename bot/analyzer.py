@@ -327,14 +327,17 @@ def analyze_stream(csv_text: str, fundamentals: str,
             yield ("error", payload)
 
 
-def review_blind_stream(csv_text: str, home: str, away: str, league: str):
+def review_blind_stream(csv_text: str, home: str, away: str, league: str,
+                        effort: str = ""):
     """复盘第一遍【盲推】：只喂盘口 CSV，不给比分、不给基本面，
     让模型从上到下正向跑 SOP 步骤 1~7 得出赛前预判（它此时并不知道结果）。
     直接复用 analyze_stream（基本面置空），阶段名沿用精算 7 段。
+    effort: 推理强度，透传给 analyze_stream。
     """
     blind_note = ("（赛后复盘·第一遍盲推：本次不提供基本面与比赛结果，"
                   "请仅依据盘口走势正向执行 SOP 步骤1~7，给出赛前预判结论。）")
-    yield from analyze_stream(csv_text, blind_note, home, away, league)
+    yield from analyze_stream(csv_text, blind_note, home, away, league,
+                              effort=effort)
 
 
 def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
@@ -388,13 +391,13 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
 
 
 def review(csv_text: str, forecast_text: str, result_text: str,
-           home: str, away: str, league: str) -> str:
+           home: str, away: str, league: str, effort: str = "") -> str:
     """复盘第二遍对照（阻塞版）。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
     system, user = _review_prompts(csv_text, forecast_text, result_text,
                                    home, away, league)
-    return _call_llm(system, user)
+    return _call_llm(system, user, effort)
 
 
 # 复盘报告 ### N. 段标题 → 进度阶段名（对照复盘第二遍）
@@ -410,12 +413,13 @@ _REVIEW_TOTAL_STAGES = 6
 
 
 def review_stream(csv_text: str, forecast_text: str, result_text: str,
-                  home: str, away: str, league: str):
+                  home: str, away: str, league: str, effort: str = ""):
     """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
       ('error', 错误串)
     forecast_text 为第一遍盲推产出的预判全文。
+    effort: 推理强度，透传给 _stream_llm。
     """
     import re
     if not available():
@@ -425,7 +429,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
                                    home, away, league)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
-    for kind, payload in _stream_llm(system, user):
+    for kind, payload in _stream_llm(system, user, effort):
         if kind == "delta":
             for m in head_re.finditer(payload):
                 n = int(m.group(1))
