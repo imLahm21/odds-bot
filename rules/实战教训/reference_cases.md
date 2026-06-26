@@ -22,6 +22,7 @@
 | 19 | Chelsea 2-1 Tottenham | 2026-05-20 | 英超 | 上盘赢球赢盘 | 十六、十七 | 见下方详细条目 |
 | 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局走盘 | — | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
 | 21 | England 0-0 Ghana | 2026-06-24 | 世界杯小组赛 | 深盘上盘全输，冷平 | feedback_14 | [England_vs_Ghana_review.md](../../report/2026-06-24/England_vs_Ghana_review.md) |
+| 22 | Ecuador 2-1 Germany | 2026-06-26 | 世界杯小组赛 | 受让方+1赢盘且直接主胜 | 十九 | [Ecuador_vs_Germany_review.md](../../report/2026-06-26/Ecuador_vs_Germany_review.md) |
 
 > 案例 11~17 的完整论证已并入 [reference_case_lessons.md](reference_case_lessons.md) 对应章节，此处仅保留索引。
 > 案例 18~20 因衍生独立 feedback / case 文件，详细内容见各文件。
@@ -46,6 +47,7 @@
 
 ### 强队深盘 / 杯赛冷平类
 - 案例 21（世界杯，feedback_14）— 强队升盘至 -1.75/-2.0 深盘诱上 + 高平赔冷平；2.5大球低水与3.5小球低水并存须收敛比分
+- 案例 22（世界杯，第十九章）— 热门强队升盘至深盘后临场降温，受让方+1赢盘直接升级为受让方主胜；亚盘对≠胜平负对
 
 ### 基本面权重类
 - 案例 12（中超，第五、六章）— 连续降盘+主场反弹+对手质量量化
