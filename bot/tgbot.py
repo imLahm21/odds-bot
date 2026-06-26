@@ -22,6 +22,7 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
 import os
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dotenv import load_dotenv
@@ -32,6 +33,12 @@ load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# 走地研判后台线程池：抓取循环(task_e)只管发盘口快报，LLM 研判丢这里异步跑，
+# 研判完成再追发一条 💡 消息。这样 1min 一轮的抓取永远不被 LLM(最坏 30s)拖慢。
+# daemon 线程，进程退出不阻塞；max_workers 限并发，避免研判堆积压垮网关。
+_live_brief_pool = ThreadPoolExecutor(max_workers=3,
+                                      thread_name_prefix="live-brief")
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -715,8 +722,12 @@ def _fmt_live_lines(rows: list[dict]) -> str:
 
 def push_live_update(chat_id: int, fid: int, entry: dict,
                      rows: list[dict], deltas: list[str]) -> None:
-    """走地异动推送：盘口快报 + 检测到的异动 + LLM 一句话研判。
-    供 scheduler.task_e_live_broadcast 后台调用。"""
+    """走地异动推送：立即发【盘口快报】，LLM 一句话研判丢后台线程异步追发。
+    供 scheduler.task_e_live_broadcast 后台调用。
+
+    解耦要点：盘口快报(进球/水位/封盘)是确定性数据，必须秒级到达；LLM 研判最坏
+    要 30s，绝不能卡住 1min 一轮的抓取循环。故本函数同步只做发快报，研判提交到
+    _live_brief_pool 后立即返回；研判线程跑完再单独 send 一条 💡 消息。"""
     status = entry.get("fixture", {}).get("status", {})
     elapsed = status.get("elapsed")
     teams = entry.get("teams", {})
@@ -730,24 +741,34 @@ def push_live_update(chat_id: int, fid: int, entry: dict,
     home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
     score = f"{hg}-{ag}"
 
+    live_lines = _fmt_live_lines(rows)
     parts = [f"🔴 走地 | {home} vs {away}",
              f"第 {elapsed}′  比分 {score}", "",
              "异动："]
     parts += [f"  {d}" for d in deltas]
     parts.append("")
-    parts.append(_fmt_live_lines(rows))
+    parts.append(live_lines)
+    # ① 盘口快报：立即发，不等 LLM
+    send(chat_id, "\n".join(parts), plain=True)
 
-    # LLM 走地研判（失败/未配置则跳过，不阻塞盘口快报）
+    # ② LLM 研判：丢后台线程，跑完再追发 💡。绝不阻塞抓取循环。
+    _live_brief_pool.submit(_async_live_brief, chat_id, fid,
+                            live_lines, deltas, home, away, elapsed, score)
+
+
+def _async_live_brief(chat_id: int, fid: int, live_lines: str,
+                       deltas: list[str], home: str, away: str,
+                       elapsed, score: str) -> None:
+    """后台线程：跑走地 LLM 研判，成功则单独追发一条 💡 消息。
+    失败/未配置/超时静默跳过——盘口快报已先行送达，不影响主信息。"""
     try:
-        brief = analyzer.live_brief(_fmt_live_lines(rows), deltas, home, away,
+        brief = analyzer.live_brief(live_lines, deltas, home, away,
                                     elapsed, score)
     except Exception as e:
         log.warning("走地研判失败 fixture %d: %s", fid, e)
-        brief = ""
+        return
     if brief and not brief.startswith(("LLM", "未配置")):
-        parts.append("")
-        parts.append(f"💡 {brief}")
-    send(chat_id, "\n".join(parts), plain=True)
+        send(chat_id, f"💡 {home} vs {away} 第 {elapsed}′：{brief}", plain=True)
 
 
 # 复盘主盘口取盘优先级：Pinnacle > Bet365（与凯利锚一致）

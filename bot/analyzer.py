@@ -79,17 +79,19 @@ def available() -> bool:
     return bool(LLM_BASE_URL and LLM_API_KEY)
 
 
-def _call_llm(system: str, user: str, effort: str = "") -> str:
+def _call_llm(system: str, user: str, effort: str = "",
+              model: str = "", timeout: int = 0, max_tokens: int = 0) -> str:
     """统一的 chat/completions 调用 + 错误处理；失败返回错误说明串。
     effort 非空时附带 reasoning_effort（low/medium/high/xhigh）；空则不传（旧行为）。
+    model/timeout/max_tokens 非默认值时覆盖 config 默认（走地用轻量模型/短超时）。
     """
     payload = {
-        "model": config.LLM_MODEL,
+        "model": model or config.LLM_MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "max_tokens": config.LLM_MAX_TOKENS,
+        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
     }
     if effort:
         payload["reasoning_effort"] = effort
@@ -100,7 +102,7 @@ def _call_llm(system: str, user: str, effort: str = "") -> str:
     try:
         r = requests.post(f"{LLM_BASE_URL}/chat/completions",
                           json=payload, headers=headers,
-                          timeout=config.LLM_TIMEOUT)
+                          timeout=timeout or config.LLM_TIMEOUT)
         if r.status_code != 200:
             log.error("LLM HTTP %s: %s", r.status_code, r.text[:500])
             return f"LLM 请求失败 HTTP {r.status_code}：{r.text[:300]}"
@@ -111,7 +113,7 @@ def _call_llm(system: str, user: str, effort: str = "") -> str:
         return choices[0].get("message", {}).get("content", "").strip() \
             or "LLM 返回空内容"
     except requests.exceptions.Timeout:
-        return f"LLM 超时（>{config.LLM_TIMEOUT}s）。gpt-5.5 推理较慢，可稍后重试。"
+        return f"LLM 超时（>{timeout or config.LLM_TIMEOUT}s）。推理较慢，可稍后重试。"
     except UnicodeEncodeError as e:
         log.error("LLM 请求头编码失败（key/url 含非 ASCII 字符）: %s", e)
         return ("LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时混入了"
@@ -278,7 +280,11 @@ def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
         f"### 检测到的异动\n" + "\n".join(f"- {d}" for d in deltas) + "\n\n"
         f"### 当前走地主盘口\n{live_lines}\n"
     )
-    return _call_llm(system, user)
+    return _call_llm(system, user,
+                     effort=config.LLM_LIVE_EFFORT,
+                     model=config.LLM_LIVE_MODEL,
+                     timeout=config.LLM_LIVE_TIMEOUT,
+                     max_tokens=config.LLM_LIVE_MAX_TOKENS)
 
 
 # SOP 报告主段标题 → 进度阶段名（按 ### N. 数字识别，子段 1b/1c/1d 不计）
