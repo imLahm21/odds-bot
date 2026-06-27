@@ -182,11 +182,16 @@ def edit_markup(chat_id: int, message_id: int, reply_markup: dict) -> None:
         "reply_markup": reply_markup})
 
 
-def edit_text(chat_id: int, message_id: int, text: str) -> None:
-    """编辑已发消息的文字（用于原地更新进度）。"""
-    _post("editMessageText", {
+def edit_text(chat_id: int, message_id: int, text: str,
+              reply_markup: dict | None = None) -> None:
+    """编辑已发消息的文字（用于原地更新进度）。
+    reply_markup 给定时一并替换内联键盘（用于多步流程的原地推进）。"""
+    payload = {
         "chat_id": chat_id, "message_id": message_id,
-        "text": text, "parse_mode": "HTML"})
+        "text": text, "parse_mode": "HTML"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    _post("editMessageText", payload)
 
 
 def answer_callback(callback_id: str, text: str = "") -> None:
