@@ -5,3 +5,7 @@ python-dotenv==1.2.2
 
 # ── 新轮询守护进程 bot/ 依赖（API-Football）──
 apscheduler==3.11.2
+
+# ── Ghost 博客发布（/publish 命令）──
+PyJWT==2.10.1
+markdown==3.7

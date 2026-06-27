@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
 
-from . import config, db, api_client, analyzer
+from . import config, db, api_client, analyzer, ghost_publish
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -90,13 +90,25 @@ ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
     | ADMIN_CHAT_IDS
 
 # 仅管理员可用的配置类命令（访客调用会被拒绝）
-_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove"}
+_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
 # 等待用户回复自定义侧重的会话状态：chat_id -> (fixture_id, effort)
 # 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, tuple[int, str]] = {}
+
+# ─── /publish 发布到 Ghost 博客的会话状态（仅管理员）──────────────────────────
+# 浏览态：chat_id -> {"date": 日期, "files": [文件名列表]}。/publish 选日期后置位，
+# 供 pf:<idx> 把短索引映射回文件名（避免长文件名塞进 callback_data 64 字节）。
+_publish_browse: dict[int, dict] = {}
+# 待发布态：token -> {"path", "is_review", "title"}。选定报告后生成短 token，
+# 后续 gt:/gv: 回调据 token 取回（避免路径塞进 callback_data）。
+_publish_pending: dict[str, dict] = {}
+# 等待管理员输入自定义标题：chat_id -> token。点「✍️ 自定义标题」后置位，
+# 下一条文本被当作标题消费后清除。
+_pending_pub_title: dict[int, str] = {}
+_publish_lock = threading.Lock()
 
 # 访客每日 /analyze 计数：持久化在 odds.db 的 analyze_usage 表（重启不清零，
 # 跨北京日期自然分行）。管理员不计数、不受限。
@@ -235,6 +247,7 @@ def setup_commands() -> None:
         {"command": "status", "description": "当前启用了哪些联赛/庄家"},
         {"command": "add", "description": "加联赛：/add 关键词 搜了点 或 /add id season"},
         {"command": "remove", "description": "删除关注联赛"},
+        {"command": "publish", "description": "把历史归档报告发布到 Ghost 博客（管理员）"},
     ]
     resp = _post("setMyCommands", {"commands": commands})
     if resp and resp.get("ok"):
@@ -348,6 +361,7 @@ _HELP_ADMIN_EXTRA = (
     "/bookmakers — 庄家开关面板\n"
     "/add &lt;关键词&gt; — 搜联赛点按钮加（如 /add 瑞典）；或 /add &lt;id&gt; &lt;season&gt;\n"
     "/remove &lt;id&gt; — 删联赛\n"
+    "/publish — 把 report/ 历史归档报告发布到 Ghost 博客（选日期→选报告→标题→可见性）\n"
 )
 HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
 
@@ -975,6 +989,124 @@ def _archive_report(meta: dict, report: str, suffix: str = "report",
         return None
 
 
+def _publish_date_keyboard() -> dict | None:
+    """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数）。
+    无任何报告时返回 None。回调 pd:<date>。"""
+    import os
+    base = "report"
+    if not os.path.isdir(base):
+        return None
+    dates = []
+    for name in os.listdir(base):
+        d = os.path.join(base, name)
+        # 仅取形如 2026-06-12 的日期目录（排除 visitors 等）
+        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
+            n = len([f for f in os.listdir(d) if f.endswith(".md")])
+            if n:
+                dates.append((name, n))
+    if not dates:
+        return None
+    dates.sort(reverse=True)   # 最新日期在前
+    rows = [[{"text": f"{date}（{n}）", "callback_data": f"pd:{date}"}]
+            for date, n in dates]
+    return {"inline_keyboard": rows}
+
+
+def _publish_report_keyboard(chat_id: int, date: str) -> dict | None:
+    """列某日期目录下所有 *.md，构造报告选择键盘。回调 pf:<idx>。
+    把文件名列表暂存 _publish_browse[chat_id]，idx 映射回文件名。"""
+    import os
+    d = os.path.join("report", date)
+    if not os.path.isdir(d):
+        return None
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
+    if not files:
+        return None
+    with _publish_lock:
+        _publish_browse[chat_id] = {"date": date, "files": files}
+    rows = []
+    for idx, fname in enumerate(files):
+        # Mexico_vs_South_Africa_report.md → Mexico vs South Africa（复盘）
+        is_review = fname.endswith("_review.md")
+        stem = fname[:-len("_review.md")] if is_review else fname[:-len("_report.md")]
+        label = stem.replace("_", " ")
+        if is_review:
+            label += "（复盘）"
+        rows.append([{"text": label, "callback_data": f"pf:{idx}"}])
+    return {"inline_keyboard": rows}
+
+
+def _publish_title_keyboard(token: str) -> dict:
+    """标题模式选择键盘。回调 gt:<token>:preset|custom|cancel。"""
+    return {"inline_keyboard": [[
+        {"text": "📋 预设标题", "callback_data": f"gt:{token}:preset"},
+        {"text": "✍️ 自定义", "callback_data": f"gt:{token}:custom"},
+        {"text": "❌ 取消", "callback_data": f"gt:{token}:cancel"},
+    ]]}
+
+
+def _publish_visibility_keyboard(token: str) -> dict:
+    """可见性选择键盘。回调 gv:<token>:public|members|paid|cancel。"""
+    return {"inline_keyboard": [[
+        {"text": "🌐 公开", "callback_data": f"gv:{token}:public"},
+        {"text": "👤 会员", "callback_data": f"gv:{token}:members"},
+        {"text": "💰 付费", "callback_data": f"gv:{token}:paid"},
+    ], [
+        {"text": "❌ 取消", "callback_data": f"gv:{token}:cancel"},
+    ]]}
+
+
+def _cmd_publish(chat_id: int, args: list[str]) -> None:
+    """从 report/ 历史归档里选一份报告发布到 Ghost 博客（仅管理员，权限已在分发处校验）。"""
+    if not ghost_publish.available():
+        send(chat_id, "未配置 Ghost 发布（.env 缺 GHOST_ADMIN_API_KEY / "
+                      "GHOST_ADMIN_API_URL）。配好后重启 bot 即可用 /publish。")
+        return
+    kb = _publish_date_keyboard()
+    if kb is None:
+        send(chat_id, "report/ 下暂无归档报告。先用 /analyze 或 /review 生成。")
+        return
+    send(chat_id, "📤 发布到博客 —— 选择报告日期：", kb)
+
+
+def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> None:
+    """取缓存 → 转换 → 调 Ghost 发文 → 回链接/错误。消费后清缓存。"""
+    with _publish_lock:
+        info = _publish_pending.get(token)
+    if not info:
+        edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /publish。")
+        return
+    import os
+    try:
+        with open(info["path"], encoding="utf-8") as f:
+            md = f.read()
+    except OSError as e:
+        edit_text(chat_id, message_id, f"❌ 读取报告失败：{e}")
+        with _publish_lock:
+            _publish_pending.pop(token, None)
+        return
+
+    edit_text(chat_id, message_id, "⏳ 正在发布到 Ghost…")
+    try:
+        title, html, excerpt = ghost_publish.report_to_post(
+            md, title=info.get("title"), is_review=info["is_review"])
+        post = ghost_publish.create_post(
+            title, html, status="published", visibility=visibility,
+            custom_excerpt=excerpt)
+    except ghost_publish.GhostError as e:
+        edit_text(chat_id, message_id, f"❌ 发布失败：{e}")
+        return
+    finally:
+        with _publish_lock:
+            _publish_pending.pop(token, None)
+
+    url = post.get("url", "")
+    vis_label = {"public": "公开", "members": "会员", "paid": "付费"}.get(
+        visibility, visibility)
+    edit_text(chat_id, message_id,
+              f"✅ 已发布（{vis_label}）：{title}\n{url}")
+
+
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
     """构造推理强度选择键盘。mode='p'(预设)/'c'(自定义)。
     管理员显示全部 4 档；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/中）。
@@ -1278,6 +1410,28 @@ def handle_message(msg: dict) -> None:
                       f"把它加入服务器 .env 的 TELEGRAM_ALLOWED_CHAT_IDS 即可。")
         return
 
+    # 若该 chat 正在等待「自定义博客标题」输入，优先消费这条消息
+    if chat_id in _pending_pub_title:
+        token = _pending_pub_title.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消") or text.startswith("/"):
+            with _publish_lock:
+                _publish_pending.pop(token, None)
+            send(chat_id, "已取消发布。")
+            if text.startswith("/"):
+                pass  # 落到下方按新命令处理
+            else:
+                return
+        else:
+            with _publish_lock:
+                info = _publish_pending.get(token)
+            if not info:
+                send(chat_id, "⏳ 会话已过期，请重新 /publish。")
+                return
+            info["title"] = text.strip()
+            send(chat_id, f"标题已设：{text.strip()}\n选择可见性以发布：",
+                 _publish_visibility_keyboard(token))
+            return
+
     # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
     if chat_id in _pending_custom:
         fid, eff = _pending_custom.pop(chat_id)
@@ -1335,8 +1489,105 @@ def handle_message(msg: dict) -> None:
         _cmd_analyze(chat_id, args)
     elif cmd == "review":
         _cmd_review(chat_id, args)
+    elif cmd == "publish":
+        _cmd_publish(chat_id, args)
     else:
         send(chat_id, "未知命令，发 /help 看用法")
+
+
+def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
+                             message_id: int) -> None:
+    """处理 /publish 系列回调：pd: 选日期 / pf: 选报告 / gt: 选标题模式 / gv: 选可见性。"""
+    import os
+    import uuid
+
+    # pd:<date> —— 列该日期的报告
+    if data.startswith("pd:"):
+        date = data[3:]
+        kb = _publish_report_keyboard(chat_id, date)
+        answer_callback(cb_id)
+        if kb is None:
+            edit_text(chat_id, message_id, f"{date} 下无报告。")
+        else:
+            edit_text(chat_id, message_id, f"📅 {date} —— 选择报告：", kb)
+        return
+
+    # pf:<idx> —— 选定报告，弹标题模式
+    if data.startswith("pf:"):
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        with _publish_lock:
+            browse = _publish_browse.get(chat_id)
+        if not browse or idx >= len(browse["files"]):
+            answer_callback(cb_id, "会话已过期，请重新 /publish")
+            edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /publish。")
+            return
+        fname = browse["files"][idx]
+        path = os.path.join("report", browse["date"], fname)
+        token = uuid.uuid4().hex[:12]
+        with _publish_lock:
+            _publish_pending[token] = {
+                "path": path,
+                "is_review": fname.endswith("_review.md"),
+                "title": None,
+            }
+        answer_callback(cb_id)
+        label = fname.replace("_", " ").rsplit(".", 1)[0]
+        edit_text(chat_id, message_id,
+                  f"已选：{label}\n选择标题方式：",
+                  _publish_title_keyboard(token))
+        return
+
+    # gt:<token>:preset|custom|cancel
+    if data.startswith("gt:"):
+        try:
+            _, token, mode = data.split(":")
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        with _publish_lock:
+            exists = token in _publish_pending
+        if not exists:
+            answer_callback(cb_id, "会话已过期")
+            edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /publish。")
+            return
+        if mode == "cancel":
+            with _publish_lock:
+                _publish_pending.pop(token, None)
+            answer_callback(cb_id, "已取消")
+            edit_text(chat_id, message_id, "❌ 已取消发布。")
+            return
+        if mode == "custom":
+            _pending_pub_title[chat_id] = token
+            answer_callback(cb_id)
+            edit_text(chat_id, message_id,
+                      "✍️ 请发一条消息作为文章标题（发 /取消 放弃）。")
+            return
+        # preset
+        answer_callback(cb_id)
+        edit_text(chat_id, message_id, "选择可见性以发布：",
+                  _publish_visibility_keyboard(token))
+        return
+
+    # gv:<token>:public|members|paid|cancel
+    if data.startswith("gv:"):
+        try:
+            _, token, vis = data.split(":")
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        if vis == "cancel":
+            with _publish_lock:
+                _publish_pending.pop(token, None)
+            answer_callback(cb_id, "已取消")
+            edit_text(chat_id, message_id, "❌ 已取消发布。")
+            return
+        answer_callback(cb_id, "发布中…")
+        _publish_do(chat_id, message_id, token, vis)
+        return
 
 
 def handle_callback(cb: dict) -> None:
@@ -1353,6 +1604,14 @@ def handle_callback(cb: dict) -> None:
     message_id = msg.get("message_id")
     if not _authorized(chat_id):
         answer_callback(cb_id, "未授权")
+        return
+
+    # ── /publish 发布到博客的回调（pd:/pf:/gt:/gv:，仅管理员）──
+    if data.startswith(("pd:", "pf:", "gt:", "gv:")):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可发布")
+            return
+        _handle_publish_callback(cb_id, data, chat_id, message_id)
         return
 
     # 走地退订按钮（访客可点，退自己的订阅）
