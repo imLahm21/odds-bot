@@ -22,6 +22,7 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
 import os
 import time
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -39,6 +40,39 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 # daemon 线程，进程退出不阻塞；max_workers 限并发，避免研判堆积压垮网关。
 _live_brief_pool = ThreadPoolExecutor(max_workers=3,
                                       thread_name_prefix="live-brief")
+
+
+# ─── 多用户并发：每个 chat 一个单线程执行器 ─────────────────────────────────
+# 轮询主循环只负责拉 update、分发、推进 offset，绝不亲自跑命令——否则一个用户
+# 的 /analyze（LLM 最坏 1~3 分钟）会把整条轮询线程占死，其它用户的命令全部被
+# 串行阻塞（这正是“多用户同时用就卡死”的根因）。
+#
+# 设计：按 chat_id 分桶，每桶一个 max_workers=1 的执行器。
+#   - 跨用户并行：不同 chat 的命令在各自线程同时跑。
+#   - 同一用户串行保序：同一 chat 的命令排队执行，保护 _pending_custom 两步流程
+#     （选侧重→发文字依赖顺序），也避免单人连点触发多个并发精算。
+# 执行器随用随建并缓存；数量受白名单人数天然限制。LLM 是网络 I/O，等待时释放
+# GIL，故即便 1C1G 也能多人并行而不抢单核 CPU。
+_chat_pools: dict[int, ThreadPoolExecutor] = {}
+_chat_pools_lock = threading.Lock()
+
+
+def _submit_for_chat(chat_id: int, fn, *args) -> None:
+    """把某 chat 的一个 update 处理任务提交到它专属的单线程执行器。"""
+    with _chat_pools_lock:
+        pool = _chat_pools.get(chat_id)
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"chat-{chat_id}")
+            _chat_pools[chat_id] = pool
+
+    def _run() -> None:
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("处理 chat=%s 的 update 出错", chat_id)
+
+    pool.submit(_run)
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -1503,10 +1537,18 @@ def run_polling(stop_flag=lambda: False) -> None:
                     log.warning("跳过重复 update_id=%s", uid)
                     continue
                 last_processed = uid
+                # 不在轮询线程里直接处理——丢给该 chat 的专属执行器，使轮询线程
+                # 立刻回到 getUpdates，不被任何用户的耗时命令（LLM 精算）阻塞。
                 if "message" in u:
-                    handle_message(u["message"])
+                    m = u["message"]
+                    cid = m.get("chat", {}).get("id")
+                    if cid is not None:
+                        _submit_for_chat(cid, handle_message, m)
                 elif "callback_query" in u:
-                    handle_callback(u["callback_query"])
+                    cb = u["callback_query"]
+                    cid = cb.get("message", {}).get("chat", {}).get("id")
+                    if cid is not None:
+                        _submit_for_chat(cid, handle_callback, cb)
         except requests.exceptions.RequestException as e:
             log.warning("getUpdates 异常，5s 后重试: %s", e)
             time.sleep(5)
