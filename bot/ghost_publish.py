@@ -68,24 +68,46 @@ def _clean_team(name: str) -> str:
     return re.sub(r"[（(].*?[）)]", "", name).strip()
 
 
+def _slugify(text: str) -> str:
+    """生成 URL slug：仅保留 ASCII 字母数字，其余转连字符。
+    非 ASCII（中文）会被丢弃 → 若结果为空则返回 ''（调用方据此回退）。"""
+    s = text.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)   # 非字母数字 → 连字符
+    return s.strip("-")
+
+
 def report_to_post(report_md: str, *, title: str | None = None,
-                   is_review: bool = False) -> tuple[str, str, str]:
-    """精算报告 markdown → (title, html, excerpt)。
+                   is_review: bool = False) -> tuple[str, str, str, str | None]:
+    """精算报告 markdown → (title, html, excerpt, slug)。
 
     title 传入则用之（管理员自定义）；否则从首行 '## 比赛：X vs Y' 生成。
+    slug 始终从报告里的英文队名生成（如 derry-city-vs-drogheda-united-prediction），
+    与标题语言无关，保证 URL 是干净英文；无法生成时返回 None（让 Ghost 自动生成）。
     付费墙：第 7 节「最终精算结论」之前免费，之后付费。
     """
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
 
+    # 队名匹配（标题与 slug 共用）
+    m = _MATCH_RE.search(text)
+    home = _clean_team(m.group(1)) if m else ""
+    away = _clean_team(m.group(2)) if m else ""
+
     # 标题
     if not title:
-        m = _MATCH_RE.search(text)
         if m:
-            home, away = _clean_team(m.group(1)), _clean_team(m.group(2))
             suffix = "复盘" if is_review else "精算预测"
             title = f"{home} vs {away} — {suffix}"
         else:
             title = "精算复盘" if is_review else "精算预测"
+
+    # slug：英文队名 + prediction/review 后缀；队名无 ASCII（纯中文）时退回 None
+    slug = None
+    if m:
+        home_slug = _slugify(home)
+        away_slug = _slugify(away)
+        if home_slug and away_slug:   # 两队都有英文才生成，避免 'vs-prediction' 这种残缺
+            suffix_en = "review" if is_review else "prediction"
+            slug = f"{home_slug}-vs-{away_slug}-{suffix_en}"
 
     # 摘要：取「## 赛事：…」一行
     em = _EVENT_RE.search(text)
@@ -107,7 +129,7 @@ def report_to_post(report_md: str, *, title: str | None = None,
     else:
         html = f"<!--members-only-->\n{paid_html}"
 
-    return title, html, excerpt
+    return title, html, excerpt, slug
 
 
 def _render(md_text: str) -> str:
@@ -124,7 +146,8 @@ def _admin_url(path: str) -> str:
 
 def create_post(title: str, html: str, *, status: str = "published",
                 visibility: str = "paid",
-                custom_excerpt: str | None = None) -> dict:
+                custom_excerpt: str | None = None,
+                slug: str | None = None) -> dict:
     """创建文章，返回 Ghost 的 post 对象（含前台 url / id）。失败抛 GhostError。"""
     post: dict = {
         "title": title,
@@ -134,6 +157,8 @@ def create_post(title: str, html: str, *, status: str = "published",
     }
     if custom_excerpt:
         post["custom_excerpt"] = custom_excerpt[:300]
+    if slug:
+        post["slug"] = slug
 
     body = {"posts": [post]}
     headers = {
