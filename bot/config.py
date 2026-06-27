@@ -235,7 +235,7 @@ LLM_EFFORT_LABELS: dict[str, str] = {
     "xhigh":  "超高",
 }
 # 访客可选档位（管理员不受限，可用全部 LLM_EFFORT_LABELS）。
-LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium"}
+LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
 # 默认强度：未显式选择时用（如旧入口直接调 analyze 不带 effort 则传空=不附带字段）
 LLM_EFFORT_DEFAULT = "high"
 # ─── 走地(滚球)实时研判专用 LLM ──────────────────────────────────────────────
