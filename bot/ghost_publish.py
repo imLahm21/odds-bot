@@ -32,6 +32,48 @@ GHOST_API_VERSION = "v5.0"
 
 _MD_EXTENSIONS = ["extra", "fenced_code", "tables", "sane_lists"]
 
+# ── 收款引导（付费墙之前展示给未登录访客）──
+# 图片：先在 Ghost 后台上传收款码拿到 URL，把下面两个占位 URL 换成真实地址。
+# 留空字符串则不显示对应图片（只显示文字引导）。
+PAY_WECHAT_ID = "Alonso_183"
+PAY_WECHAT_QR_URL = ""   # ← 微信收款码图片 URL（上传后填）
+PAY_ALIPAY_QR_URL = ""   # ← 支付宝收款码图片 URL（上传后填）
+
+
+def _cta_html() -> str:
+    """生成收款引导 HTML 区块（插在免费预览末尾、付费墙之前）。"""
+    imgs = []
+    if PAY_WECHAT_QR_URL:
+        imgs.append(
+            f'<figure style="margin:0;text-align:center">'
+            f'<img src="{PAY_WECHAT_QR_URL}" alt="微信收款码" '
+            f'style="max-width:220px;width:100%"/>'
+            f'<figcaption>微信扫码</figcaption></figure>')
+    if PAY_ALIPAY_QR_URL:
+        imgs.append(
+            f'<figure style="margin:0;text-align:center">'
+            f'<img src="{PAY_ALIPAY_QR_URL}" alt="支付宝收款码" '
+            f'style="max-width:220px;width:100%"/>'
+            f'<figcaption>支付宝扫码</figcaption></figure>')
+    qr_row = ""
+    if imgs:
+        qr_row = ('<div style="display:flex;gap:24px;justify-content:center;'
+                  'flex-wrap:wrap;margin:16px 0">' + "".join(imgs) + "</div>")
+    return (
+        '<hr/>'
+        '<div style="border:1px solid #e5e5e5;border-radius:8px;padding:20px;'
+        'background:#fafafa">'
+        '<h3 style="margin-top:0">🔒 完整精算结论为付费内容</h3>'
+        '<p>以上为免费预览。<strong>最终下注方向、比分预测、置信度</strong>等核心结论，'
+        '需成为会员后登录查看。</p>'
+        f'<p><strong>如何成为会员：</strong>付费订阅请加微信 '
+        f'<strong>{PAY_WECHAT_ID}</strong>，付款后把你的登录邮箱发给站长，'
+        '即为你开通会员，登录本站即可解锁全文。</p>'
+        f'{qr_row}'
+        '</div>'
+    )
+
+
 # 报告锚点（由 analyzer 的 prompt 固定产出，稳定）
 # 首行： ## 比赛：墨西哥（…） vs 南非（…）
 _MATCH_RE = re.compile(r"^\#\#\s*比赛[：:]\s*(.+?)\s+vs\s+(.+?)\s*$", re.MULTILINE)
@@ -335,10 +377,16 @@ def report_to_post(report_md: str, *, title: str | None = None,
 
     free_html = _render(free_md)
     paid_html = _render(paid_md)
-    if free_html:
-        html = f"{free_html}\n<!--members-only-->\n{paid_html}"
+    if paid_html:
+        # 有付费内容：免费段末尾插收款引导 CTA，再接付费墙分隔符
+        cta = _cta_html()
+        if free_html:
+            html = f"{free_html}\n{cta}\n<!--members-only-->\n{paid_html}"
+        else:
+            html = f"{cta}\n<!--members-only-->\n{paid_html}"
     else:
-        html = f"<!--members-only-->\n{paid_html}"
+        # 整篇免费，无付费墙、无 CTA
+        html = free_html
 
     return title, html, excerpt, slug
 
