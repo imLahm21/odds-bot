@@ -1540,6 +1540,11 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
     import os
     import uuid
 
+    # 立即先确认回调，清掉 TG 客户端的加载圈（服务器到 Telegram 跨境延迟高，
+    # 若等扫目录/调 Ghost 完再确认，客户端会超时显示"点了没反应"，需点第二次）。
+    # 同一 cb_id 再次 answer 是无害空操作，故后续分支保留带文案的 answer 不冲突。
+    answer_callback(cb_id)
+
     # pd:<date> —— 列该日期的报告
     if data.startswith("pd:"):
         date = data[3:]
