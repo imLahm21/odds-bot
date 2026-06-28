@@ -68,6 +68,51 @@ def _clean_team(name: str) -> str:
     return re.sub(r"[（(].*?[）)]", "", name).strip()
 
 
+# 英文队名 → 中文 映射表（命中则标题用中文；未命中退回规范化英文）。
+# 数据源队名为英文（API-Football），这里只收常关注的联赛/球队，可随时补充。
+# key 统一用小写匹配，避免大小写不一致（如 'SHANGHAI SIPG'）。
+_TEAM_CN = {
+    # 中超
+    "shanghai sipg": "上海海港",
+    "shanghai port": "上海海港",
+    "henan jianye": "河南酒祖杜康",
+    "henan songshan longmen": "河南酒祖杜康",
+    "shanghai shenhua": "上海申花",
+    "beijing guoan": "北京国安",
+    "shandong taishan": "山东泰山",
+    "shandong luneng taishan": "山东泰山",
+    "guangzhou": "广州队",
+    "guangzhou evergrande taobao": "广州队",
+    "wuhan three towns": "武汉三镇",
+    "chengdu rongcheng": "成都蓉城",
+    "zhejiang": "浙江队",
+    "tianjin jinmen tiger": "天津津门虎",
+    "changchun yatai": "长春亚泰",
+    "qingdao hainiu": "青岛海牛",
+    "qingdao west coast": "青岛西海岸",
+    "meizhou hakka": "梅州客家",
+    "cangzhou mighty lions": "沧州雄狮",
+    "nantong zhiyun": "南通支云",
+    "shenzhen peng city": "深圳新鹏城",
+    "dalian pro": "大连人",
+    "beijing renhe": "北京人和",
+}
+
+
+def _normalize_en(name: str) -> str:
+    """规范化英文队名大小写：'SHANGHAI SIPG' → 'Shanghai Sipg' 风格的标题化。
+    全大写或全小写时做 title-case；已是混合大小写（如 'Henan Jianye'）则保持原样。"""
+    n = name.strip()
+    if n.isupper() or n.islower():
+        return n.title()
+    return n
+
+
+def _cn_or_en(name: str) -> str:
+    """队名优先取中文映射，未命中则规范化英文。"""
+    return _TEAM_CN.get(name.strip().lower(), _normalize_en(name))
+
+
 def _slugify(text: str) -> str:
     """生成 URL slug：仅保留 ASCII 字母数字，其余转连字符。
     非 ASCII（中文）会被丢弃 → 若结果为空则返回 ''（调用方据此回退）。"""
@@ -87,16 +132,16 @@ def report_to_post(report_md: str, *, title: str | None = None,
     """
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 队名匹配（标题与 slug 共用）
+    # 队名匹配（home/away 保留英文原名，供 slug 用；标题另取中文/规范英文）
     m = _MATCH_RE.search(text)
     home = _clean_team(m.group(1)) if m else ""
     away = _clean_team(m.group(2)) if m else ""
 
-    # 标题
+    # 标题：队名优先中文映射，未命中规范化英文；分隔符用 ·
     if not title:
         if m:
             suffix = "复盘" if is_review else "精算预测"
-            title = f"{home} vs {away} — {suffix}"
+            title = f"{_cn_or_en(home)} vs {_cn_or_en(away)} · {suffix}"
         else:
             title = "精算复盘" if is_review else "精算预测"
 
@@ -112,6 +157,11 @@ def report_to_post(report_md: str, *, title: str | None = None,
     # 摘要：取「## 赛事：…」一行
     em = _EVENT_RE.search(text)
     excerpt = em.group(1).strip() if em else ""
+
+    # 去掉开头「## 比赛：…」「## 赛事：…」两行元信息（标题/摘要已含，正文重复且丑）
+    text = _MATCH_RE.sub("", text, count=1)
+    text = _EVENT_RE.sub("", text, count=1)
+    text = text.lstrip("\n")
 
     # 付费墙切分
     pm = _PAYWALL_RE.search(text)
