@@ -475,7 +475,9 @@ def _cmd_remove(chat_id: int, args: list[str]) -> None:
     send(chat_id, f"已删除联赛 id={lid}" if ok else f"未找到 id={lid}")
 
 
-def _cmd_fixtures(chat_id: int) -> None:
+def _render_fixtures(view: str = "future"):
+    """生成 /fixtures 的文本 + 内联键盘。view='future' 看未来可精算的比赛，
+    view='past' 看已开赛可复盘的比赛。返回 (text, keyboard)。"""
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
     # 过去 3 天 ~ 未来 3 天：过去的可 /review 复盘，未来的可 /analyze 精算
@@ -491,9 +493,6 @@ def _cmd_fixtures(chat_id: int) -> None:
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
         conn.close()
-    if not fixtures:
-        send(chat_id, "过去/未来 3 天暂无赛程（可能休赛期或赛程未拉取）")
-        return
 
     tz_cst = timezone(timedelta(hours=8))
 
@@ -510,15 +509,48 @@ def _cmd_fixtures(chat_id: int) -> None:
         except (ValueError, AttributeError):
             return False
 
-    lines = ["<b>赛程（过去 3 天 ~ 未来 3 天）</b>",
-             "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
-    for fid, commence, home, away, league, league_id in fixtures[:40]:
+    past = [f for f in fixtures if kicked_off(f[1])]
+    future = [f for f in fixtures if not kicked_off(f[1])]
+
+    # 切换按钮：高亮当前视图，点另一个切过去
+    kb = {"inline_keyboard": [[
+        {"text": ("🔵 未来(可精算)" if view == "future" else "🔵 未来"),
+         "callback_data": "fx:future"},
+        {"text": ("✅ 已开赛(可复盘)" if view == "past" else "✅ 已开赛"),
+         "callback_data": "fx:past"},
+    ]]}
+
+    if not fixtures:
+        return "过去/未来 3 天暂无赛程（可能休赛期或赛程未拉取）", kb
+
+    CAP = 40
+    if view == "past":
+        # 已开赛：取最近的（按时间降序展示，最近的在上）
+        rows = past[-CAP:][::-1]
+        header = f"<b>已开赛（可 /review 复盘）</b>　共 {len(past)} 场"
+        if len(past) > len(rows):
+            header += f"，仅列最近 {len(rows)} 场"
+    else:
+        rows = future[:CAP]
+        header = f"<b>未来（可 /analyze 精算）</b>　共 {len(future)} 场"
+        if len(future) > len(rows):
+            header += f"，仅列最早 {len(rows)} 场"
+
+    lines = [header, "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
+    if not rows:
+        lines.append("（本视图暂无比赛，点下方按钮切换）")
+    for fid, commence, home, away, league, league_id in rows:
         mark = "✅" if kicked_off(commence) else "🔵"
         label = config.league_label(league_id, league)
         lg = f"（{label}）" if label else ""
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  "
                      f"{home} vs {away}{lg}")
-    send(chat_id, "\n".join(lines))
+    return "\n".join(lines), kb
+
+
+def _cmd_fixtures(chat_id: int) -> None:
+    text, kb = _render_fixtures("future")
+    send(chat_id, text, kb)
 
 
 def _cmd_coverage(chat_id: int, args: list[str]) -> None:
@@ -1656,6 +1688,14 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "仅管理员可发布")
             return
         _handle_publish_callback(cb_id, data, chat_id, message_id)
+        return
+
+    # /fixtures 过去/未来切换按钮（访客可点）
+    if data.startswith("fx:"):
+        view = data[3:] if data[3:] in ("past", "future") else "future"
+        text, kb = _render_fixtures(view)
+        answer_callback(cb_id)
+        edit_text(chat_id, message_id, text, kb)
         return
 
     # 走地退订按钮（访客可点，退自己的订阅）
