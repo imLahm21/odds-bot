@@ -1051,11 +1051,11 @@ def _publish_title_keyboard(token: str) -> dict:
 
 
 def _publish_visibility_keyboard(token: str) -> dict:
-    """可见性选择键盘。回调 gv:<token>:public|members|paid|cancel。"""
+    """可见性选择键盘。回调 gv:<token>:public|members|cancel。
+    无 Stripe 方案：付费内容用 members 级（手动白名单），不提供 paid（paid 需 Stripe）。"""
     return {"inline_keyboard": [[
-        {"text": "🌐 公开", "callback_data": f"gv:{token}:public"},
-        {"text": "👤 会员", "callback_data": f"gv:{token}:members"},
-        {"text": "💰 付费", "callback_data": f"gv:{token}:paid"},
+        {"text": "🌐 公开（全文免费）", "callback_data": f"gv:{token}:public"},
+        {"text": "🔒 会员（付费解锁）", "callback_data": f"gv:{token}:members"},
     ], [
         {"text": "❌ 取消", "callback_data": f"gv:{token}:cancel"},
     ]]}
@@ -1106,10 +1106,13 @@ def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> N
             _publish_pending.pop(token, None)
 
     url = post.get("url", "")
-    vis_label = {"public": "公开", "members": "会员", "paid": "付费"}.get(
+    vis_label = {"public": "公开全文", "members": "会员付费解锁"}.get(
         visibility, visibility)
+    tip = ""
+    if visibility == "members":
+        tip = "\n\n💡 付费读者付款后，到 Ghost 后台 Members → New member 加他邮箱即可解锁。"
     edit_text(chat_id, message_id,
-              f"✅ 已发布（{vis_label}）：{title}\n{url}")
+              f"✅ 已发布（{vis_label}）：{title}\n{url}{tip}")
 
 
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
@@ -1577,7 +1580,7 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
                   _publish_visibility_keyboard(token))
         return
 
-    # gv:<token>:public|members|paid|cancel
+    # gv:<token>:public|members|cancel
     if data.startswith("gv:"):
         try:
             _, token, vis = data.split(":")
