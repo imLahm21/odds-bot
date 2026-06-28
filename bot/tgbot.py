@@ -951,6 +951,37 @@ def _fmt_result(entry: dict) -> tuple[str, str] | tuple[None, None]:
     return "\n".join(parts), short
 
 
+def _md_to_tg(text: str) -> str:
+    """把 Markdown 报告转成 TG 易读的纯文本（仅用于 TG 显示，不影响归档/发布）。
+    - 去掉标题井号：'### 7. 最终精算结论' → '7. 最终精算结论'
+    - 去掉加粗/斜体标记：'**亚盘判定**' → '亚盘判定'
+    - 列表符号 '- ' / '* ' → '• '（保留缩进层级）
+    - 去掉引用符号 '> '
+    表格行（含 |）保持原样不动。
+    """
+    import re
+    out = []
+    for line in text.split("\n"):
+        # 标题：行首 1~6 个 # + 空格 → 去掉
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        # 引用：行首 > → 去掉
+        line = re.sub(r"^(\s*)>\s?", r"\1", line)
+        # 列表符号：行首（可带缩进）- / * / + + 空格 → •
+        m = re.match(r"^(\s*)[-*+]\s+(.*)$", line)
+        if m and "|" not in line:
+            line = f"{m.group(1)}• {m.group(2)}"
+        # 加粗 **x** / __x__ → x
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"__(.+?)__", r"\1", line)
+        # 斜体 *x* / _x_ → x（避开已处理的列表符；表格行不动）
+        if "|" not in line:
+            line = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)\*(?!\*)", r"\1", line)
+        # 残留的成对 ** 清掉
+        line = line.replace("**", "")
+        out.append(line)
+    return "\n".join(out)
+
+
 def _send_long(chat_id: int, text: str, plain: bool = True) -> None:
     """长文本按 TG_MSG_MAX 拆段发送，优先在换行处断开。
     默认 plain=True（纯文本）：LLM 报告/基本面含 <>&| 等字符，HTML 模式会
@@ -1266,7 +1297,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         return
     if msg_id:
         edit_text(chat_id, msg_id, title + "\n\n✅ 全部 7 步完成，报告如下：")
-    _send_long(chat_id, report)
+    _send_long(chat_id, _md_to_tg(report))   # TG 显示纯文本；归档仍用原始 report
     path = _archive_report(meta, report, chat_id=chat_id)
     if path:
         send(chat_id, f"📁 报告已归档：{path}")
@@ -1357,7 +1388,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
         return
     if msg_a:
         edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
-    _send_long(chat_id, "🔮 第一步·盲推预判\n\n" + forecast)
+    _send_long(chat_id, _md_to_tg("🔮 第一步·盲推预判\n\n" + forecast))
 
     # ── 第二遍：揭晓比分，对照归因（6 步）──
     send(chat_id, "🎬 第二步【对照】：揭晓真实比分，对照盲推预判做归因复盘…")
@@ -1399,7 +1430,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
         return
     if msg_id:
         edit_text(chat_id, msg_id, title + "\n\n✅ 全部 6 步完成，复盘如下：")
-    _send_long(chat_id, report)
+    _send_long(chat_id, _md_to_tg(report))   # TG 纯文本；归档 full 仍用原始 md
     # 归档：盲推预判 + 对照复盘合并存一份
     full = ("# 第一步·盲推预判（不看比分）\n\n" + forecast
             + "\n\n---\n\n# 第二步·对照复盘\n\n" + report)
