@@ -66,9 +66,8 @@ def _cta_html() -> str:
         '<h3 style="margin-top:0">🔒 完整精算结论为付费内容</h3>'
         '<p>以上为免费预览。<strong>最终下注方向、比分预测、置信度</strong>等核心结论，'
         '需成为会员后登录查看。</p>'
-        f'<p><strong>如何成为会员：</strong>付费订阅请加微信 '
-        f'<strong>{PAY_WECHAT_ID}</strong>，付款后把你的登录邮箱发给站长，'
-        '即为你开通会员，登录本站即可解锁全文。</p>'
+        f'<p><strong>如何成为会员：</strong>请联系站长微信 '
+        f'<strong>{PAY_WECHAT_ID}</strong> 开通，开通后登录本站即可解锁全文。</p>'
         f'{qr_row}'
         '</div>'
     )
