@@ -1966,6 +1966,11 @@ def run_polling(stop_flag=lambda: False) -> None:
         log.error("未配置 TELEGRAM_BOT_TOKEN，bot 不启动")
         return
     log.info("Telegram bot 启动，白名单 %d 人", len(ALLOWED_CHAT_IDS))
+    # 启动时打印实际读到的广播目标，便于排查 /publish 不弹通知按钮：
+    # 若这里是 0 个，说明 .env 的 TELEGRAM_BROADCAST_TARGETS 没被读到（未配/格式错/未重启）。
+    bt = config.TELEGRAM_BROADCAST_TARGETS
+    log.info("广播目标 %d 个：%s", len(bt),
+             "、".join(f"{lbl}({cid})" for lbl, cid in bt) or "（无，/publish 不弹通知按钮）")
     setup_commands()   # 注册 / 命令菜单（输入框打 / 弹出）
     offset = None
     last_processed = -1   # 已处理的最大 update_id，去重水位线（防同一 update 被重复消费）
