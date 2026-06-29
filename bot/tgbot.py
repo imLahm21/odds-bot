@@ -99,6 +99,13 @@ API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 # 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, tuple[int, str]] = {}
 
+# 等待用户回复「场次号」的会话状态：chat_id -> 命令名（如 "review"/"analyze"）。
+# 用户点菜单/直接发不带参数的命令后置位（force_reply 追问），下一条纯数字回复
+# 被拼成 "<cmd> <fid>" 重新走命令分发后清除。免去手打命令+空格+号。
+_pending_fixarg: dict[int, str] = {}
+# 接受 force_reply 追问场次号的命令白名单（都吃单个 fixture_id 参数）
+_FIXARG_CMDS = {"review", "analyze", "coverage", "export", "live", "unlive"}
+
 # ─── /publish 发布到 Ghost 博客的会话状态（仅管理员）──────────────────────────
 # 浏览态：chat_id -> {"date": 日期, "files": [文件名列表]}。/publish 选日期后置位，
 # 供 pf:<idx> 把短索引映射回文件名（避免长文件名塞进 callback_data 64 字节）。
@@ -546,17 +553,32 @@ def _render_fixtures(view: str = "future", page: int = 0):
     if pages > 1:
         header += f"（第 {page + 1}/{pages} 页）"
 
-    lines = [header, "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算"]
+    lines = [header, "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算",
+             "👇 点下方按钮直接复盘/精算该场，无需输号"]
+    keyboard = [toggle_row]
     if not rows:
         lines.append("（本视图暂无比赛，点下方按钮切换）")
+
+    def _short(s: str, n: int = 12) -> str:
+        s = s or "?"
+        return s if len(s) <= n else s[:n - 1] + "…"
+
     for fid, commence, home, away, league, league_id in rows:
-        mark = "✅" if kicked_off(commence) else "🔵"
+        kicked = kicked_off(commence)
+        mark = "✅" if kicked else "🔵"
         label = config.league_label(league_id, league)
         lg = f"（{label}）" if label else ""
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  "
                      f"{home} vs {away}{lg}")
+        # 每场一行操作按钮：已开赛→复盘，未来→精算。带队名便于在按钮区分辨。
+        vs = f"{_short(home)} vs {_short(away)}"
+        if kicked:
+            keyboard.append([{"text": f"🔬 复盘 {vs}",
+                              "callback_data": f"fr:{fid}"}])
+        else:
+            keyboard.append([{"text": f"🎯 精算 {vs}",
+                              "callback_data": f"fa:{fid}"}])
 
-    keyboard = [toggle_row]
     if pages > 1:
         nav = []
         if page > 0:
@@ -1558,6 +1580,20 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
         send(chat_id, f"📁 复盘已归档：{path}")
 
 
+def _prompt_fixarg(chat_id: int, cmd: str) -> None:
+    """命令未带场次号时，用 force_reply 追问，并置位 _pending_fixarg。
+    用户随后只需回一条纯数字（场次号），免去手打命令+空格+号。"""
+    _pending_fixarg[chat_id] = cmd
+    label = {
+        "review": "复盘", "analyze": "精算", "coverage": "查采集进度",
+        "export": "导出CSV", "live": "订阅走地", "unlive": "退订走地",
+    }.get(cmd, cmd)
+    send(chat_id,
+         f"🔢 请回复要{label}的场次号（fixture_id，如 1562344）。\n"
+         f"不知道号？发 /fixtures 看赛程列表。（发 /cancel 取消）",
+         {"force_reply": True, "input_field_placeholder": "输入场次号…"})
+
+
 def handle_message(msg: dict) -> None:
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "").strip()
@@ -1608,6 +1644,24 @@ def handle_message(msg: dict) -> None:
                 send(chat_id, "精算执行出错，请查看服务器日志。")
             return
 
+    # 若该 chat 正在等待「场次号」输入（点了不带参数的命令后），优先消费这条
+    if chat_id in _pending_fixarg:
+        pend_cmd = _pending_fixarg.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消"):
+            send(chat_id, "已取消。")
+            return
+        if text.startswith("/"):
+            # 用户改发了别的命令，放弃本次追问、按新命令正常处理（落到下方分发）
+            pass
+        else:
+            fid_str = text.strip().split()[0] if text.strip() else ""
+            if not fid_str.isdigit():
+                send(chat_id, f"「{text.strip()}」不是有效的场次号（应为纯数字，如 1562344）。"
+                              f"请重发命令再试。")
+                return
+            # 拼成「<cmd> <fid>」重走分发，复用各命令既有逻辑（含权限/限额校验）
+            text = f"/{pend_cmd} {fid_str}"
+
     parts = text.split()
     cmd = parts[0].lower().lstrip("/")
     args = parts[1:]
@@ -1616,6 +1670,11 @@ def handle_message(msg: dict) -> None:
     if cmd in _ADMIN_ONLY_CMDS and not _is_admin(chat_id):
         send(chat_id, "⛔ 该命令仅管理员可用。你可以用 /fixtures 选比赛，"
                       "再用 /analyze 或 /review 分析。发 /help 看可用命令。")
+        return
+
+    # 吃场次号的命令若未带参数：用 force_reply 追问，免手打号（点菜单即用）
+    if cmd in _FIXARG_CMDS and not args:
+        _prompt_fixarg(chat_id, cmd)
         return
 
     if cmd in ("start", "help"):
@@ -1766,6 +1825,21 @@ def handle_callback(cb: dict) -> None:
     message_id = msg.get("message_id")
     if not _authorized(chat_id):
         answer_callback(cb_id, "未授权")
+        return
+
+    # ── /fixtures 每场的「复盘/精算」直达按钮（访客可点，复用既有命令逻辑）──
+    # fr:<fid> 复盘  fa:<fid> 精算。直接喂 fid 给 _cmd_review/_cmd_analyze，
+    # 走它们原有的校验→弹强度/预览键盘流程，省去手输场次号。
+    if data.startswith(("fr:", "fa:")):
+        fid_str = data[3:]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        answer_callback(cb_id)
+        if data.startswith("fr:"):
+            _cmd_review(chat_id, [fid_str])
+        else:
+            _cmd_analyze(chat_id, [fid_str])
         return
 
     # ── /publish 发布到博客的回调（pd:/pf:/gt:/gv:，仅管理员）──
