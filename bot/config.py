@@ -5,6 +5,8 @@
 增删联赛只改这里，无需动其它代码（配置驱动）。
 """
 
+import os
+
 # ─── API-Football 端点 ──────────────────────────────────────────────────────
 BASE_URL = "https://v3.football.api-sports.io"
 AUTH_HEADER = "x-apisports-key"     # 直连鉴权头（非 RapidAPI）
@@ -211,6 +213,27 @@ TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
 TG_MSG_MAX = 4000             # 单条消息最大字符（Telegram 上限 4096，留余量）
 # 访客每日 /analyze 次数上限（管理员不受限）。防额度被刷；0 或负数=不限制。
 VISITOR_ANALYZE_DAILY_LIMIT = 10
+
+# /publish 发布成功后可选广播的目标（群聊/频道）。从 .env 读：
+#   TELEGRAM_BROADCAST_TARGETS=群聊|-1001111111,频道|-1002222222
+# 每项 "标签|chat_id"，逗号分隔。标签是按钮上显示的中文名，chat_id 是群/频道的数字 id
+# （群/超级群/频道一般是 -100 开头的负数）。发布完成后机器人按你勾选的目标推送文章链接。
+# 注意：机器人必须已在该群里（频道则需设为频道管理员）才能发出，否则推送会失败。
+def _parse_broadcast_targets(raw: str) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "|" not in item:
+            continue
+        label, _, cid = item.partition("|")
+        label, cid = label.strip(), cid.strip()
+        if label and cid.lstrip("-").isdigit():
+            out.append((label, int(cid)))
+    return out
+
+
+TELEGRAM_BROADCAST_TARGETS = _parse_broadcast_targets(
+    os.getenv("TELEGRAM_BROADCAST_TARGETS", ""))
 
 # ─── 旧数据清理 ──────────────────────────────────────────────────────────────
 CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
