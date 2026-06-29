@@ -7,6 +7,13 @@
 
 import os
 
+from dotenv import load_dotenv
+
+# config 在导入链最前端被加载（daemon→db→config），早于 tgbot 的 load_dotenv()。
+# 这里必须自己先加载 .env，否则模块体里 os.getenv(...) 读到的全是空
+# （TELEGRAM_BROADCAST_TARGETS 曾因此读不到、/publish 后不弹通知按钮）。
+load_dotenv()
+
 # ─── API-Football 端点 ──────────────────────────────────────────────────────
 BASE_URL = "https://v3.football.api-sports.io"
 AUTH_HEADER = "x-apisports-key"     # 直连鉴权头（非 RapidAPI）
