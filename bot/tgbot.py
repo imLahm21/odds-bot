@@ -1176,11 +1176,13 @@ def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> N
 
     edit_text(chat_id, message_id, "⏳ 正在发布到 Ghost…")
     try:
-        title, html, excerpt, slug = ghost_publish.report_to_post(
-            md, title=info.get("title"), is_review=info["is_review"])
+        title, html, excerpt, slug, meta_title, meta_description = \
+            ghost_publish.report_to_post(
+                md, title=info.get("title"), is_review=info["is_review"])
         post = ghost_publish.create_post(
             title, html, status="published", visibility=visibility,
-            custom_excerpt=excerpt, slug=slug)
+            custom_excerpt=excerpt, slug=slug,
+            meta_title=meta_title, meta_description=meta_description)
     except ghost_publish.GhostError as e:
         edit_text(chat_id, message_id, f"❌ 发布失败：{e}")
         return

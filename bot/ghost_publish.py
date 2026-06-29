@@ -324,8 +324,9 @@ def _slugify(text: str) -> str:
 
 
 def report_to_post(report_md: str, *, title: str | None = None,
-                   is_review: bool = False) -> tuple[str, str, str, str | None]:
-    """精算报告 markdown → (title, html, excerpt, slug)。
+                   is_review: bool = False
+                   ) -> tuple[str, str, str, str | None, str, str]:
+    """精算报告 markdown → (title, html, excerpt, slug, meta_title, meta_description)。
 
     title 传入则用之（管理员自定义）；否则从首行 '## 比赛：X vs Y' 生成。
     slug 始终从报告里的英文队名生成（如 derry-city-vs-drogheda-united-prediction），
@@ -387,7 +388,32 @@ def report_to_post(report_md: str, *, title: str | None = None,
         # 整篇免费，无付费墙、无 CTA
         html = free_html
 
-    return title, html, excerpt, slug
+    # ── SEO 元数据（中文，供 Ghost Meta data + 列表 Excerpt）──
+    home_cn = _cn_or_en(home) if home else ""
+    away_cn = _cn_or_en(away) if away else ""
+    vs_cn = f"{home_cn} vs {away_cn}" if (home_cn or away_cn) else title
+    # 从赛事行提取纯中文联赛名（去掉英文/轮次/开球时间），如「世界杯 FIFA World Cup（小组赛首轮）」→「世界杯」
+    lm = re.search(r"[一-鿿·]+", excerpt.split("开球时间")[0]) if excerpt else None
+    league_cn = lm.group(0) if lm else ""
+    league_paren = f"（{league_cn}）" if league_cn else ""
+
+    if is_review:
+        meta_title = f"{vs_cn}赔率分析" + (f"｜{league_cn}复盘解盘" if league_cn else "｜复盘解盘")
+        meta_description = (
+            f"{vs_cn}{league_paren}赔率复盘：回溯盘口异动、资金流向与凯利信号，"
+            "解析庄家操盘意图与赛果偏差。完整复盘见正文。")
+        excerpt_tail = "赔率复盘：回溯盘口异动、资金流向与凯利信号，解析操盘意图与赛果偏差。"
+    else:
+        meta_title = f"{vs_cn}赔率分析" + (f"｜{league_cn}精算预测" if league_cn else "｜精算预测")
+        meta_description = (
+            f"{vs_cn}{league_paren}赔率精算：欧赔亚盘资金流向、凯利指数风控、"
+            "近况与历史交锋推演比分与胜平负方向。完整结论见正文。")
+        excerpt_tail = "本场赔率精算：欧赔亚盘资金流向、凯利风控、近况与交锋全维度推演，完整结论见正文。"
+
+    # 列表卡片 Excerpt：原赛事行（含开球时间，站内浏览有用）+ 内容简介
+    excerpt = f"{excerpt}。{excerpt_tail}" if excerpt else excerpt_tail
+
+    return title, html, excerpt, slug, meta_title, meta_description
 
 
 def _render(md_text: str) -> str:
@@ -405,7 +431,9 @@ def _admin_url(path: str) -> str:
 def create_post(title: str, html: str, *, status: str = "published",
                 visibility: str = "paid",
                 custom_excerpt: str | None = None,
-                slug: str | None = None) -> dict:
+                slug: str | None = None,
+                meta_title: str | None = None,
+                meta_description: str | None = None) -> dict:
     """创建文章，返回 Ghost 的 post 对象（含前台 url / id）。失败抛 GhostError。"""
     post: dict = {
         "title": title,
@@ -417,6 +445,18 @@ def create_post(title: str, html: str, *, status: str = "published",
         post["custom_excerpt"] = custom_excerpt[:300]
     if slug:
         post["slug"] = slug
+
+    # ── SEO 元数据（搜索结果实际显示 ~60 字符标题 / ~155 字符描述）──
+    # 后台可逐篇手动覆盖；此处仅写入 /publish 默认值。
+    if meta_title:
+        post["meta_title"] = meta_title[:300]
+    if meta_description:
+        post["meta_description"] = meta_description[:500]
+        # 社交分享卡片（微信/Facebook OG + Twitter）复用同一份标题/描述
+        post["og_title"] = (meta_title or title)[:300]
+        post["og_description"] = meta_description[:500]
+        post["twitter_title"] = (meta_title or title)[:300]
+        post["twitter_description"] = meta_description[:500]
 
     body = {"posts": [post]}
     headers = {
