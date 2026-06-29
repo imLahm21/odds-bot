@@ -21,6 +21,7 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
 
 import os
 import time
+import uuid
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1656,7 +1657,6 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
                              message_id: int) -> None:
     """处理 /publish 系列回调：pd: 选日期 / pf: 选报告 / gt: 选标题模式 / gv: 选可见性。"""
     import os
-    import uuid
 
     # 立即先确认回调，清掉 TG 客户端的加载圈（服务器到 Telegram 跨境延迟高，
     # 若等扫目录/调 Ghost 完再确认，客户端会超时显示"点了没反应"，需点第二次）。
