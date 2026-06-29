@@ -1200,6 +1200,69 @@ def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> N
     edit_text(chat_id, message_id,
               f"✅ 已发布（{vis_label}）：{title}\n{url}{tip}")
 
+    # 发布成功后：若配置了广播目标（群/频道），弹勾选键盘让管理员决定是否通知、通知谁。
+    targets = config.TELEGRAM_BROADCAST_TARGETS
+    if targets and url:
+        bc_token = uuid.uuid4().hex[:12]
+        with _publish_lock:
+            _broadcast_pending[bc_token] = {
+                "title": title, "url": url, "vis_label": vis_label,
+                "selected": set(),
+            }
+        send(chat_id,
+             "📢 是否把这篇通知到群聊/频道？勾选目标后点「发送通知」：",
+             _broadcast_keyboard(bc_token))
+
+
+# ─── /publish 成功后广播到群/频道 ───────────────────────────────────────────
+# 待广播态：token -> {"title","url","vis_label","selected": set(目标索引)}。
+# 选定目标的勾选状态存在 selected 里，bx: 回调切换、发送时据此推送。
+_broadcast_pending: dict[str, dict] = {}
+
+
+def _broadcast_keyboard(token: str) -> dict:
+    """构造广播目标勾选键盘。每个目标一行可切换（✅/⬜），底部发送/取消。
+    回调：bx:<token>:<idx> 切换某目标；bx:<token>:send 发送；bx:<token>:cancel 取消。"""
+    with _publish_lock:
+        info = _broadcast_pending.get(token)
+    selected = info["selected"] if info else set()
+    rows = []
+    for idx, (label, _cid) in enumerate(config.TELEGRAM_BROADCAST_TARGETS):
+        mark = "✅" if idx in selected else "⬜"
+        rows.append([{"text": f"{mark} {label}",
+                      "callback_data": f"bx:{token}:{idx}"}])
+    rows.append([
+        {"text": "📤 发送通知", "callback_data": f"bx:{token}:send"},
+        {"text": "🚫 不通知", "callback_data": f"bx:{token}:cancel"},
+    ])
+    return {"inline_keyboard": rows}
+
+
+def _broadcast_do(chat_id: int, message_id: int, token: str) -> None:
+    """按勾选的目标推送文章链接。汇总成功/失败回报给管理员。"""
+    with _publish_lock:
+        info = _broadcast_pending.pop(token, None)
+    if not info:
+        edit_text(chat_id, message_id, "⏳ 广播会话已过期。")
+        return
+    selected = info["selected"]
+    if not selected:
+        edit_text(chat_id, message_id, "（未勾选任何目标，已取消通知。）")
+        return
+    text = (f"📰 新文章发布\n<b>{info['title']}</b>\n{info['url']}")
+    ok, fail = [], []
+    for idx in sorted(selected):
+        if idx >= len(config.TELEGRAM_BROADCAST_TARGETS):
+            continue
+        label, cid = config.TELEGRAM_BROADCAST_TARGETS[idx]
+        mid = send(cid, text)
+        (ok if mid is not None else fail).append(label)
+    summary = f"✅ 已通知：{'、'.join(ok)}" if ok else ""
+    if fail:
+        summary += (("\n" if summary else "")
+                    + f"❌ 失败：{'、'.join(fail)}（确认机器人已加入该群/频道并有发言权）")
+    edit_text(chat_id, message_id, summary or "未发送。")
+
 
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
     """构造推理强度选择键盘。mode='p'(预设)/'c'(自定义)。
@@ -1711,6 +1774,44 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "仅管理员可发布")
             return
         _handle_publish_callback(cb_id, data, chat_id, message_id)
+        return
+
+    # ── 发布成功后广播到群/频道（bx:，仅管理员）──
+    # 格式 bx:<token>:<idx> 切换目标勾选 / bx:<token>:send 发送 / bx:<token>:cancel 取消
+    if data.startswith("bx:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可操作")
+            return
+        try:
+            _, token, action = data.split(":")
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        if action == "cancel":
+            with _publish_lock:
+                _broadcast_pending.pop(token, None)
+            answer_callback(cb_id, "已跳过通知")
+            edit_text(chat_id, message_id, "🚫 未通知群聊/频道。")
+            return
+        if action == "send":
+            answer_callback(cb_id, "发送中…")
+            _broadcast_do(chat_id, message_id, token)
+            return
+        # 切换某目标的勾选状态
+        with _publish_lock:
+            info = _broadcast_pending.get(token)
+            if info is None:
+                answer_callback(cb_id, "会话已过期")
+                edit_text(chat_id, message_id, "⏳ 广播会话已过期。")
+                return
+            if action.isdigit():
+                idx = int(action)
+                if idx in info["selected"]:
+                    info["selected"].discard(idx)
+                else:
+                    info["selected"].add(idx)
+        answer_callback(cb_id)
+        edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
     # /fixtures 过去/未来切换 + 翻页按钮（访客可点）。格式 fx:<view>[:<page>]
