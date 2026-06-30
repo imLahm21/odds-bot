@@ -287,6 +287,63 @@ def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
                      max_tokens=config.LLM_LIVE_MAX_TOKENS)
 
 
+def seo_summarize(free_body: str, home: str, away: str, league: str,
+                  is_review: bool = False) -> tuple[dict | None, str | None]:
+    """据报告【免费正文】生成 SEO 三件套，返回 (结果 dict 或 None, 错误说明 或 None)。
+
+    成功：({"hook":…, "excerpt":…, "meta_desc":…}, None)
+    失败/未配置：(None, "原因串")——调用方据此回退模板，并可把原因发回 TG 提示。
+    只喂免费正文（第1~6节），天然不泄露第7节结论。
+    用轻量模型 + 短超时（这是发布期的锦上添花，不该拖慢/卡死发布）。
+    """
+    import json
+    import re as _re
+    if not available():
+        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+    view = "赛后复盘" if is_review else "赛前预测"
+    system = (
+        "你是足球赔率分析博客的中文 SEO 编辑。根据用户给的一篇文章免费正文，"
+        "生成用于搜索引擎与列表展示的文案。只输出一个 JSON 对象，不要 markdown "
+        "代码块、不要多余文字。字段：\n"
+        '  "hook": 一句话看点（≤20字），勾起读者兴趣，用作标题副标题；\n'
+        '  "excerpt": 文章摘要（120~160字），描述本场盘口看点与分析维度；\n'
+        '  "meta_desc": 搜索引擎描述（≤145字），在 excerpt 基础上做 SEO 优化、'
+        "核心关键词前置。\n"
+        "硬规则：① 绝不出现比分/胜负/上下盘等结论性预测，只描述分析了什么；"
+        "② 不出现任何具体庄家名（如 365/Pinnacle/威廉），连「庄家」这个通用词也避开，"
+        "统一用「主流机构」指代；③ 全中文；④ 视角是【{view}】；⑤ 用「推算」而非「精算」"
+        "描述分析行为；⑥ 只依据给定正文，不编造数据。"
+    ).replace("{view}", view)
+    user = (
+        f"## 比赛：{home} vs {away}（{league}）\n"
+        f"## 视角：{view}\n\n"
+        f"### 免费正文\n{free_body}\n"
+    )
+    raw = _call_llm(system, user,
+                    effort=config.LLM_LIVE_EFFORT,
+                    model=config.LLM_LIVE_MODEL,
+                    timeout=config.LLM_LIVE_TIMEOUT,
+                    max_tokens=config.LLM_LIVE_MAX_TOKENS)
+    # _call_llm 失败时返回错误说明串（非 JSON），下面解析失败即回退并带回原因
+    m = _re.search(r"\{.*\}", raw, _re.S)   # 容忍模型偶尔包裹代码块/前后缀
+    if not m:
+        log.warning("SEO 概括未返回 JSON，回退模板：%s", raw[:120])
+        return None, raw[:200]
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        log.warning("SEO 概括 JSON 解析失败，回退模板：%s", m.group(0)[:120])
+        return None, "LLM 返回非合法 JSON，无法解析"
+    hook = str(d.get("hook", "")).strip()
+    excerpt = str(d.get("excerpt", "")).strip()
+    meta_desc = str(d.get("meta_desc", "")).strip()
+    if not (hook and excerpt and meta_desc):   # 任一缺失即整体回退，避免半套文案
+        log.warning("SEO 概括字段不全，回退模板：%s", str(d)[:120])
+        return None, "LLM 返回字段不全（hook/excerpt/meta_desc 缺失）"
+    return {"hook": hook[:30], "excerpt": excerpt[:200],
+            "meta_desc": meta_desc[:145]}, None
+
+
 # SOP 报告主段标题 → 进度阶段名（按 ### N. 数字识别，子段 1b/1c/1d 不计）
 _STAGE_NAMES = {
     1: "数据提取",
