@@ -859,6 +859,7 @@ def push_live_update(chat_id: int, fid: int, entry: dict,
     _live_brief_pool 后立即返回；研判线程跑完再单独 send 一条 💡 消息。"""
     status = entry.get("fixture", {}).get("status", {})
     elapsed = status.get("elapsed")
+    short = status.get("short") or ""
     teams = entry.get("teams", {})
     hg = teams.get("home", {}).get("goals")
     ag = teams.get("away", {}).get("goals")
@@ -870,9 +871,20 @@ def push_live_update(chat_id: int, fid: int, entry: dict,
     home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
     score = f"{hg}-{ag}"
 
+    # 阶段标注：加时/点球阶段明确写出，不再只有「第 N′」（点球阶段 elapsed 常为空）
+    phase = config.LIVE_PHASE_ZH.get(short, "")
+    if short == "P":
+        time_line = f"🥅 点球大战  比分 {score}"
+    elif short in ("ET", "BT"):
+        mins = f"第 {elapsed}′" if elapsed is not None else ""
+        time_line = f"⏱ {phase} {mins}  比分 {score}".replace("  ", " ").strip()
+    else:
+        mins = f"第 {elapsed}′" if elapsed is not None else (phase or "进行中")
+        time_line = f"{mins}  比分 {score}"
+
     live_lines = _fmt_live_lines(rows)
     parts = [f"🔴 走地 | {home} vs {away}",
-             f"第 {elapsed}′  比分 {score}", "",
+             time_line, "",
              "异动："]
     parts += [f"  {d}" for d in deltas]
     parts.append("")
