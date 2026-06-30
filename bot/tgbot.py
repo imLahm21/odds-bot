@@ -1212,9 +1212,13 @@ def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> N
 
     edit_text(chat_id, message_id, "⏳ 正在发布到 Ghost…")
     try:
-        title, html, excerpt, slug, meta_title, meta_description = \
+        title, html, excerpt, slug, meta_title, meta_description, seo_err = \
             ghost_publish.report_to_post(
                 md, title=info.get("title"), is_review=info["is_review"])
+        # LLM 概括 SEO 文案失败：先告知原因（已自动回退到固定模板，发布不中断）
+        if seo_err:
+            send(chat_id, f"⚠️ SEO 文案 LLM 概括失败，已回退默认模板：\n{seo_err}",
+                 plain=True)
         post = ghost_publish.create_post(
             title, html, status="published", visibility=visibility,
             custom_excerpt=excerpt, slug=slug,

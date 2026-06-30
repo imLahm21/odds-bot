@@ -80,6 +80,9 @@ _MATCH_RE = re.compile(r"^\#\#\s*比赛[：:]\s*(.+?)\s+vs\s+(.+?)\s*$", re.MULT
 _EVENT_RE = re.compile(r"^\#\#\s*赛事[：:]\s*(.+?)\s*$", re.MULTILINE)
 # 付费墙锚点：### 7. 最终精算结论（允许 7 后面是 . 、 中文顿号或空格）
 _PAYWALL_RE = re.compile(r"^\#{3}\s*7\s*[\.、]?\s*最终精算结论", re.MULTILINE)
+# 归档路径行：CLAUDE.md 步骤8 让 LLM 在报告末尾输出的 "> 归档路径：report/..."，
+# 仅供后台落盘用，不应进入发布正文。整行剥除（含可选的引用前缀/空白）。
+_ARCHIVE_LINE_RE = re.compile(r"(?m)^\s*>?\s*归档路径[：:].*$\n?")
 
 
 class GhostError(Exception):
@@ -325,28 +328,39 @@ def _slugify(text: str) -> str:
 
 def report_to_post(report_md: str, *, title: str | None = None,
                    is_review: bool = False
-                   ) -> tuple[str, str, str, str | None, str, str]:
-    """精算报告 markdown → (title, html, excerpt, slug, meta_title, meta_description)。
+                   ) -> tuple[str, str, str, str | None, str, str, str | None]:
+    """精算报告 markdown → (title, html, excerpt, slug, meta_title,
+    meta_description, seo_err)。
 
-    title 传入则用之（管理员自定义）；否则从首行 '## 比赛：X vs Y' 生成。
+    title 传入则用之（管理员自定义）；否则「中文队名 vs 中文队名」做基底，
+      LLM 概括出的看点拼成「X vs Y｜看点」（LLM 不可用时退回「X vs Y · 推算预测」）。
     slug 始终从报告里的英文队名生成（如 derry-city-vs-drogheda-united-prediction），
-    与标题语言无关，保证 URL 是干净英文；无法生成时返回 None（让 Ghost 自动生成）。
+      与标题语言无关，保证 URL 是干净英文；无法生成时返回 None（让 Ghost 自动生成）。
+    excerpt / meta_description 由 LLM 据【免费正文】概括（不泄露第7节结论），
+      失败回退固定模板。meta_title 直接用 title。
+    seo_err：LLM 概括失败原因（成功为 None）；调用方可据此先发 TG 提示再正常发布。
     付费墙：第 7 节「最终精算结论」之前免费，之后付费。
     """
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
+    text = _ARCHIVE_LINE_RE.sub("", text)   # 剥掉「> 归档路径：…」行，不进发布正文
 
     # 队名匹配（home/away 保留英文原名，供 slug 用；标题另取中文/规范英文）
     m = _MATCH_RE.search(text)
     home = _clean_team(m.group(1)) if m else ""
     away = _clean_team(m.group(2)) if m else ""
 
-    # 标题：队名优先中文映射，未命中规范化英文；分隔符用 ·
+    # 标题：管理员自定义优先；否则「中文队名 vs 中文队名」做基底，
+    # 看点副标题在免费正文切出后由 LLM 生成再拼上（见下方 SEO 段）。
+    custom_title = bool(title)
+    vs_cn = ""
+    if m:
+        vs_cn = f"{_cn_or_en(home)} vs {_cn_or_en(away)}"
     if not title:
         if m:
-            suffix = "复盘" if is_review else "精算预测"
-            title = f"{_cn_or_en(home)} vs {_cn_or_en(away)} · {suffix}"
+            suffix = "复盘" if is_review else "推算预测"
+            title = f"{vs_cn} · {suffix}"
         else:
-            title = "精算复盘" if is_review else "精算预测"
+            title = "精算复盘" if is_review else "推算预测"
 
     # slug：英文队名 + prediction/review 后缀；队名无 ASCII（纯中文）时退回 None
     slug = None
@@ -389,31 +403,52 @@ def report_to_post(report_md: str, *, title: str | None = None,
         html = free_html
 
     # ── SEO 元数据（中文，供 Ghost Meta data + 列表 Excerpt）──
-    home_cn = _cn_or_en(home) if home else ""
-    away_cn = _cn_or_en(away) if away else ""
-    vs_cn = f"{home_cn} vs {away_cn}" if (home_cn or away_cn) else title
-    # 从赛事行提取纯中文联赛名（去掉英文/轮次/开球时间），如「世界杯 FIFA World Cup（小组赛首轮）」→「世界杯」
-    lm = re.search(r"[一-鿿·]+", excerpt.split("开球时间")[0]) if excerpt else None
+    # 联赛名：从赛事行提取纯中文（去英文/轮次/开球时间），供模板回退与 LLM 输入用。
+    # 如「世界杯 FIFA World Cup（小组赛首轮）」→「世界杯」。
+    event_line = excerpt   # 此时 excerpt 仍是原始赛事行
+    lm = re.search(r"[一-鿿·]+", event_line.split("开球时间")[0]) if event_line else None
     league_cn = lm.group(0) if lm else ""
     league_paren = f"（{league_cn}）" if league_cn else ""
+    vs_or_title = vs_cn or title
 
+    # 固定模板（LLM 不可用或失败时的回退）——保持改动前的行为
     if is_review:
-        meta_title = f"{vs_cn}赔率分析" + (f"｜{league_cn}复盘解盘" if league_cn else "｜复盘解盘")
-        meta_description = (
-            f"{vs_cn}{league_paren}赔率复盘：回溯盘口异动、资金流向与凯利信号，"
-            "解析庄家操盘意图与赛果偏差。完整复盘见正文。")
-        excerpt_tail = "赔率复盘：回溯盘口异动、资金流向与凯利信号，解析操盘意图与赛果偏差。"
+        tpl_meta_desc = (
+            f"{vs_or_title}{league_paren}赔率复盘：回溯盘口异动、资金流向与凯利信号，"
+            "解析主流机构操盘意图与赛果偏差。")
+        tpl_excerpt_tail = "赔率复盘：回溯盘口异动、资金流向与凯利信号，解析主流机构操盘意图与赛果偏差。"
     else:
-        meta_title = f"{vs_cn}赔率分析" + (f"｜{league_cn}精算预测" if league_cn else "｜精算预测")
-        meta_description = (
-            f"{vs_cn}{league_paren}赔率精算：欧赔亚盘资金流向、凯利指数风控、"
-            "近况与历史交锋推演比分与胜平负方向。完整结论见正文。")
-        excerpt_tail = "本场赔率精算：欧赔亚盘资金流向、凯利风控、近况与交锋全维度推演，完整结论见正文。"
+        tpl_meta_desc = (
+            f"{vs_or_title}{league_paren}赔率推算：欧赔亚盘资金流向、凯利指数风控、"
+            "近况与历史交锋推演比分与胜平负方向。")
+        tpl_excerpt_tail = "本场赔率推算：欧赔亚盘资金流向、凯利风控、近况与交锋全维度推演。"
+    tpl_excerpt = f"{event_line}。{tpl_excerpt_tail}" if event_line else tpl_excerpt_tail
 
-    # 列表卡片 Excerpt：原赛事行（含开球时间，站内浏览有用）+ 内容简介
-    excerpt = f"{excerpt}。{excerpt_tail}" if excerpt else excerpt_tail
+    # LLM 概括（只喂免费正文 free_md，天然不泄露第7节结论）。失败/未配置则回退模板，
+    # 并把失败原因 seo_err 带回调用方（供 TG 先发一条提示，再继续用模板正常发布）。
+    seo, seo_err = None, None
+    if free_md.strip():
+        try:
+            from . import analyzer
+            seo, seo_err = analyzer.seo_summarize(
+                free_md, vs_or_title, "", league_cn or "足球", is_review=is_review)
+        except Exception as e:
+            log.exception("SEO 概括异常，回退模板")
+            seo, seo_err = None, f"SEO 概括异常：{e}"
 
-    return title, html, excerpt, slug, meta_title, meta_description
+    if seo:
+        excerpt = seo["excerpt"]
+        meta_description = seo["meta_desc"]
+        # 看点拼进标题（仅自动标题；管理员自定义标题时不动）。meta_title = title。
+        if not custom_title and vs_cn and seo.get("hook"):
+            title = f"{vs_cn}｜{seo['hook']}"
+    else:
+        excerpt = tpl_excerpt
+        meta_description = tpl_meta_desc
+
+    meta_title = title   # 规范：Meta title 直接用文章标题
+
+    return title, html, excerpt, slug, meta_title, meta_description, seo_err
 
 
 def _render(md_text: str) -> str:
