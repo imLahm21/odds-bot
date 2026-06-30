@@ -534,13 +534,12 @@ def _render_fixtures(view: str = "future", page: int = 0):
         return ("过去/未来 3 天暂无赛程（可能休赛期或赛程未拉取）",
                 {"inline_keyboard": [toggle_row]})
 
-    # 已开赛：按开球时间降序（最新在最前、落第 1 页，便于复盘刚结束的比赛）；
-    # 未来：按开球时间升序（最近要开的在最前）。
+    # 两个视图都按开球时间降序：最新（开球时间最晚）的在最前、落第 1 页。
     if view == "past":
         all_rows = past[::-1]
         title = "已开赛（可 /review 复盘）"
     else:
-        all_rows = future
+        all_rows = future[::-1]
         title = "未来（可 /analyze 精算）"
 
     # 不再硬性截断：超过 PAGE 场就分页
