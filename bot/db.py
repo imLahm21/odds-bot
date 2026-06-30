@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS live_odds_history (
     snapshot_utc  TEXT NOT NULL,
     elapsed       INTEGER,                  -- 进行分钟数(走地节点语义)
     home_goals    INTEGER, away_goals INTEGER,  -- 抓取瞬间实时比分
+    status_short  TEXT,                     -- fixture.status.short(1H/2H/ET/BT/P…)，判加时/点球阶段
     bookmaker_id  INTEGER, bookmaker TEXT,
     market        TEXT NOT NULL,            -- 'h2h' | 'ah' | 'ou'
     handicap      REAL,                     -- 主盘口线(h2h 为 NULL)
@@ -114,6 +115,7 @@ ODDS_COLS = [
 # live_odds_history 批量插入列顺序（与 parser.parse_live_response 产出对齐）
 LIVE_ODDS_COLS = [
     "fixture_id", "snapshot_utc", "elapsed", "home_goals", "away_goals",
+    "status_short",
     "bookmaker_id", "bookmaker", "market",
     "handicap", "home_water", "away_water", "draw_odds", "suspended",
 ]
@@ -147,6 +149,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col in ("home_team_id", "away_team_id"):
         if col not in cols:
             conn.execute(f"ALTER TABLE fixtures ADD COLUMN {col} INTEGER")
+    # 走地表补 status_short（旧库无此列；新增走地阶段标注/终局判定用）
+    live_cols = {r[1] for r in conn.execute("PRAGMA table_info(live_odds_history)")}
+    if "status_short" not in live_cols:
+        conn.execute("ALTER TABLE live_odds_history ADD COLUMN status_short TEXT")
     conn.commit()
 
 
@@ -379,7 +385,7 @@ def get_latest_live_snapshot(conn: sqlite3.Connection, fixture_id: int,
                              bookmaker_id: int) -> list[tuple]:
     """取某场某庄最近一次走地快照的全部 market 行（异动对比用）。
     返回 [(market, handicap, home_water, away_water, draw_odds, suspended,
-           elapsed, home_goals, away_goals), ...]；无则空列表。"""
+           elapsed, home_goals, away_goals, status_short), ...]；无则空列表。"""
     row = conn.execute(
         "SELECT snapshot_utc FROM live_odds_history "
         "WHERE fixture_id=? AND bookmaker_id=? "
@@ -388,7 +394,7 @@ def get_latest_live_snapshot(conn: sqlite3.Connection, fixture_id: int,
         return []
     return conn.execute(
         "SELECT market, handicap, home_water, away_water, draw_odds, suspended, "
-        "elapsed, home_goals, away_goals FROM live_odds_history "
+        "elapsed, home_goals, away_goals, status_short FROM live_odds_history "
         "WHERE fixture_id=? AND bookmaker_id=? AND snapshot_utc=?",
         (fixture_id, bookmaker_id, row[0])).fetchall()
 

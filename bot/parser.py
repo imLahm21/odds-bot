@@ -332,6 +332,7 @@ def parse_live_response(entry: dict, snapshot_utc: str,
         return []
     status = entry.get("fixture", {}).get("status", {})
     elapsed = status.get("elapsed")
+    status_short = status.get("short")        # 1H/2H/ET/BT/P… 判加时/点球阶段
     teams = entry.get("teams", {})
     home_goals = teams.get("home", {}).get("goals")
     away_goals = teams.get("away", {}).get("goals")
@@ -339,6 +340,7 @@ def parse_live_response(entry: dict, snapshot_utc: str,
     base = {
         "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
         "elapsed": elapsed, "home_goals": home_goals, "away_goals": away_goals,
+        "status_short": status_short,
         "bookmaker_id": 0, "bookmaker": "LIVE",
     }
     rows = []

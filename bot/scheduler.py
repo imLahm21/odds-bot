@@ -176,14 +176,14 @@ def _cur_from(rows: list[dict]) -> dict:
 def _prev_from(snapshot_rows: list[tuple]) -> dict:
     """把 db.get_latest_live_snapshot 的行(元组)转成按 market 索引的 dict。
     元组列序: (market, handicap, home_water, away_water, draw_odds, suspended,
-               elapsed, home_goals, away_goals)
+               elapsed, home_goals, away_goals, status_short)
     """
     prev = {}
-    for (market, hc, hw, aw, draw, susp, el, hg, ag) in snapshot_rows:
+    for (market, hc, hw, aw, draw, susp, el, hg, ag, st) in snapshot_rows:
         prev[market] = {
             "market": market, "handicap": hc, "home_water": hw, "away_water": aw,
             "draw_odds": draw, "suspended": susp,
-            "elapsed": el, "home_goals": hg, "away_goals": ag,
+            "elapsed": el, "home_goals": hg, "away_goals": ag, "status_short": st,
         }
     return prev
 
@@ -208,6 +208,16 @@ def _detect_live_delta(prev: dict, cur: dict) -> list[str]:
         cc = (any_cur.get("home_goals"), any_cur.get("away_goals"))
         if None not in cc and None not in pc and cc != pc:
             deltas.append(f"⚽ 进球！比分 {pc[0]}-{pc[1]} → {cc[0]}-{cc[1]}")
+        # 阶段切换：进入加时/加时中场/点球大战时必推（这些是赛果走向的关键节点，
+        # 此前完全没标注——常规时间结束进加时、加时平进点球，用户最需要知道）。
+        ps = (any_prev.get("status_short") or "")
+        cs = (any_cur.get("status_short") or "")
+        if ps != cs and cs in ("ET", "BT", "P"):
+            phase = config.LIVE_PHASE_ZH.get(cs, cs)
+            tip = {"ET": "常规时间战平/未分胜负，进入加时赛",
+                   "BT": "加时上下半场之间",
+                   "P": "加时仍未分胜负，进入点球大战"}.get(cs, "")
+            deltas.append(f"⏱ 进入{phase}" + (f"（{tip}）" if tip else ""))
 
     market_zh = {"ah": "亚盘", "ou": "大小球", "h2h": "欧赔"}
     for mk in ("ah", "ou", "h2h"):
@@ -230,15 +240,32 @@ def _detect_live_delta(prev: dict, cur: dict) -> list[str]:
     return deltas
 
 
+def _fmt_final_score(result: dict) -> str:
+    """据 fixture 结果拼终场比分文本，正确反映加时/点球：
+      - 常规/加时：用 goals(全场总比分，含加时)
+      - 点球(PEN)：在总比分后补「(点球 X-Y)」，避免只显示 1-1 看不出谁赢
+    """
+    goals = (result or {}).get("goals", {}) or {}
+    score = (result or {}).get("score", {}) or {}
+    short = (result or {}).get("fixture", {}).get("status", {}).get("short", "")
+    hg, ag = goals.get("home", "?"), goals.get("away", "?")
+    txt = f"{hg}-{ag}"
+    pen = score.get("penalty", {}) or {}
+    if short == "PEN" and pen.get("home") is not None:
+        txt += f"（点球 {pen.get('home')}-{pen.get('away')}）"
+    elif short == "AET":
+        txt += "（加时）"
+    return txt
+
+
 def _maybe_autounsub(conn, fid: int) -> None:
-    """订阅的比赛不在进行中列表里 → 查 fixture 状态，已结束则自动退订并通知。"""
+    """订阅的比赛不在进行中列表里 → 查 fixture 状态，已结束/异常终止则自动退订并通知。"""
     meta = db.get_fixture_meta(conn, fid)
     home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
     result = api_client.fetch_fixture_result(fid)
     short = (result or {}).get("fixture", {}).get("status", {}).get("short", "")
-    if short in ("FT", "AET", "PEN"):   # 已结束
-        goals = (result or {}).get("goals", {})
-        score = f"{goals.get('home', '?')}-{goals.get('away', '?')}"
+    if short in config.LIVE_STATUS_FINISHED:        # 正常结束（FT/AET/PEN）
+        score = _fmt_final_score(result)
         chats = db.disable_live_sub_all(conn, fid)
         if chats:
             from . import tgbot
@@ -246,6 +273,16 @@ def _maybe_autounsub(conn, fid: int) -> None:
                 tgbot.send(cid, f"🏁 {home} vs {away} 已结束(终场 {score})，"
                                 f"走地播报自动退订。", plain=True)
         log.info("【任务E】fixture %d 已结束(%s)，自动退订 %d 人", fid, short, len(chats))
+    elif short in config.LIVE_STATUS_ABNORMAL_END:  # 中断/延期/取消等异常
+        chats = db.disable_live_sub_all(conn, fid)
+        if chats:
+            from . import tgbot
+            zh = {"SUSP": "中断", "INT": "中断", "PST": "延期", "CANC": "取消",
+                  "ABD": "放弃", "AWD": "判负", "WO": "弃权"}.get(short, short)
+            for cid in chats:
+                tgbot.send(cid, f"⚠️ {home} vs {away} 已{zh}({short})，"
+                                f"走地播报自动退订。", plain=True)
+        log.info("【任务E】fixture %d 异常终止(%s)，自动退订 %d 人", fid, short, len(chats))
 
 
 def task_e_live_broadcast() -> int:
