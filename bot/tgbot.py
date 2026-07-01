@@ -1088,30 +1088,68 @@ def _send_long(chat_id: int, text: str, plain: bool = True) -> None:
         text = text[cut:].lstrip("\n")
 
 
-def _archive_report(meta: dict, report: str, suffix: str = "report",
-                    chat_id: int | None = None) -> str | None:
-    """把报告存一份 md。
+def _report_path(meta: dict, suffix: str = "report",
+                 chat_id: int | None = None) -> str:
+    """拼归档报告路径（纯路径，不建目录、不写文件），供归档与读取共用，
+    避免路径规则两处漂移。
     - 管理员（或 chat_id 缺省）：report/<开球日期>/<主队>_vs_<客队>_<suffix>.md
     - 访客：report/visitors/<chat_id>/<开球日期>/<...>.md
-      每个访客有独立专用文件夹（用其 chat_id 命名），互不混淆、便于审计。
-    suffix: 'report'（精算）或 'review'（复盘）。
+    """
+    import os
+    date = (meta.get("kick_cst") or "")[:10] or "未知日期"
+    teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
+    if chat_id is not None and not _is_admin(chat_id):
+        out_dir = os.path.join("report", "visitors", str(chat_id), date)
+    else:
+        out_dir = os.path.join("report", date)
+    return os.path.join(out_dir, f"{teams}_{suffix}.md")
+
+
+def _archive_report(meta: dict, report: str, suffix: str = "report",
+                    chat_id: int | None = None) -> str | None:
+    """把报告存一份 md。路径规则见 _report_path。
+    suffix: 'report'（精算）/ 'review'（复盘）/ 'review_blind'（只盲推）。
     """
     import os
     try:
-        date = (meta.get("kick_cst") or "")[:10] or "未知日期"
-        teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
-        if chat_id is not None and not _is_admin(chat_id):
-            out_dir = os.path.join("report", "visitors", str(chat_id), date)
-        else:
-            out_dir = os.path.join("report", date)
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{teams}_{suffix}.md")
+        path = _report_path(meta, suffix, chat_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(report)
         return path
     except Exception as e:
         log.warning("报告归档失败: %s", e)
         return None
+
+
+def _load_blind_forecast(meta: dict, chat_id: int | None = None) -> str | None:
+    """只跑第二步（对照）时，从已有归档读出第一步盲推预判。
+    优先 <主>_vs_<客>_review_blind.md（整篇即预判）；
+    其次 _review.md（合并档，切出「# 第二步·对照复盘」之前的第一步部分）。
+    都没有则返回 None（调用方提示先跑盲推）。
+    """
+    import os
+    for suffix in ("review_blind", "review"):
+        path = _report_path(meta, suffix, chat_id)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            log.warning("读取盲推归档失败 %s: %s", path, e)
+            continue
+        if suffix == "review":
+            # 合并档：切出对照之前的第一步；去掉「# 第一步·盲推预判…」标题行
+            head = text.split("# 第二步·对照复盘", 1)[0]
+            head = head.replace("---", "").strip()
+            if head.startswith("# 第一步"):
+                head = head.split("\n", 1)[1] if "\n" in head else ""
+            text = head.strip()
+        text = text.strip()
+        if text:
+            return text
+    return None
 
 
 def _publish_date_keyboard() -> dict | None:
@@ -1474,8 +1512,8 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
 
 
 def _cmd_review(chat_id: int, args: list[str]) -> None:
-    """复盘第一步：校验 + 弹推理强度选择键盘（ae:r:<fid>:<effort>）。
-    选完强度才真正开跑（见 _run_review）。强度同时用于盲推与对照两遍。"""
+    """复盘第一步：校验 + 弹模式选择键盘（只盲推/只对照/两步全跑）。
+    选完模式再弹强度键盘（ae:r<mode>:<fid>:<effort>），选完强度才开跑（见 _run_review）。"""
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/review &lt;fixture_id&gt;（对已结束的比赛复盘）")
         return
@@ -1488,16 +1526,25 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
     if not csv_str:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
         return
-    send(chat_id, "🔬 复盘（盲推 + 对照两遍）：请选择推理强度\n"
-                  "低/中=快、省额度；高/超高=更慢更深。该强度同时用于两遍。",
-         _effort_keyboard(chat_id, "r", fid))
+    kb = {"inline_keyboard": [[
+        {"text": "🔮 只盲推", "callback_data": f"rm:b:{fid}"},
+        {"text": "🎬 只对照", "callback_data": f"rm:c:{fid}"},
+        {"text": "🔁 两步全跑", "callback_data": f"rm:a:{fid}"},
+    ]]}
+    send(chat_id, "🔬 复盘方式：\n"
+                  "🔮 只盲推 = 只凭盘口正向跑 SOP 出预判（不看比分，归档备用）；\n"
+                  "🎬 只对照 = 读已归档的盲推预判 + 揭晓比分做归因（需先跑过盲推）；\n"
+                  "🔁 两步全跑 = 盲推 + 对照连跑（默认）。\n"
+                  "选完再选推理强度。", kb)
 
 
-def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
-    """对已结束的比赛做【正向盲推 + 对照】复盘：
-    第一遍只喂盘口走势(不给比分)正向跑 SOP 得预判 → 第二遍揭晓真实比分做对照归因。
-    两遍各自实时播报进度，最后两份报告都发回并归档。
-    effort 为推理强度，同时用于盲推与对照两遍。"""
+def _run_review(chat_id: int, fid: int, effort: str = "",
+                sub_mode: str = "all") -> None:
+    """对已结束的比赛做复盘。sub_mode 三选一：
+      "blind"   只跑第一步盲推（仅凭盘口正向跑 SOP 得预判）→ 归档 _review_blind.md
+      "compare" 只跑第二步对照（从归档读盲推预判 + 揭晓比分做归因）→ 归档 _review.md
+      "all"     两步全跑（盲推 + 对照，合并归档 _review.md）——默认
+    effort 为推理强度，同时用于两遍。"""
     from . import api_client
     if not analyzer.available():
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
@@ -1507,58 +1554,79 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
         return
 
-    # 实时拉最终结果（不入库，复盘一次性使用）
-    entry = api_client.fetch_fixture_result(fid)
-    if not entry:
-        send(chat_id, f"无法拉取 fixture {fid} 的结果（API 无返回）")
-        return
-    result_text, short = _fmt_result(entry)
-    finished = {"FT", "AET", "PEN"}
-    if result_text is None or short not in finished:
-        send(chat_id, f"⚠️ fixture {fid} 尚未结束（状态：{short or '未知'}），"
-                      f"无法复盘。请在比赛结束后再试。")
-        return
-
-    # ── 第一遍：盲推（只喂盘口，不给比分），正向跑 SOP 7 步 ──
-    send(chat_id, f"🔬 复盘分两步。第一步【盲推】：不看比分，仅凭盘口正向跑 SOP "
-                  f"得赛前预判（gpt-5.5，约 1~3 分钟）…")
-    blind_title = f"⏳ 第一步·盲推 {meta['home']} vs {meta['away']}（不看结果）"
-    total_a = analyzer._TOTAL_STAGES
-
-    def blind_progress(cur_n: int | None, cur_name: str | None) -> str:
-        lines = [blind_title, ""]
-        for n in range(1, total_a + 1):
-            name = analyzer._STAGE_NAMES[n]
-            if cur_n and n < cur_n:
-                lines.append(f"✅ {n}. {name}")
-            elif n == cur_n:
-                lines.append(f"🔄 {n}. {name} …")
-            else:
-                lines.append(f"⬜ {n}. {name}")
-        return "\n".join(lines)
-
-    msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]))
+    # 只对照时需要比分与已有盲推预判；只盲推时都不需要。按 sub_mode 分别准备。
+    result_text = None
     forecast = None
-    for ev in analyzer.review_blind_stream(csv_str, meta["home"],
-                                           meta["away"], meta["league"],
-                                           effort):
-        if ev[0] == "stage":
-            if msg_a:
-                edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]))
-        elif ev[0] == "done":
-            forecast = ev[1]
-        elif ev[0] == "error":
-            if msg_a:
-                edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}")
-            else:
-                send(chat_id, f"❌ 盲推失败：{ev[1]}")
+    if sub_mode in ("all", "compare"):
+        # 实时拉最终结果（不入库，复盘一次性使用）
+        entry = api_client.fetch_fixture_result(fid)
+        if not entry:
+            send(chat_id, f"无法拉取 fixture {fid} 的结果（API 无返回）")
             return
-    if not forecast:
-        send(chat_id, "❌ 盲推未产出预判，复盘中止。")
+        result_text, short = _fmt_result(entry)
+        finished = {"FT", "AET", "PEN"}
+        if result_text is None or short not in finished:
+            send(chat_id, f"⚠️ fixture {fid} 尚未结束（状态：{short or '未知'}），"
+                          f"无法复盘。请在比赛结束后再试。")
+            return
+    if sub_mode == "compare":
+        # 跳过盲推，从归档读第一步预判
+        forecast = _load_blind_forecast(meta, chat_id)
+        if not forecast:
+            send(chat_id, "⚠️ 未找到该场的盲推预判归档，无法只跑对照。\n"
+                          "请先用「只盲推」或「两步全跑」生成预判后再试。")
+            return
+        send(chat_id, "📄 已读取归档的盲推预判，直接进入第二步对照…")
+
+    # ── 第一遍：盲推（只喂盘口，不给比分），正向跑 SOP 7 步 ──（compare 跳过）
+    if sub_mode in ("all", "blind"):
+        send(chat_id, f"🔬 第一步【盲推】：不看比分，仅凭盘口正向跑 SOP "
+                      f"得赛前预判（gpt-5.5，约 1~3 分钟）…")
+        blind_title = f"⏳ 第一步·盲推 {meta['home']} vs {meta['away']}（不看结果）"
+        total_a = analyzer._TOTAL_STAGES
+
+        def blind_progress(cur_n: int | None, cur_name: str | None) -> str:
+            lines = [blind_title, ""]
+            for n in range(1, total_a + 1):
+                name = analyzer._STAGE_NAMES[n]
+                if cur_n and n < cur_n:
+                    lines.append(f"✅ {n}. {name}")
+                elif n == cur_n:
+                    lines.append(f"🔄 {n}. {name} …")
+                else:
+                    lines.append(f"⬜ {n}. {name}")
+            return "\n".join(lines)
+
+        msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]))
+        for ev in analyzer.review_blind_stream(csv_str, meta["home"],
+                                               meta["away"], meta["league"],
+                                               effort):
+            if ev[0] == "stage":
+                if msg_a:
+                    edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]))
+            elif ev[0] == "done":
+                forecast = ev[1]
+            elif ev[0] == "error":
+                if msg_a:
+                    edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}")
+                else:
+                    send(chat_id, f"❌ 盲推失败：{ev[1]}")
+                return
+        if not forecast:
+            send(chat_id, "❌ 盲推未产出预判，复盘中止。")
+            return
+        if msg_a:
+            edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
+        _send_long(chat_id, _md_to_tg("🔮 第一步·盲推预判\n\n" + forecast))
+
+    # 只盲推：归档预判后结束，不跑对照
+    if sub_mode == "blind":
+        path = _archive_report(meta, forecast, suffix="review_blind",
+                               chat_id=chat_id)
+        if path:
+            send(chat_id, f"📁 盲推预判已归档：{path}\n"
+                          f"（之后可用「只对照」揭晓比分做归因）")
         return
-    if msg_a:
-        edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
-    _send_long(chat_id, _md_to_tg("🔮 第一步·盲推预判\n\n" + forecast))
 
     # ── 基本面（仅供第二遍对照归因，盲推刻意不看）──
     # 两阶段：拉原始基本面 → 轻量模型预处理成研判 → 传给对照复盘做归因（失败回退原始/空）。
@@ -1996,8 +2064,28 @@ def handle_callback(cb: dict) -> None:
              _effort_keyboard(chat_id, "c", fid))
         return
 
+    # 复盘模式选定：rm:<sub>:<fid>（sub=b 只盲推/c 只对照/a 两步全跑）→ 再弹强度键盘
+    if data.startswith("rm:"):
+        try:
+            _, sub, sfid = data.split(":")
+            fid = int(sfid)
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        if sub not in ("b", "c", "a"):
+            answer_callback(cb_id, "未知复盘模式")
+            return
+        label = {"b": "只盲推", "c": "只对照", "a": "两步全跑"}[sub]
+        answer_callback(cb_id, f"复盘方式：{label}，请选推理强度")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id, f"🔬 复盘【{label}】：请选择推理强度\n"
+                      "低/中=快、省额度；高/超高=更慢更深。",
+             _effort_keyboard(chat_id, f"r{sub}", fid))
+        return
+
     # 推理强度选定：ae:<mode>:<fid>:<effort>
-    #   mode=p 预设精算→直接跑；c 自定义→置位待输入侧重文字；r 复盘→直接跑两遍
+    #   mode=p 预设精算→直接跑；c 自定义→置位待输入侧重文字；
+    #   rb/rc/ra 复盘（只盲推/只对照/两步全跑）→ 跑对应 sub_mode
     if data.startswith("ae:"):
         try:
             _, mode, sfid, eff = data.split(":")
@@ -2022,10 +2110,13 @@ def handle_callback(cb: dict) -> None:
                  "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
                  "（直接发文字即可；发 /cancel 取消）",
                  {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
-        elif mode == "r":
+        elif mode.startswith("r"):
+            # 复盘：mode = rb(只盲推)/rc(只对照)/ra(两步全跑)
+            sub_map = {"rb": "blind", "rc": "compare", "ra": "all"}
+            sub_mode = sub_map.get(mode, "all")
             answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…")
             try:
-                _run_review(chat_id, fid, effort=eff)
+                _run_review(chat_id, fid, effort=eff, sub_mode=sub_mode)
             except Exception:
                 log.exception("复盘执行出错")
                 send(chat_id, "复盘执行出错，请查看服务器日志。")

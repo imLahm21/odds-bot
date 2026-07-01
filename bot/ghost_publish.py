@@ -389,8 +389,29 @@ def report_to_post(report_md: str, *, title: str | None = None,
         # 找不到第 7 节锚点 → 整篇付费（安全兜底）
         free_md, paid_md = "", text.strip()
 
+    # 联赛名：从赛事行提取纯中文（去英文/轮次/开球时间），供科普段/SEO 用。
+    # 如「世界杯 FIFA World Cup（小组赛首轮）」→「世界杯」。
+    event_line = excerpt   # 此时 excerpt 仍是原始赛事行
+    lm = re.search(r"[一-鿿·]+", event_line.split("开球时间")[0]) if event_line else None
+    league_cn = lm.group(0) if lm else ""
+
     free_html = _render(free_md)
     paid_html = _render(paid_md)
+
+    # 发布期增强：把免费正文的近况/交锋提炼成一段口语化「基本面速览」，插在免费区
+    # 最前做引流（不含结论，不泄露付费段）。失败/未配置返回空则不插，行为回退现状。
+    if free_md.strip():
+        try:
+            from . import analyzer
+            fan_brief = analyzer.fan_fundamentals_brief(
+                free_md, home or "主队", away or "客队", league_cn or "足球")
+        except Exception as e:
+            log.warning("科普基本面段生成异常，跳过: %s", e)
+            fan_brief = ""
+        if fan_brief:
+            fan_html = _render(f"## 基本面速览\n\n{fan_brief}")
+            free_html = f"{fan_html}\n{free_html}"
+
     if paid_html:
         # 有付费内容：免费段末尾插收款引导 CTA，再接付费墙分隔符
         cta = _cta_html()
@@ -403,11 +424,6 @@ def report_to_post(report_md: str, *, title: str | None = None,
         html = free_html
 
     # ── SEO 元数据（中文，供 Ghost Meta data + 列表 Excerpt）──
-    # 联赛名：从赛事行提取纯中文（去英文/轮次/开球时间），供模板回退与 LLM 输入用。
-    # 如「世界杯 FIFA World Cup（小组赛首轮）」→「世界杯」。
-    event_line = excerpt   # 此时 excerpt 仍是原始赛事行
-    lm = re.search(r"[一-鿿·]+", event_line.split("开球时间")[0]) if event_line else None
-    league_cn = lm.group(0) if lm else ""
     league_paren = f"（{league_cn}）" if league_cn else ""
     vs_or_title = vs_cn or title
 

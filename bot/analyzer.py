@@ -354,6 +354,40 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
     return out, True
 
 
+def fan_fundamentals_brief(free_md: str, home: str, away: str,
+                           league: str) -> str:
+    """发布期：把报告免费正文里的球队近况/交锋/赛程改写成一段面向普通球迷的
+    口语化「基本面速览」，供 /publish 插入文章免费区引流。
+
+    素材取已成文的 free_md（报告 1b/1c/1d 段），不重新拉数据——publish 读的是
+    历史归档报告，对应 fixture 可能已过 CLEANUP_DAYS 被清。
+    失败/未配置返回 ""（调用方据此不插入，发布不中断）。
+    """
+    if not available() or not free_md.strip():
+        return ""
+    system = (
+        "你是足球博客编辑。下面是一篇赛前分析报告的正文（含球队近况、历史交锋、"
+        "赛程等）。请据此写一段【面向普通球迷的口语化基本面速览】：\n"
+        "- 150~300 字，一段或两段，通俗易懂，不用盘口/亚盘/凯利等术语；\n"
+        "- 只讲两队近期状态、交锋恩怨、伤停赛程等基本面看点，帮读者快速了解看点；\n"
+        "- 不要给出比分预测或胜负结论（结论是付费内容，不可泄露）；\n"
+        "- 直接输出正文，不要标题、不要 markdown 标记。数据缺失不编造。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
+        f"### 报告正文（据此提炼基本面速览）\n{free_md}\n"
+    )
+    out = _call_llm(system, user,
+                    effort=config.FUND_ANALYZE_EFFORT,
+                    model=config.FUND_ANALYZE_MODEL,
+                    timeout=config.FUND_ANALYZE_TIMEOUT,
+                    max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
+    if not out or out.startswith(_LLM_ERR_PREFIXES):
+        log.warning("科普基本面段生成失败，跳过: %s", out[:120])
+        return ""
+    return out.strip()
+
+
 def seo_summarize(free_body: str, home: str, away: str, league: str,
                   is_review: bool = False) -> tuple[dict | None, str | None]:
     """据报告【免费正文】生成 SEO 三件套，返回 (结果 dict 或 None, 错误说明 或 None)。
