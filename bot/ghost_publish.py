@@ -522,9 +522,13 @@ def create_post(title: str, html: str, *, status: str = "published",
         "Content-Type": "application/json",
         "Accept-Version": GHOST_API_VERSION,
     }
-    # 直连内网/环回地址时，用真实域名覆盖 Host，避免 Ghost 301 跳回公网域名
+    # 直连内网/环回地址时，用真实域名覆盖 Host，避免 Ghost 301 跳回公网域名；
+    # 同时带 X-Forwarded-Proto=https：Ghost 的 url 配成 https，会把 http 请求 301
+    # 跳到 https（又绕回公网 CF）。Ghost 在代理后靠此头判定原始请求是否安全，
+    # 带上它 Ghost 即视作 https 请求、不再跳转。
     if GHOST_ADMIN_HOST_HEADER:
         headers["Host"] = GHOST_ADMIN_HOST_HEADER
+        headers["X-Forwarded-Proto"] = "https"
     try:
         r = requests.post(_admin_url("posts/"), params={"source": "html"},
                           json=body, headers=headers, timeout=60,
