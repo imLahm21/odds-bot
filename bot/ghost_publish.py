@@ -30,6 +30,13 @@ GHOST_ADMIN_API_URL = os.getenv("GHOST_ADMIN_API_URL", "").strip().rstrip("/")
 GHOST_DEFAULT_VISIBILITY = os.getenv("GHOST_DEFAULT_VISIBILITY", "paid").strip().lower()
 GHOST_API_VERSION = "v5.0"
 
+# 可选：显式 Host 头。当 GHOST_ADMIN_API_URL 指向内网/环回地址（如
+# http://127.0.0.1:2368，绕过 Cloudflare 直连同机 Ghost）时，Ghost 会因请求
+# Host 与其配置的 canonical url 不符而 301 跳回公网域名 —— 又绕回 CF 被拦成 403。
+# 把本项设为真实公网域名（如 blog.lahmxavi.top），请求即带上正确 Host，
+# Ghost 视作本站请求、不再重定向。留空则不覆盖，走 URL 自身的 host。
+GHOST_ADMIN_HOST_HEADER = os.getenv("GHOST_ADMIN_HOST_HEADER", "").strip()
+
 _MD_EXTENSIONS = ["extra", "fenced_code", "tables", "sane_lists"]
 
 # ── 收款引导（付费墙之前展示给未登录访客）──
@@ -515,9 +522,13 @@ def create_post(title: str, html: str, *, status: str = "published",
         "Content-Type": "application/json",
         "Accept-Version": GHOST_API_VERSION,
     }
+    # 直连内网/环回地址时，用真实域名覆盖 Host，避免 Ghost 301 跳回公网域名
+    if GHOST_ADMIN_HOST_HEADER:
+        headers["Host"] = GHOST_ADMIN_HOST_HEADER
     try:
         r = requests.post(_admin_url("posts/"), params={"source": "html"},
-                          json=body, headers=headers, timeout=60)
+                          json=body, headers=headers, timeout=60,
+                          allow_redirects=False)
     except requests.exceptions.RequestException as e:
         log.warning("Ghost 请求异常: %s", e)
         raise GhostError(f"网络错误：{e}") from e
@@ -527,6 +538,13 @@ def create_post(title: str, html: str, *, status: str = "published",
         data = r.json()
     except ValueError:
         pass
+
+    # 直连内网时若仍被 3xx 跳转（Host 未生效等），明确报错而非静默跟随回公网 CF
+    if 300 <= r.status_code < 400:
+        loc = r.headers.get("Location", "")
+        raise GhostError(
+            f"Ghost 返回重定向 HTTP {r.status_code} → {loc}；"
+            "多为直连时 Host 头与站点 url 不符，请检查 GHOST_ADMIN_HOST_HEADER")
 
     if r.status_code >= 400 or "errors" in data:
         msg = _extract_error(data) or f"HTTP {r.status_code}"
