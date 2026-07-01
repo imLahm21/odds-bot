@@ -498,7 +498,7 @@ def _render_fixtures(view: str = "future", page: int = 0):
         # 直接查，多带一列 league_name（不动 db.get_fixtures_between 的 4 列结构，
         # 那个被调度器解包复用）
         fixtures = conn.execute(
-            "SELECT fixture_id, commence_utc, home_team, away_team, league_name, league_id "
+            "SELECT fixture_id, commence_utc, home_team, away_team, league_name, league_id, status "
             "FROM fixtures WHERE commence_utc BETWEEN ? AND ? "
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
@@ -519,8 +519,22 @@ def _render_fixtures(view: str = "future", page: int = 0):
         except (ValueError, AttributeError):
             return False
 
-    past = [f for f in fixtures if kicked_off(f[1])]
-    future = [f for f in fixtures if not kicked_off(f[1])]
+    # 是否「真正开踢过」——决定归 已开赛(可复盘) 还是 未来(可精算)。
+    # 只按开球时间会误判：推迟(PST)/取消(CANC)的比赛开球时间已过却没真踢，
+    # 应留在「未来(可精算)」而非「已开赛」。故优先看比赛状态，状态缺失才退回时间判。
+    _KICKED = config.LIVE_STATUS_IN_PROGRESS | config.LIVE_STATUS_FINISHED
+    _NOT_KICKED = config.LIVE_STATUS_ABNORMAL_END | {"NS", "TBD"}
+
+    def has_kicked(iso_str, status):
+        s = (status or "").strip()
+        if s in _KICKED:
+            return True
+        if s in _NOT_KICKED:
+            return False
+        return kicked_off(iso_str)   # 状态未知：退回时间判据（旧行为，避免回归）
+
+    past = [f for f in fixtures if has_kicked(f[1], f[6])]
+    future = [f for f in fixtures if not has_kicked(f[1], f[6])]
 
     # 切换按钮：高亮当前视图，点另一个切过去（切视图回到第 0 页）
     toggle_row = [
@@ -564,13 +578,17 @@ def _render_fixtures(view: str = "future", page: int = 0):
         s = s or "?"
         return s if len(s) <= n else s[:n - 1] + "…"
 
-    for fid, commence, home, away, league, league_id in rows:
-        kicked = kicked_off(commence)
+    for fid, commence, home, away, league, league_id, status in rows:
+        kicked = has_kicked(commence, status)
         mark = "✅" if kicked else "🔵"
         label = config.league_label(league_id, league)
         lg = f"（{label}）" if label else ""
+        # 推迟/取消/中断：开球时间已过却没真踢，会留在未来档，标注让用户知道原因
+        tag = {"PST": " ⚠️推迟", "CANC": " ⚠️取消", "SUSP": " ⚠️中断",
+               "INT": " ⚠️中断", "ABD": " ⚠️放弃", "AWD": " ⚠️判负",
+               "WO": " ⚠️弃权"}.get((status or "").strip(), "")
         lines.append(f"{mark} <code>{fid}</code> {to_cst(commence)}  "
-                     f"{home} vs {away}{lg}")
+                     f"{home} vs {away}{lg}{tag}")
         # 每场一行操作按钮：已开赛→复盘，未来→精算。带队名便于在按钮区分辨。
         vs = f"{_short(home)} vs {_short(away)}"
         if kicked:
