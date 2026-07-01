@@ -291,11 +291,28 @@ LLM_LIVE_MODEL = "gpt-5.4-mini"   # 走地轻量模型
 LLM_LIVE_EFFORT = "low"           # 走地推理强度（最低档，求快）
 LLM_LIVE_TIMEOUT = 30             # 走地超时（秒）：超过即跳过研判，不阻塞盘口快报
 LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 mini 的少量推理 + 3~5 句正文
+# ─── 基本面分析（/analyze 精算前的两阶段预处理）─────────────────────────────
+# 用轻量模型先把 build_fundamentals 的原始数据（近况/交锋/赛程/积分榜）依据
+# 国家队/赛事情境/大小球方法论规则，分析成一份「基本面研判」，再喂给主 SOP 精算。
+# 好处：mini 专注读数据出研判，gpt-5.5 专注盘口精算，职责分离。
+FUND_ANALYZE_MODEL = "gpt-5.4-mini"   # 与走地同款轻量模型
+FUND_ANALYZE_EFFORT = "medium"        # 基本面研判要点判断，比走地 low 略高
+FUND_ANALYZE_TIMEOUT = 90             # 秒，比走地 30 长（研判内容多），比主精算 300 短
+FUND_ANALYZE_MAX_TOKENS = 4000        # 研判输出上限（走地 1200 太小，主精算 32000 太大）
+# 基本面分析专用规则（只加载基本面相关方法论，不加载全套 SOP，减负提速）
+FUND_ANALYZE_RULE_FILES = [
+    "rules/方法论/reference_national_team.md",
+    "rules/方法论/reference_competition_context.md",
+    "rules/方法论/reference_over_under.md",
+]
 # 全量规则文件（相对项目根），按顺序拼接成 system prompt
 ANALYZE_RULE_FILES = [
     "CLAUDE.md",
     "rules/方法论/reference_asian_handicap.md",
     "rules/方法论/reference_dynamic_analysis.md",
+    "rules/方法论/reference_over_under.md",
+    "rules/方法论/reference_national_team.md",
+    "rules/方法论/reference_competition_context.md",
     "rules/风控验证/reference_kelly_index.md",
     "rules/实战教训/reference_case_lessons.md",
     "rules/实战教训/reference_cases.md",

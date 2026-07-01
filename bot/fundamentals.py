@@ -19,6 +19,76 @@ from . import config, api_client
 log = logging.getLogger("odds_bot.fundamentals")
 
 
+# 国家队赛事：基本面须切到 reference_national_team.md 口径（先分赛制/近况分层/实力锚等）。
+# 已知 league_id：1=世界杯、5=欧国联；洲际杯/世预赛/友谊赛按名称关键词兜底
+# （EXTRA 池未来可能纳入，且世预赛/友谊赛无固定 league_id）。
+_NATIONAL_LEAGUE_IDS = {1, 5}
+_NATIONAL_NAME_KEYWORDS = (
+    "world cup", "世界杯", "nations league", "欧国联",
+    "euro", "欧洲杯", "copa america", "美洲杯",
+    "asian cup", "亚洲杯", "africa cup", "非洲杯", "afcon", "gold cup",
+    "qualification", "qualifier", "预选赛", "世预赛",
+    "friendl", "友谊赛", "international",
+)
+
+
+def _is_national_team_event(league_id: int | None, league_name: str) -> bool:
+    """判断是否国家队赛事（世界杯/洲际杯/欧国联/世预赛/友谊赛）。"""
+    if league_id in _NATIONAL_LEAGUE_IDS:
+        return True
+    name = (league_name or "").lower()
+    return any(kw in name for kw in _NATIONAL_NAME_KEYWORDS)
+
+
+# 国家队赛事：基本面须切到 reference_national_team.md 口径（先分赛制/近况分层/实力锚等）。
+# 已知 league_id：1=世界杯、5=欧国联；洲际杯/世预赛/友谊赛按名称关键词兜底
+# （EXTRA 池未来可能纳入，且世预赛/友谊赛无固定 league_id）。
+_NATIONAL_LEAGUE_IDS = {1, 5}
+_NATIONAL_NAME_KEYWORDS = (
+    "world cup", "世界杯", "nations league", "欧国联",
+    "euro", "欧洲杯", "copa america", "美洲杯",
+    "asian cup", "亚洲杯", "africa cup", "非洲杯", "afcon", "gold cup",
+    "qualification", "qualifier", "预选赛", "世预赛",
+    "friendl", "友谊赛", "international",
+)
+
+
+def _is_national_team_event(league_id: int | None, league_name: str) -> bool:
+    """判断是否国家队赛事（世界杯/洲际杯/欧国联/世预赛/友谊赛）。"""
+    if league_id in _NATIONAL_LEAGUE_IDS:
+        return True
+    name = (league_name or "").lower()
+    return any(kw in name for kw in _NATIONAL_NAME_KEYWORDS)
+
+
+_NATIONAL_TEAM_HINT = (
+    "⚠️ 本场为【国家队赛事】：基本面须切到 reference_national_team.md 口径，"
+    "覆盖 CLAUDE.md 步骤 1 第 5~7 条的联赛读法——\n"
+    "  ① 先分赛制：赛会制决赛圈=中立场（除东道主），禁用主场加成、废除主客场分拆；"
+    "主客场制（世预赛/欧国联）=有地利但弱于俱乐部主场；友谊赛=地利近乎无意义。不可一刀切中立场；\n"
+    "  ② 近 N 场按赛事性质分层：正式大赛/世预赛关键战=高权重，世预赛虐菜=进球注水，"
+    "友谊赛=近乎无参考（连胜≠状态好），禁止等权数胜负；\n"
+    "  ③ 无终指：改用 FIFA 排名/洲际强弱/世预赛含金量锚实力，盘口与实力锚一致才可提置信度；\n"
+    "  ④ 赛程改判集训磨合/休息天数/加时消耗/核心停赛/旅行气候，废除双线/分心/轮换；\n"
+    "  ⑤ 小组赛须算末轮出线数学（已出线留力/默契球→利小球+冷平；生死战→强攻或崩盘）；\n"
+    "  ⑥ 强弱深盘+高平赔时，冷平/受让方直接取胜须保留独立高权重，不得因实力悬殊归零；\n"
+    "  ⑦ H2H 跨届换代/友谊赛≠大赛，仅作极弱背景参考，本届状态+实力锚权重 ≫ 历史交锋。"
+)
+
+# 赛事情境提示（所有赛事通用，注入后引导 LLM 先判阶段/赛制/赛程情境再进 SOP）。
+_CONTEXT_HINT = (
+    "ℹ️ 研判前先判【赛事情境】（依据下方实拉数据，见 reference_competition_context.md）——\n"
+    "  · 赛事阶段：读积分榜结构（多张小表+最佳第三名=杯赛小组赛；无积分榜+杯赛=淘汰赛；"
+    "单张长表=常规联赛），淘汰赛再分单场决胜 vs 两回合；\n"
+    "  · 赛制：读积分榜已赛场次判单/双循环，样本不足则近况权重>排名；\n"
+    "  · 俱乐部赛程情境：读两队近 10 场最近日期算「上场→本场恢复天数」（≤3 天下调体能，"
+    "两队恢复不对称=爆冷信号）；读未来 5 场赛程判下场对手压力/多线作战/是否留力放弃本场"
+    "（无关键意义+下场紧邻高优先级赛事+多线 ≥2 项→标注留力风险，下调战力、上调对手与小球/冷平权重）。\n"
+    "  · 数据缺失（无积分榜/无赛程日期）则标注「情境无法判定」，不编造。"
+)
+
+
+
 def _fmt_match(m: dict, focus_team_id: int | None = None) -> str:
     """格式化一场比赛：日期 [赛事] 主 X-Y 客（可标注 focus 队胜平负）。"""
     fx = m.get("fixture", {})
@@ -172,6 +242,8 @@ def build_fundamentals(conn, fixture_id: int) -> str:
      home_id, away_id, _commence) = meta
 
     parts = [f"=== 基本面：{home} vs {away}（{league_name}）==="]
+    if _is_national_team_event(league_id, league_name):
+        parts.append(_NATIONAL_TEAM_HINT)
     if not home_id or not away_id:
         parts.append("⚠️ 该比赛缺少球队 ID（旧数据未刷新），基本面暂不可用。"
                      "等任务A刷新后重试。")
@@ -188,5 +260,6 @@ def build_fundamentals(conn, fixture_id: int) -> str:
         log.warning("基本面拉取部分失败: %s", e)
         parts.append(f"（基本面拉取出错：{e}）")
 
+    parts.append(_CONTEXT_HINT)
     parts.append("⚠️ 缺失的数据不要编造，请按以上战绩/比分/排名/交锋综合判断。")
     return "\n".join(parts)

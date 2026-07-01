@@ -39,6 +39,7 @@ LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
 _rules_cache: str | None = None
 _live_rules_cache: str | None = None
+_fund_rules_cache: str | None = None
 
 
 def load_rules() -> str:
@@ -73,6 +74,24 @@ def load_live_rules() -> str:
     _live_rules_cache = "".join(parts)
     log.info("走地规则已加载，共 %d 字符", len(_live_rules_cache))
     return _live_rules_cache
+
+
+def load_fund_rules() -> str:
+    """读取基本面分析专用规则（国家队/赛事情境/大小球），独立缓存。
+    仅供两阶段基本面预处理用，不含全套 SOP 精算规则。"""
+    global _fund_rules_cache
+    if _fund_rules_cache is not None:
+        return _fund_rules_cache
+    parts = []
+    for rel in config.FUND_ANALYZE_RULE_FILES:
+        try:
+            with open(rel, encoding="utf-8") as f:
+                parts.append(f"\n\n===== {rel} =====\n{f.read()}")
+        except FileNotFoundError:
+            log.warning("基本面规则文件缺失，跳过: %s", rel)
+    _fund_rules_cache = "".join(parts)
+    log.info("基本面规则已加载，共 %d 字符", len(_fund_rules_cache))
+    return _fund_rules_cache
 
 
 def available() -> bool:
@@ -287,6 +306,54 @@ def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
                      max_tokens=config.LLM_LIVE_MAX_TOKENS)
 
 
+# _call_llm 失败时返回的错误串前缀（见 _call_llm 各分支），据此判定基本面预处理失败
+_LLM_ERR_PREFIXES = (
+    "LLM 请求失败", "LLM 超时", "LLM 网络错误",
+    "LLM 返回无 choices", "LLM 返回空内容", "LLM_API_KEY",
+)
+
+
+def analyze_fundamentals(raw_funds: str, home: str, away: str,
+                         league: str) -> tuple[str, bool]:
+    """两阶段预处理：用轻量模型把原始基本面数据分析成一份「基本面研判」。
+
+    返回 (文本, ok)：
+      ok=True  → 文本为 mini 产出的研判，供主 SOP 精算用；
+      ok=False → 文本回退为原始 raw_funds（未配置/失败/超时/空），调用方据此标注。
+    失败绝不抛异常、不阻断精算（沿用 _call_llm 的错误串返回约定）。
+    """
+    if not available():
+        return raw_funds, False
+    system = (
+        load_fund_rules()
+        + "\n\n===== 任务（基本面分析） =====\n"
+        "你是足球赛事基本面分析师。下面是某场比赛的原始基本面数据"
+        "（两队近 10 场、历史交锋、未来 5 场赛程、积分榜，来自 API-Football）。"
+        "请严格依据上述方法论规则，把原始数据分析成一份结构化【基本面研判】，"
+        "供操盘手后续盘口精算参考：\n"
+        "1. 先判赛事情境：赛事阶段（小组赛/淘汰赛/联赛轮次）、赛制（单/双循环）、"
+        "俱乐部赛程情境（恢复天数/下场对手/多线/留力）；国家队赛事则先分赛制"
+        "（赛会制中立场 vs 主客场制有地利）。\n"
+        "2. 再逐项研判：近况按赛事性质分层加权、实力锚（无终指时用排名/洲际强弱）、"
+        "H2H 权重、出线形势与战意、两队攻防与大小球倾向。\n"
+        "3. 产出研判结论（不是复述数据），指出对盘口的参考意义与风险点。\n"
+        "数据缺失的部分明确标注「无数据」，不要编造。控制在合理篇幅内。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
+        f"### 原始基本面数据\n{raw_funds}\n"
+    )
+    out = _call_llm(system, user,
+                    effort=config.FUND_ANALYZE_EFFORT,
+                    model=config.FUND_ANALYZE_MODEL,
+                    timeout=config.FUND_ANALYZE_TIMEOUT,
+                    max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
+    if not out or out.startswith(_LLM_ERR_PREFIXES):
+        log.warning("基本面预处理失败，回退原始数据: %s", out[:120])
+        return raw_funds, False
+    return out, True
+
+
 def seo_summarize(free_body: str, home: str, away: str, league: str,
                   is_review: bool = False) -> tuple[dict | None, str | None]:
     """据报告【免费正文】生成 SEO 三件套，返回 (结果 dict 或 None, 错误说明 或 None)。
@@ -404,13 +471,25 @@ def review_blind_stream(csv_text: str, home: str, away: str, league: str,
 
 
 def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
-                    home: str, away: str, league: str) -> tuple[str, str]:
+                    home: str, away: str, league: str,
+                    fund_brief: str = "") -> tuple[str, str]:
     """构造复盘第二遍【对照】的 (system, user)。
 
     关键：第一遍已在不知道比分的情况下正向推出预判（forecast_text）。
     本遍才揭晓真实比分，让模型对照「盲推预判 vs 实际结果」做归因，
     而非拿结果倒推 SOP。
+
+    fund_brief：基本面研判（两阶段预处理产物）。非空时本遍结合基本面做归因，
+    解释盲推（纯盘口、无基本面）对/错背后是否有基本面成因；空则退回纯盘口复盘。
     """
+    has_fund = bool(fund_brief.strip())
+    fund_clause = (
+        "本遍额外提供【基本面研判】（盲推时模型看不到，故基本面正是盲推的盲区）。"
+        "请结合基本面研判解释盲推对/错的成因——盘口对了是否与基本面一致、"
+        "盘口错了是否基本面早有预警。缺失数据不要编造。"
+        if has_fund else
+        "只依据盘口走势 + 预判 + 实际结果，不使用基本面，缺失数据不要编造。"
+    )
     system = (
         load_rules()
         + "\n\n===== 任务（赛后对照复盘）=====\n"
@@ -419,8 +498,7 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         "SOP 得出了赛前预判（见下方『第一遍盲推预判』）。现在揭晓真实比分，请你"
         "对照【盲推预判】与【实际结果】做归因复盘。\n"
         "要求：以第一遍的正向预判为基准做检验，不要重新拿结果倒推 SOP；"
-        "客观指出盲推哪里对、哪里错、为何错。只依据盘口走势 + 预判 + 实际结果，"
-        "不使用基本面，缺失数据不要编造。\n\n"
+        "客观指出盲推哪里对、哪里错、为何错。" + fund_clause + "\n\n"
         "严格按以下结构输出对照复盘报告：\n"
         "## 复盘：[主队] [比分] [客队]\n"
         "## 赛事：[联赛]  开球：[CST]\n\n"
@@ -436,10 +514,15 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         "### 4. 信号有效性复盘\n"
         "- 正确信号：盲推中哪些变盘/凯利/水位/欧赔信号正确预示了结果\n"
         "- 误导信号：哪些把盲推带偏了（噪音或反向）\n"
-        "- 凯利/返还率事后检验（报警是否兑现）\n\n"
+        + ("- 基本面归因：结合基本面研判，指出盲推的盲区里哪些基本面因素"
+           "（近况/实力锚/赛程情境/出线战意）本可修正或印证盘口信号\n"
+           if has_fund else "")
+        + "- 凯利/返还率事后检验（报警是否兑现）\n\n"
         "### 5. 经验教训\n"
         "- 本场印证/修正了哪条军规或既有教训（引用规则库编号）\n"
-        "- 盲推若判错，根因是什么；可沉淀的防错提醒\n\n"
+        "- 盲推若判错，根因是什么"
+        + ("（区分是纯盘口不可知，还是基本面本可补正的盲区）" if has_fund else "")
+        + "；可沉淀的防错提醒\n\n"
         "### 6. 盘口指示强度评分\n"
         "- 盘口对结果的预示强度：[0~100]（事前仅凭盘口能多大程度预判此结果）\n"
         "- 一句话总结\n"
@@ -448,18 +531,21 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 全程盘口快照（CSV）\n{csv_text}\n\n"
         f"### 第一遍盲推预判（模型当时不知道比分）\n{forecast_text}\n\n"
-        f"### 实际结果（现在才揭晓）\n{result_text}\n"
+        + (f"### 基本面研判（盲推时不可见，供本遍归因）\n{fund_brief}\n\n"
+           if has_fund else "")
+        + f"### 实际结果（现在才揭晓）\n{result_text}\n"
     )
     return system, user
 
 
 def review(csv_text: str, forecast_text: str, result_text: str,
-           home: str, away: str, league: str, effort: str = "") -> str:
-    """复盘第二遍对照（阻塞版）。"""
+           home: str, away: str, league: str, effort: str = "",
+           fund_brief: str = "") -> str:
+    """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
     system, user = _review_prompts(csv_text, forecast_text, result_text,
-                                   home, away, league)
+                                   home, away, league, fund_brief)
     return _call_llm(system, user, effort)
 
 
@@ -476,12 +562,14 @@ _REVIEW_TOTAL_STAGES = 6
 
 
 def review_stream(csv_text: str, forecast_text: str, result_text: str,
-                  home: str, away: str, league: str, effort: str = ""):
+                  home: str, away: str, league: str, effort: str = "",
+                  fund_brief: str = ""):
     """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
       ('error', 错误串)
     forecast_text 为第一遍盲推产出的预判全文。
+    fund_brief 非空则结合基本面研判做归因（盲推的盲区）。
     effort: 推理强度，透传给 _stream_llm。
     """
     import re
@@ -489,7 +577,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。")
         return
     system, user = _review_prompts(csv_text, forecast_text, result_text,
-                                   home, away, league)
+                                   home, away, league, fund_brief)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user, effort):
