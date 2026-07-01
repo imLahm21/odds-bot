@@ -1407,6 +1407,18 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
 
+    # 两阶段：先用轻量模型把原始基本面分析成研判，再喂主 SOP（失败/超时回退原始）。
+    # 仅当基本面确有数据时才预处理；上游拉取已失败则跳过。
+    if funds and not funds.startswith("（基本面"):
+        send(chat_id, "🧠 正在分析基本面（轻量模型预处理）…")
+        fund_brief, ok = analyzer.analyze_fundamentals(
+            funds, meta["home"], meta["away"], meta["league"])
+        if ok:
+            funds = ("（以下为基本面方法论研判：原始数据已由轻量模型按"
+                     "国家队/赛事情境/大小球规则预处理）\n\n" + fund_brief)
+        else:
+            funds = ("⚠️ 基本面预处理失败，已回退原始数据。\n\n" + funds)
+
     # 流式精算 + 原地进度播报
     tag = "✍️自定义" if extra_instruction.strip() else "🎯预设"
     eff_label = config.LLM_EFFORT_LABELS.get(effort, "")
@@ -1548,6 +1560,26 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
         edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
     _send_long(chat_id, _md_to_tg("🔮 第一步·盲推预判\n\n" + forecast))
 
+    # ── 基本面（仅供第二遍对照归因，盲推刻意不看）──
+    # 两阶段：拉原始基本面 → 轻量模型预处理成研判 → 传给对照复盘做归因（失败回退原始/空）。
+    from . import fundamentals
+    fund_brief = ""
+    try:
+        conn = db.get_conn()
+        try:
+            raw_funds = fundamentals.build_fundamentals(conn, fid)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("复盘基本面拉取失败: %s", e)
+        raw_funds = ""
+    if raw_funds and not raw_funds.startswith("（基本面"):
+        send(chat_id, "🧠 正在分析基本面（供对照归因）…")
+        brief, ok = analyzer.analyze_fundamentals(
+            raw_funds, meta["home"], meta["away"], meta["league"])
+        # 成功用研判；失败回退原始数据（仍可供归因，只是未经方法论提炼）
+        fund_brief = brief if ok else raw_funds
+
     # ── 第二遍：揭晓比分，对照归因（6 步）──
     send(chat_id, "🎬 第二步【对照】：揭晓真实比分，对照盲推预判做归因复盘…")
     title = (f"⏳ 第二步·对照复盘 {meta['home']} vs {meta['away']}\n"
@@ -1570,7 +1602,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "") -> None:
     report = None
     for ev in analyzer.review_stream(csv_str, forecast, result_text,
                                      meta["home"], meta["away"], meta["league"],
-                                     effort):
+                                     effort, fund_brief):
         if ev[0] == "stage":
             if msg_id:
                 edit_text(chat_id, msg_id, progress_text(ev[1]))
