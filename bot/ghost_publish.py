@@ -461,13 +461,15 @@ def report_to_post(report_md: str, *, title: str | None = None,
 
     if seo:
         excerpt = seo["excerpt"]
-        meta_description = seo["meta_desc"]
+        # meta description / 社交卡片描述统一复用 excerpt，保证后台三处描述一致
+        # （不再单独用 LLM 的 meta_desc，避免 Excerpt 与 Meta/X/Facebook 描述不一致）
+        meta_description = excerpt
         # 看点拼进标题（仅自动标题；管理员自定义标题时不动）。meta_title = title。
         if not custom_title and vs_cn and seo.get("hook"):
             title = f"{vs_cn}｜{seo['hook']}"
     else:
         excerpt = tpl_excerpt
-        meta_description = tpl_meta_desc
+        meta_description = tpl_excerpt   # 回退时同样让两者一致
 
     meta_title = title   # 规范：Meta title 直接用文章标题
 
