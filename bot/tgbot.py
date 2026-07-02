@@ -602,13 +602,13 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
     future = [f for f in fixtures if not has_kicked(f[1], f[6])]
 
     # 切换按钮：高亮当前视图，点另一个切过去（切视图回到第 0 页）。
-    # 末位🔄刷新：带 r 标记回调，触发对可疑场次的更大范围实时校正（推迟补赛等）。
+    # 🔄刷新居中：带 r 标记回调，触发对可疑场次的更大范围实时校正（推迟补赛等）。
     toggle_row = [
         {"text": ("🔵 未来(可精算)" if view == "future" else "🔵 未来"),
          "callback_data": "fx:future:0"},
+        {"text": "🔄 刷新", "callback_data": f"fx:{view}:{page}:r"},
         {"text": ("✅ 已开赛(可复盘)" if view == "past" else "✅ 已开赛"),
          "callback_data": "fx:past:0"},
-        {"text": "🔄 刷新", "callback_data": f"fx:{view}:{page}:r"},
     ]
 
     if not fixtures:
