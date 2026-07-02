@@ -213,6 +213,17 @@ def upsert_fixtures(conn: sqlite3.Connection, rows: list[dict]) -> int:
     return len(payload)
 
 
+def update_fixture_status(conn: sqlite3.Connection, fixture_id: int,
+                          status: str) -> None:
+    """只更新单场比赛的 status（供 /fixtures 实时校正用）。
+    赛程 upsert(任务A)一天仅两次，两次之间开球并结束的比赛 status 会滞留旧值
+    (如 NS)，导致已结束的比赛错留在「未来可精算」档。这里按 fixture_id 就地改状态。"""
+    conn.execute(
+        "UPDATE fixtures SET status=?, updated_at=? WHERE fixture_id=?",
+        (status, _now_utc_iso(), fixture_id))
+    conn.commit()
+
+
 def insert_odds(conn: sqlite3.Connection, rows: list[dict]) -> int:
     """批量插入盘口快照。重复（唯一索引命中）自动忽略。返回实际新增行数。"""
     if not rows:
