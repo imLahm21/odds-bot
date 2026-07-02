@@ -484,10 +484,66 @@ def _cmd_remove(chat_id: int, args: list[str]) -> None:
     send(chat_id, f"已删除联赛 id={lid}" if ok else f"未找到 id={lid}")
 
 
-def _render_fixtures(view: str = "future", page: int = 0):
+# /fixtures 实时校正状态时，单次最多重查多少场（护栏：防一次点按打爆 API 额度）
+_REFRESH_CAP = 15
+
+
+def _refresh_stale_statuses(fixtures, now, aggressive: bool = False) -> dict:
+    """对「开球时间已过、但库里状态还没到终局」的可疑场次，实时查一次真实状态并写回库。
+    返回 {fixture_id: 最新status}，供本次渲染即时用上（不必等下次任务A）。
+
+    根因：赛程状态由任务A一天两次(2/14点)刷新，两次之间开球并结束的比赛，库里
+    status 滞留旧值(常为 NS)，被昨天的 has_kicked 规则判为「未踢」→ 错留在未来精算档。
+
+    aggressive=False（自动，/fixtures 渲染时用）：只查最省的一小撮——开球已过且状态仍
+      是 NS/TBD/空（“该踢了却还标未开”）。正常比赛状态会随任务A自然变对，无需每次都查。
+    aggressive=True（手动，点🔄刷新时用）：开球已过且状态非终局(FT/AET/PEN)的都重查，
+      连推迟后又补赛、中断后恢复等也一并校正。
+    上限 _REFRESH_CAP 场，避免一次点按打爆额度/拖慢响应。"""
+    from datetime import datetime
+    finished = config.LIVE_STATUS_FINISHED
+    suspects = []
+    for f in fixtures:
+        commence, status = f[1], (f[6] or "").strip()
+        try:
+            passed = datetime.fromisoformat(
+                commence.replace("Z", "+00:00")) <= now
+        except (ValueError, AttributeError):
+            passed = False
+        if not passed:
+            continue
+        if status in finished:
+            continue                       # 已是终局，无需再查
+        if aggressive or status in ("NS", "TBD", ""):
+            suspects.append(f[0])
+    if not suspects:
+        return {}
+    suspects = suspects[:_REFRESH_CAP]
+    fresh = {}
+    conn = db.get_conn()
+    try:
+        for fid in suspects:
+            try:
+                result = api_client.fetch_fixture_result(fid)
+            except Exception:
+                log.exception("刷新 fixture %d 状态失败", fid)
+                continue
+            short = (result or {}).get("fixture", {}).get(
+                "status", {}).get("short", "")
+            if short:
+                db.update_fixture_status(conn, fid, short)
+                fresh[fid] = short
+    finally:
+        conn.close()
+    if fresh:
+        log.info("【/fixtures】实时校正 %d 场状态：%s", len(fresh), fresh)
+    return fresh
+
+
+def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False):
     """生成 /fixtures 的文本 + 内联键盘。view='future' 看未来可精算的比赛，
-    view='past' 看已开赛可复盘的比赛。两个视图都按开球时间升序（最旧在上、
-    最新在下）。比赛数超过 PAGE 时分页，page 为 0 起的页码。返回 (text, keyboard)。"""
+    view='past' 看已开赛可复盘的比赛。已开赛降序、未来升序，超过 PAGE 分页。
+    refresh=True（点🔄刷新）对更大范围的可疑场次实时重查状态。返回 (text, keyboard)。"""
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
     # 过去 3 天 ~ 未来 3 天：过去的可 /review 复盘，未来的可 /analyze 精算
@@ -503,6 +559,15 @@ def _render_fixtures(view: str = "future", page: int = 0):
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
         conn.close()
+
+    # 实时校正滞留状态：把已结束却仍标 NS 的比赛拉回真实状态（详见 _refresh_stale_statuses）。
+    # 自动模式（refresh=False）只查最少的可疑场；手动🔄（refresh=True）查更大范围。
+    fresh = _refresh_stale_statuses(fixtures, now, aggressive=refresh)
+    if fresh:
+        # 用最新状态覆盖本次查询结果的 status 列（元组不可变，重建行）
+        fixtures = [(f if f[0] not in fresh
+                     else (f[0], f[1], f[2], f[3], f[4], f[5], fresh[f[0]]))
+                    for f in fixtures]
 
     tz_cst = timezone(timedelta(hours=8))
 
@@ -536,12 +601,14 @@ def _render_fixtures(view: str = "future", page: int = 0):
     past = [f for f in fixtures if has_kicked(f[1], f[6])]
     future = [f for f in fixtures if not has_kicked(f[1], f[6])]
 
-    # 切换按钮：高亮当前视图，点另一个切过去（切视图回到第 0 页）
+    # 切换按钮：高亮当前视图，点另一个切过去（切视图回到第 0 页）。
+    # 末位🔄刷新：带 r 标记回调，触发对可疑场次的更大范围实时校正（推迟补赛等）。
     toggle_row = [
         {"text": ("🔵 未来(可精算)" if view == "future" else "🔵 未来"),
          "callback_data": "fx:future:0"},
         {"text": ("✅ 已开赛(可复盘)" if view == "past" else "✅ 已开赛"),
          "callback_data": "fx:past:0"},
+        {"text": "🔄 刷新", "callback_data": f"fx:{view}:{page}:r"},
     ]
 
     if not fixtures:
@@ -2023,12 +2090,16 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
-    # /fixtures 过去/未来切换 + 翻页按钮（访客可点）。格式 fx:<view>[:<page>]
+    # /fixtures 过去/未来切换 + 翻页 + 刷新（访客可点）。格式 fx:<view>[:<page>[:r]]
+    # 末段为 r → 手动刷新：对可疑场次做更大范围的实时状态校正后重绘。
     if data.startswith("fx:"):
         parts = data.split(":")
         view = parts[1] if len(parts) > 1 and parts[1] in ("past", "future") else "future"
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        text, kb = _render_fixtures(view, page)
+        refresh = len(parts) > 3 and parts[3] == "r"
+        if refresh:
+            answer_callback(cb_id, "正在刷新比赛状态…")
+        text, kb = _render_fixtures(view, page, refresh=refresh)
         answer_callback(cb_id)
         edit_text(chat_id, message_id, text, kb)
         return
