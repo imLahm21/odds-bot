@@ -90,6 +90,15 @@ _PAYWALL_RE = re.compile(r"^\#{3}\s*7\s*[\.、]?\s*最终精算结论", re.MULTI
 # 归档路径行：CLAUDE.md 步骤8 让 LLM 在报告末尾输出的 "> 归档路径：report/..."，
 # 仅供后台落盘用，不应进入发布正文。整行剥除（含可选的引用前缀/空白）。
 _ARCHIVE_LINE_RE = re.compile(r"(?m)^\s*>?\s*归档路径[：:].*$\n?")
+# 复盘归档分隔：/review 两步全跑存成「# 第一步·盲推预判 … --- # 第二步·对照复盘 …」。
+# 盲推是不看比分、无基本面的中间过程（会写出没有依据的"基本面"段），不该进公开文章；
+# 发布时只取第二步对照。匹配「第二步·对照复盘」标题，取其后全部为发布正文。
+_REVIEW_STEP2_RE = re.compile(r"(?m)^#{1,3}\s*第二步[·\s]*对照复盘\s*$")
+# 复盘第二步付费墙锚点：第 3 节「盲推预判 vs 实际对照」起付费
+# （免费展示 1.实际结果 + 2.盘口结算回放做引流）。允许 3 后接 . 、顿号或空格。
+_REVIEW_PAYWALL_RE = re.compile(r"(?m)^#{3}\s*3\s*[\.、]?\s*盲推预判")
+# 复盘第二步开头的「## 复盘：…」行（对应精算的「## 比赛：…」），发布正文里去重用。
+_REVIEW_HEAD_RE = re.compile(r"(?m)^#{2}\s*复盘[：:].*$")
 
 
 class GhostError(Exception):
@@ -351,8 +360,18 @@ def report_to_post(report_md: str, *, title: str | None = None,
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
     text = _ARCHIVE_LINE_RE.sub("", text)   # 剥掉「> 归档路径：…」行，不进发布正文
 
+    # 队名/赛事等元信息始终从完整原文提取（复盘的「## 比赛/赛事」在第一步盲推开头）。
+    meta_src = text
+    # 复盘：只发布「第二步·对照复盘」，丢弃第一步盲推（无基本面的中间过程，
+    # 其正文会写出没有依据的"基本面"段，不该进公开文章）。/review 命令本身两步照跑，
+    # 只是发布环节剔除盲推。找不到分隔标题（如只跑了对照/旧格式）时回退用全文。
+    if is_review:
+        sm = _REVIEW_STEP2_RE.search(text)
+        if sm:
+            text = text[sm.end():].lstrip("\n")
+
     # 队名匹配（home/away 保留英文原名，供 slug 用；标题另取中文/规范英文）
-    m = _MATCH_RE.search(text)
+    m = _MATCH_RE.search(meta_src)
     home = _clean_team(m.group(1)) if m else ""
     away = _clean_team(m.group(2)) if m else ""
 
@@ -378,22 +397,27 @@ def report_to_post(report_md: str, *, title: str | None = None,
             suffix_en = "review" if is_review else "prediction"
             slug = f"{home_slug}-vs-{away_slug}-{suffix_en}"
 
-    # 摘要：取「## 赛事：…」一行
-    em = _EVENT_RE.search(text)
+    # 摘要：取「## 赛事：…」一行。始终从 meta_src 取——盲推开头有标准的
+    # 「## 赛事：… 开球时间：…」，比第二步对照的「开球：」格式更规整（利于后续联赛名提取）。
+    em = _EVENT_RE.search(meta_src)
     excerpt = em.group(1).strip() if em else ""
 
-    # 去掉开头「## 比赛：…」「## 赛事：…」两行元信息（标题/摘要已含，正文重复且丑）
+    # 去掉开头元信息行（标题/摘要已含，正文重复且丑）：
+    # 精算是「## 比赛：…」，复盘第二步是「## 复盘：…」，两者的「## 赛事：…」都去掉。
     text = _MATCH_RE.sub("", text, count=1)
+    text = _REVIEW_HEAD_RE.sub("", text, count=1)
     text = _EVENT_RE.sub("", text, count=1)
     text = text.lstrip("\n")
 
-    # 付费墙切分
-    pm = _PAYWALL_RE.search(text)
+    # 付费墙切分：精算切在第7节「最终精算结论」，复盘第二步切在第3节「盲推预判 vs 实际对照」
+    # （免费展示实际结果+盘口结算回放引流）。
+    paywall_re = _REVIEW_PAYWALL_RE if is_review else _PAYWALL_RE
+    pm = paywall_re.search(text)
     if pm:
         free_md = text[:pm.start()].rstrip()
         paid_md = text[pm.start():].strip()
     else:
-        # 找不到第 7 节锚点 → 整篇付费（安全兜底）
+        # 找不到付费锚点 → 整篇付费（安全兜底）
         free_md, paid_md = "", text.strip()
 
     # 联赛名：从赛事行提取纯中文（去英文/轮次/开球时间），供科普段/SEO 用。
@@ -488,13 +512,49 @@ def _admin_url(path: str) -> str:
     return f"{GHOST_ADMIN_API_URL}/ghost/api/admin/{path}"
 
 
-def create_post(title: str, html: str, *, status: str = "published",
-                visibility: str = "paid",
-                custom_excerpt: str | None = None,
-                slug: str | None = None,
-                meta_title: str | None = None,
-                meta_description: str | None = None) -> dict:
-    """创建文章，返回 Ghost 的 post 对象（含前台 url / id）。失败抛 GhostError。"""
+def _admin_headers() -> dict:
+    """Admin API 通用请求头（JWT 鉴权 + 版本；直连内网时补 Host/协议头）。"""
+    headers = {
+        "Authorization": f"Ghost {_make_token()}",
+        "Content-Type": "application/json",
+        "Accept-Version": GHOST_API_VERSION,
+    }
+    # 直连内网/环回地址时，用真实域名覆盖 Host，避免 Ghost 301 跳回公网域名；
+    # 并带 X-Forwarded-Proto=https 让 Ghost 视作 https 请求、不再跳转（详见 create_post 注释）。
+    if GHOST_ADMIN_HOST_HEADER:
+        headers["Host"] = GHOST_ADMIN_HOST_HEADER
+        headers["X-Forwarded-Proto"] = "https"
+    return headers
+
+
+def _find_post_by_slug(slug: str) -> dict | None:
+    """按 slug 查已存在文章，返回 post 对象（含 id/updated_at）或 None。
+    查询失败（网络/权限等）一律返回 None，让调用方回退到「新建」，不阻断发布。"""
+    if not slug:
+        return None
+    try:
+        r = requests.get(_admin_url(f"posts/slug/{slug}/"),
+                         headers=_admin_headers(), timeout=30,
+                         allow_redirects=False)
+        if r.status_code == 200:
+            data = r.json()
+            posts = data.get("posts") or []
+            return posts[0] if posts else None
+        # 404 = 该 slug 不存在（正常，首次发布）；其它状态记日志后当作不存在
+        if r.status_code != 404:
+            log.warning("查 slug=%s 返回 HTTP %s，按不存在处理", slug, r.status_code)
+    except requests.exceptions.RequestException as e:
+        log.warning("查 slug=%s 失败（按不存在处理）：%s", slug, e)
+    except ValueError:
+        log.warning("查 slug=%s 响应非 JSON（按不存在处理）", slug)
+    return None
+
+
+def _build_post_payload(title: str, html: str, *, status: str, visibility: str,
+                        custom_excerpt: str | None, slug: str | None,
+                        meta_title: str | None,
+                        meta_description: str | None) -> dict:
+    """组装 Ghost post 字段（create/update 共用）。"""
     post: dict = {
         "title": title,
         "html": html,
@@ -505,7 +565,6 @@ def create_post(title: str, html: str, *, status: str = "published",
         post["custom_excerpt"] = custom_excerpt[:300]
     if slug:
         post["slug"] = slug
-
     # ── SEO 元数据（搜索结果实际显示 ~60 字符标题 / ~155 字符描述）──
     # 后台可逐篇手动覆盖；此处仅写入 /publish 默认值。
     if meta_title:
@@ -517,50 +576,73 @@ def create_post(title: str, html: str, *, status: str = "published",
         post["og_description"] = meta_description[:500]
         post["twitter_title"] = (meta_title or title)[:300]
         post["twitter_description"] = meta_description[:500]
+    return post
 
-    body = {"posts": [post]}
-    headers = {
-        "Authorization": f"Ghost {_make_token()}",
-        "Content-Type": "application/json",
-        "Accept-Version": GHOST_API_VERSION,
-    }
-    # 直连内网/环回地址时，用真实域名覆盖 Host，避免 Ghost 301 跳回公网域名；
-    # 同时带 X-Forwarded-Proto=https：Ghost 的 url 配成 https，会把 http 请求 301
-    # 跳到 https（又绕回公网 CF）。Ghost 在代理后靠此头判定原始请求是否安全，
-    # 带上它 Ghost 即视作 https 请求、不再跳转。
-    if GHOST_ADMIN_HOST_HEADER:
-        headers["Host"] = GHOST_ADMIN_HOST_HEADER
-        headers["X-Forwarded-Proto"] = "https"
-    try:
-        r = requests.post(_admin_url("posts/"), params={"source": "html"},
-                          json=body, headers=headers, timeout=60,
-                          allow_redirects=False)
-    except requests.exceptions.RequestException as e:
-        log.warning("Ghost 请求异常: %s", e)
-        raise GhostError(f"网络错误：{e}") from e
 
+def _post_response(r: "requests.Response", action: str) -> dict:
+    """统一解析 Ghost 发文/改文响应：处理重定向/错误，返回 post 对象。"""
     data = {}
     try:
         data = r.json()
     except ValueError:
         pass
-
     # 直连内网时若仍被 3xx 跳转（Host 未生效等），明确报错而非静默跟随回公网 CF
     if 300 <= r.status_code < 400:
         loc = r.headers.get("Location", "")
         raise GhostError(
             f"Ghost 返回重定向 HTTP {r.status_code} → {loc}；"
             "多为直连时 Host 头与站点 url 不符，请检查 GHOST_ADMIN_HOST_HEADER")
-
     if r.status_code >= 400 or "errors" in data:
         msg = _extract_error(data) or f"HTTP {r.status_code}"
-        log.warning("Ghost 发文失败: %s", msg)
+        log.warning("Ghost %s失败: %s", action, msg)
         raise GhostError(msg)
-
     try:
         return data["posts"][0]
     except (KeyError, IndexError) as e:
         raise GhostError(f"响应格式异常：{data}") from e
+
+
+def create_post(title: str, html: str, *, status: str = "published",
+                visibility: str = "paid",
+                custom_excerpt: str | None = None,
+                slug: str | None = None,
+                meta_title: str | None = None,
+                meta_description: str | None = None) -> dict:
+    """发布文章：slug 已存在则【更新】原文（避免 Ghost 生成 -2/-3 后缀），
+    否则新建。返回 Ghost 的 post 对象（含前台 url / id）。失败抛 GhostError。"""
+    post = _build_post_payload(
+        title, html, status=status, visibility=visibility,
+        custom_excerpt=custom_excerpt, slug=slug,
+        meta_title=meta_title, meta_description=meta_description)
+
+    # 先查同 slug 是否已存在：存在则走更新，避免重复发布产生 xxx-2 这种脏 URL。
+    existing = _find_post_by_slug(slug) if slug else None
+    if existing and existing.get("id"):
+        # Ghost 更新用乐观锁：必须回传原文的 updated_at，否则报 "Saving failed..."。
+        # 复用原文 updated_at；slug 保持不变（就更新这篇），避免又生成新 slug。
+        post["updated_at"] = existing.get("updated_at")
+        post.pop("slug", None)
+        body = {"posts": [post]}
+        try:
+            r = requests.put(_admin_url(f"posts/{existing['id']}/"),
+                             params={"source": "html"}, json=body,
+                             headers=_admin_headers(), timeout=60,
+                             allow_redirects=False)
+        except requests.exceptions.RequestException as e:
+            log.warning("Ghost 更新请求异常: %s", e)
+            raise GhostError(f"网络错误：{e}") from e
+        return _post_response(r, "更新")
+
+    # 不存在 → 新建
+    body = {"posts": [post]}
+    try:
+        r = requests.post(_admin_url("posts/"), params={"source": "html"},
+                          json=body, headers=_admin_headers(), timeout=60,
+                          allow_redirects=False)
+    except requests.exceptions.RequestException as e:
+        log.warning("Ghost 请求异常: %s", e)
+        raise GhostError(f"网络错误：{e}") from e
+    return _post_response(r, "发文")
 
 
 def _extract_error(data: dict) -> str:
