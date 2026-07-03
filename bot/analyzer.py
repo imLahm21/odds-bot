@@ -223,6 +223,51 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
     return out, True
 
 
+def distill_lesson(review_report: str, home: str, away: str,
+                   league: str) -> tuple[str, bool]:
+    """把一份【对照复盘报告】蒸馏成一张「实战教训卡」，对齐 rules/实战教训/case_*.md
+    的结构，供归入教训规则库。返回 (markdown文本, ok)。
+
+    只喂已成文的复盘报告（不重拉数据）。失败/未配置/空 → (错误说明或提示, False)，
+    调用方据此不落盘。用轻量模型 + 中等超时（这是复盘后的可选增值，不该拖慢）。
+    """
+    if not available():
+        return "未配置 LLM_BASE_URL / LLM_API_KEY", False
+    if not review_report.strip():
+        return "复盘报告为空", False
+    system = (
+        "你是足球赔率复盘教练。用户给你一份【赛后对照复盘报告】，请把其中可复用的"
+        "操盘教训提炼成一张精炼的「实战教训卡」（Markdown），供沉淀进教训规则库。"
+        "严格按以下结构输出，不要多余前后缀、不要代码块围栏：\n\n"
+        "# 案例（数据存档）：[主队] [比分] [客队]（[日期] [联赛][轮次如有]）\n\n"
+        "## 结果\n"
+        "- **预测**：[盲推的亚盘/胜平负/比分/置信度，命中或偏差]\n"
+        "- **实际**：[真实比分与结算]\n"
+        "- **正确结论**：[事后看应得的判断]\n\n"
+        "## 关键信号\n"
+        "[3~6 条最能解释对/错的盘口/凯利/水位/欧赔/基本面信号，用短句或小表格]\n\n"
+        "## 教训与规则\n"
+        "[本场印证或修正了哪条军规/既有教训（引用编号如有）；根因是什么；"
+        "可沉淀的防错提醒。若复盘判断正确，则记录被验证有效的信号组合]\n\n"
+        "硬规则：① 只依据给定复盘报告，不编造数据、不新增未提及的结论；"
+        "② 中文；③ 简洁——整张卡控制在 400 字内，突出可复用规律而非复述全文；"
+        "④ 若报告显示预测正确，如实写成「正确案例」，不要硬凑错误。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}（{league}）\n\n"
+        f"### 对照复盘报告\n{review_report}\n"
+    )
+    out = _call_llm(system, user,
+                    effort=config.FUND_ANALYZE_EFFORT,
+                    model=config.FUND_ANALYZE_MODEL,
+                    timeout=config.FUND_ANALYZE_TIMEOUT,
+                    max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
+    if not out or out.startswith(_LLM_ERR_PREFIXES):
+        log.warning("实战教训蒸馏失败: %s", (out or "")[:120])
+        return (out or "LLM 无返回"), False
+    return out.strip(), True
+
+
 def fan_fundamentals_brief(free_md: str, home: str, away: str,
                            league: str) -> str:
     """发布期：把报告免费正文里的球队近况/交锋/赛程改写成一段面向普通球迷的

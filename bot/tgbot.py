@@ -122,6 +122,12 @@ _publish_pending: dict[str, dict] = {}
 _pending_pub_title: dict[int, str] = {}
 _publish_lock = threading.Lock()
 
+# ─── /review 复盘后「可选归档为实战教训」的会话状态（仅管理员）──────────────────
+# 待归档态：token -> {"report", "meta"}。复盘完成后生成短 token，避免整篇报告塞进
+# callback_data。点「📚 归档为实战教训」(ls:<token>:go) 后据 token 取回蒸馏落盘。
+_lesson_pending: dict[str, dict] = {}
+_lesson_lock = threading.Lock()
+
 # 访客每日 /analyze 计数：持久化在 odds.db 的 analyze_usage 表（重启不清零，
 # 跨北京日期自然分行）。管理员不计数、不受限。
 def _today_cst() -> str:
@@ -1243,6 +1249,57 @@ def _load_blind_forecast(meta: dict, chat_id: int | None = None) -> str | None:
     return None
 
 
+# ─── 复盘 → 实战教训归档 ─────────────────────────────────────────────────────
+_LESSONS_DIR = os.path.join("rules", "实战教训")
+
+
+def _next_case_path(meta: dict) -> str:
+    """为一张新的实战教训卡拼路径：rules/实战教训/<日期YYYYMMDD>_case_<编号>_<主>_vs_<客>.md
+    编号取目录里现有 case_NN 的最大值 +1（两位补零），与既有命名一致。"""
+    import os
+    import re
+    date = (meta.get("kick_cst") or "")[:10].replace("-", "") or "00000000"
+    teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
+    # 文件名安全化：去掉路径分隔与非常见字符（联赛队名可能含 / 等）
+    teams = re.sub(r"[\\/:*?\"<>|]", "", teams)
+    mx = 0
+    try:
+        for name in os.listdir(_LESSONS_DIR):
+            m = re.search(r"_case_(\d+)_", name)
+            if m:
+                mx = max(mx, int(m.group(1)))
+    except OSError:
+        pass
+    return os.path.join(_LESSONS_DIR, f"{date}_case_{mx + 1:02d}_{teams}.md")
+
+
+def _archive_lesson(chat_id: int, message_id: int, token: str) -> None:
+    """把缓存的复盘报告蒸馏成实战教训卡并写入 rules/实战教训/。消费后清缓存。"""
+    import os
+    with _lesson_lock:
+        info = _lesson_pending.pop(token, None)
+    if not info:
+        edit_text(chat_id, message_id, "⏳ 会话已过期，复盘教训未归档。")
+        return
+    meta, report = info["meta"], info["report"]
+    edit_text(chat_id, message_id, "🧠 正在提炼实战教训…")
+    card, ok = analyzer.distill_lesson(report, meta["home"], meta["away"],
+                                       meta["league"])
+    if not ok:
+        edit_text(chat_id, message_id, f"❌ 教训提炼失败：{card[:200]}")
+        return
+    try:
+        path = _next_case_path(meta)
+        os.makedirs(_LESSONS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(card)
+    except OSError as e:
+        edit_text(chat_id, message_id, f"❌ 教训写入失败：{e}")
+        return
+    _send_long(chat_id, "📚 实战教训卡：\n\n" + card)
+    edit_text(chat_id, message_id, f"✅ 已归档实战教训：{path}")
+
+
 def _publish_date_keyboard() -> dict | None:
     """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数）。
     无任何报告时返回 None。回调 pd:<date>。"""
@@ -1787,6 +1844,20 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     if path:
         send(chat_id, f"📁 复盘已归档：{path}")
 
+    # 复盘后可选：把教训沉淀进规则库（仅管理员；不自动跑，用户点按钮才归档）。
+    # 教训库是核心规则资产，故不开放给访客。用 token 缓存整篇报告避免塞进 callback_data。
+    if _is_admin(chat_id):
+        token = uuid.uuid4().hex[:12]
+        with _lesson_lock:
+            _lesson_pending[token] = {"report": report, "meta": meta}
+        send(chat_id,
+             "是否把本场复盘沉淀为一条【实战教训】归入规则库？\n"
+             "（LLM 会把复盘提炼成教训卡，写入 rules/实战教训/，供日后精算防错参考）",
+             {"inline_keyboard": [[
+                 {"text": "📚 归档为实战教训", "callback_data": f"ls:{token}:go"},
+                 {"text": "跳过", "callback_data": f"ls:{token}:no"},
+             ]]})
+
 
 # ─── /llm 管理面板（端点池 + 熔断状态 + 可调参数；仅管理员）──────────────────
 _BREAKER_ZH = {"CLOSED": "✅正常", "OPEN": "🔴熔断", "HALF_OPEN": "🟡半开"}
@@ -2204,6 +2275,26 @@ def handle_callback(cb: dict) -> None:
             _cmd_review(chat_id, [fid_str])
         else:
             _cmd_analyze(chat_id, [fid_str])
+        return
+
+    # ── 复盘后归档实战教训（ls:<token>:go|no，仅管理员）──
+    if data.startswith("ls:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可归档教训")
+            return
+        try:
+            _, token, action = data.split(":")
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        if action == "no":
+            with _lesson_lock:
+                _lesson_pending.pop(token, None)
+            answer_callback(cb_id, "已跳过")
+            edit_text(chat_id, message_id, "已跳过，未归档实战教训。")
+            return
+        answer_callback(cb_id, "归档中…")
+        _archive_lesson(chat_id, message_id, token)
         return
 
     # ── /publish 发布到博客的回调（pd:/pf:/gt:/gv:，仅管理员）──
