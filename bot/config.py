@@ -282,6 +282,47 @@ LLM_EFFORT_LABELS: dict[str, str] = {
 LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
 # 默认强度：未显式选择时用（如旧入口直接调 analyze 不带 effort 则传空=不附带字段）
 LLM_EFFORT_DEFAULT = "high"
+
+# ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
+# 这里是这 9 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、
+# llm_client 无 DB 值时兜底也读它。修改默认/范围只改这一处。
+#   key   —— 存 db.llm_settings 的主键，也是 TG 回调 ls:<key> 的标识
+#   default/min/max —— 默认值与合法闭区间（TG 改值越界即拒）
+#   label —— TG 面板中文名
+#   help  —— TG 面板补充说明（越界提示也用它）
+# 说明：主 SOP 精算走【流式】，用 stream_first_byte_timeout + stream_idle_timeout；
+# non_stream_timeout 只作用于未显式传超时的阻塞调用（走地/基本面/SEO 各有自己的短超时，
+# 优先级更高、不受此值影响）。故调这些默认值不会回归已调好的走地/基本面时效。
+LLM_SETTING_SPECS: dict[str, dict] = {
+    "max_retries": {
+        "default": 2, "min": 0, "max": 10,
+        "label": "最大重试次数", "help": "单端点请求失败时的重试次数（0-10）"},
+    "failure_threshold": {
+        "default": 3, "min": 3, "max": 10,
+        "label": "失败阈值", "help": "连续失败多少次后打开熔断器（3-10）"},
+    "stream_first_byte_timeout": {
+        "default": 60, "min": 1, "max": 120,
+        "label": "流式首字节超时", "help": "等待首个数据块的最大秒数（1-120，默认60）"},
+    "stream_idle_timeout": {
+        "default": 90, "min": 0, "max": 600,
+        "label": "流式静默超时", "help": "数据块之间最大间隔秒数（60-600，填0禁用）"},
+    "non_stream_timeout": {
+        "default": 180, "min": 60, "max": 1200,
+        "label": "非流式超时", "help": "非流式请求总超时秒数（60-1200，默认180）"},
+    "recovery_success_threshold": {
+        "default": 3, "min": 1, "max": 20,
+        "label": "恢复成功阈值", "help": "半开状态下成功多少次后关闭熔断器"},
+    "recovery_wait_seconds": {
+        "default": 90, "min": 30, "max": 120,
+        "label": "恢复等待时间", "help": "熔断打开后等待多久尝试恢复（30-120秒）"},
+    "error_rate_threshold_pct": {
+        "default": 70, "min": 1, "max": 100,
+        "label": "错误率阈值%", "help": "滚动错误率超此值打开熔断器（1-100）"},
+    "min_requests": {
+        "default": 15, "min": 1, "max": 200,
+        "label": "最小请求数", "help": "计算错误率前的最小请求数"},
+}
+
 # ─── 走地(滚球)实时研判专用 LLM ──────────────────────────────────────────────
 # 走地 live_brief 跑在 1min 一轮的广播循环里、是同步阻塞调用，要的是【秒级】反应。
 # gpt-5.5(推理模型)先烧大量 reasoning token 再出正文，单次可能几十秒~1min+，会拖住

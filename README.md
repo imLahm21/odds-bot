@@ -214,6 +214,11 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 # 可选：启用 /analyze LLM 精算（IKuncode 等 OpenAI 兼容平台）
 LLM_BASE_URL=https://api.ikuncode.cc/v1
 LLM_API_KEY=你的LLM密钥
+# 可选：多端点故障转移。主端点=上面的 LLM_BASE_URL/LLM_API_KEY；这里追加备用，
+# 逗号或换行分隔，每条 key|base_url|标签（base_url 省略则复用主端点 URL）。
+# 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复。
+# 管理员在 TG 发 /llm 可测各端点连通性/延迟，并实时改重试/超时/熔断参数（免重启）。
+LLM_ENDPOINTS=sk-备用1|,sk-备用2|https://api.other.com/v1|备用商
 EOF
 ```
 

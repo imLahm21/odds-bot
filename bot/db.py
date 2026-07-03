@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS analyze_usage (
     PRIMARY KEY (chat_id, day)
 );
 
+-- LLM 故障转移/熔断可调参数：由 TG /llm 面板实时改，llm_client 读取（免重启）。
+-- 只存 9 个数值参数（非 secret）；端点密钥仍在 .env、不落库。key 白名单见
+-- config.LLM_SETTING_SPECS，seed_config 灌默认值。
+CREATE TABLE IF NOT EXISTS llm_settings (
+    key        TEXT PRIMARY KEY,
+    value      REAL NOT NULL,
+    updated_at TEXT
+);
+
 -- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
 -- 避免污染赛前 SOP 的 CSV。只存 main:true 主盘口线(走地只看主盘)。
 CREATE TABLE IF NOT EXISTS live_odds_history (
@@ -176,6 +185,14 @@ def seed_config(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO watched_bookmakers (bookmaker_id, name, enabled) "
         "VALUES (?,?,?)", bm_rows)
+
+    # LLM 熔断/故障转移参数默认值（INSERT OR IGNORE：用户在 /llm 改过的不覆盖）
+    now = _now_utc_iso()
+    llm_rows = [(k, float(spec["default"]), now)
+                for k, spec in config.LLM_SETTING_SPECS.items()]
+    conn.executemany(
+        "INSERT OR IGNORE INTO llm_settings (key, value, updated_at) "
+        "VALUES (?,?,?)", llm_rows)
     conn.commit()
 
 
@@ -297,6 +314,43 @@ def incr_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
         (chat_id, day))
     conn.commit()
     return get_analyze_used(conn, chat_id, day)
+
+
+# ─── LLM 熔断/故障转移参数（TG /llm 面板读写，llm_client 读取）──────────────
+def get_llm_settings(conn: sqlite3.Connection) -> dict[str, float]:
+    """读全部 LLM 参数为 {key: value}。以 config.LLM_SETTING_SPECS 为准补齐缺失键
+    （旧库首次加表、或新增参数时未 seed 到的键，回退该键的默认值），确保调用方
+    永远拿得到 9 个键的完整字典。"""
+    rows = dict(conn.execute("SELECT key, value FROM llm_settings").fetchall())
+    return {k: float(rows.get(k, spec["default"]))
+            for k, spec in config.LLM_SETTING_SPECS.items()}
+
+
+def set_llm_setting(conn: sqlite3.Connection, key: str, value: float) -> bool:
+    """写单个 LLM 参数（UPSERT）。仅接受 LLM_SETTING_SPECS 白名单里的 key，
+    非法 key 返回 False（防伪造回调写入任意键）。范围校验由调用方(tgbot)据
+    spec 的 min/max 负责，这里只做键白名单守卫。"""
+    if key not in config.LLM_SETTING_SPECS:
+        return False
+    conn.execute(
+        "INSERT INTO llm_settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (key, float(value), _now_utc_iso()))
+    conn.commit()
+    return True
+
+
+def reset_llm_settings(conn: sqlite3.Connection) -> None:
+    """把全部 LLM 参数恢复为 config.LLM_SETTING_SPECS 的默认值。"""
+    now = _now_utc_iso()
+    rows = [(k, float(spec["default"]), now)
+            for k, spec in config.LLM_SETTING_SPECS.items()]
+    conn.executemany(
+        "INSERT INTO llm_settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at", rows)
+    conn.commit()
 
 
 # ─── 动态配置读写（供调度器读、TG bot 写）──────────────────────────────────
