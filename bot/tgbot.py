@@ -91,7 +91,8 @@ ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
     | ADMIN_CHAT_IDS
 
 # 仅管理员可用的配置类命令（访客调用会被拒绝）
-_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm"}
+_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm",
+                    "lesson"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
@@ -127,6 +128,9 @@ _publish_lock = threading.Lock()
 # callback_data。点「📚 归档为实战教训」(ls:<token>:go) 后据 token 取回蒸馏落盘。
 _lesson_pending: dict[str, dict] = {}
 _lesson_lock = threading.Lock()
+# /lesson 独立命令的浏览态：chat_id -> {"date", "files"}。选日期(ld:)后置位，
+# lf:<idx> 把短索引映射回复盘报告文件名（避免长文件名塞进 callback_data）。
+_lesson_browse: dict[int, dict] = {}
 
 # 访客每日 /analyze 计数：持久化在 odds.db 的 analyze_usage 表（重启不清零，
 # 跨北京日期自然分行）。管理员不计数、不受限。
@@ -271,6 +275,7 @@ def setup_commands() -> None:
         {"command": "add", "description": "加联赛：/add 关键词 搜了点 或 /add id season"},
         {"command": "remove", "description": "删除关注联赛"},
         {"command": "publish", "description": "把历史归档报告发布到 Ghost 博客（管理员）"},
+        {"command": "lesson", "description": "把历史复盘归档为实战教训（管理员）"},
         {"command": "llm", "description": "LLM 端点测试/故障转移/熔断参数面板（管理员）"},
     ]
     resp = _post("setMyCommands", {"commands": commands})
@@ -387,6 +392,7 @@ _HELP_ADMIN_EXTRA = (
     "/add &lt;关键词&gt; — 搜联赛点按钮加（如 /add 瑞典）；或 /add &lt;id&gt; &lt;season&gt;\n"
     "/remove &lt;id&gt; — 删联赛\n"
     "/publish — 把 report/ 历史归档报告发布到 Ghost 博客（选日期→选报告→标题→可见性）\n"
+    "/lesson — 把 report/ 历史复盘（_review）蒸馏归档为实战教训（选日期→选报告）\n"
     "/llm — LLM 端点连通性测试 + 故障转移/熔断参数面板（测试延迟、改重试/超时/熔断阈值）\n"
 )
 HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
@@ -1300,6 +1306,98 @@ def _archive_lesson(chat_id: int, message_id: int, token: str) -> None:
     edit_text(chat_id, message_id, f"✅ 已归档实战教训：{path}")
 
 
+def _lesson_date_keyboard() -> dict | None:
+    """扫 report/ 下含【复盘报告(_review.md)】的日期目录，构造日期选择键盘。
+    只有对照复盘(_review.md)才有比分归因可提炼教训，纯精算(_report.md)不列。
+    无则返回 None。回调 ld:<date>。"""
+    import os
+    base = "report"
+    if not os.path.isdir(base):
+        return None
+    dates = []
+    for name in os.listdir(base):
+        d = os.path.join(base, name)
+        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
+            n = len([f for f in os.listdir(d) if f.endswith("_review.md")])
+            if n:
+                dates.append((name, n))
+    if not dates:
+        return None
+    dates.sort(reverse=True)
+    rows = [[{"text": f"{date}（{n}）", "callback_data": f"ld:{date}"}]
+            for date, n in dates]
+    return {"inline_keyboard": rows}
+
+
+def _lesson_report_keyboard(chat_id: int, date: str) -> dict | None:
+    """列某日期下所有复盘报告(_review.md)，构造选择键盘。回调 lf:<idx>。
+    文件名列表暂存 _lesson_browse[chat_id]，idx 映射回文件名。"""
+    import os
+    d = os.path.join("report", date)
+    if not os.path.isdir(d):
+        return None
+    files = sorted(f for f in os.listdir(d) if f.endswith("_review.md"))
+    if not files:
+        return None
+    with _lesson_lock:
+        _lesson_browse[chat_id] = {"date": date, "files": files}
+    rows = []
+    for idx, fname in enumerate(files):
+        label = fname[:-len("_review.md")].replace("_", " ") + "（复盘）"
+        rows.append([{"text": label, "callback_data": f"lf:{idx}"}])
+    return {"inline_keyboard": rows}
+
+
+def _cmd_lesson(chat_id: int) -> None:
+    """独立命令：从 report/ 历史复盘报告里选一份，蒸馏归档为实战教训（仅管理员）。
+    补足「错过 /review 后那个按钮」或「给历史复盘补归教训」的入口。"""
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法提炼教训。")
+        return
+    kb = _lesson_date_keyboard()
+    if kb is None:
+        send(chat_id, "report/ 下暂无复盘报告（_review.md）。先用 /review 生成对照复盘。")
+        return
+    send(chat_id, "📚 归档实战教训 —— 选择复盘报告日期：", kb)
+
+
+def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
+    """读一份已归档的复盘报告 → 蒸馏成教训卡 → 写入 rules/实战教训/。供 /lesson 用。"""
+    import os
+    import re
+    try:
+        with open(path, encoding="utf-8") as f:
+            report = f.read()
+    except OSError as e:
+        edit_text(chat_id, message_id, f"❌ 读取复盘报告失败：{e}")
+        return
+    # 从文件名与日期目录反推 meta（队名、开球日期），供教训卡命名/表头
+    fname = os.path.basename(path)
+    stem = fname[:-len("_review.md")] if fname.endswith("_review.md") else fname
+    home, _, away = stem.partition("_vs_")
+    date_dir = os.path.basename(os.path.dirname(path))   # report/<date>/
+    m = re.match(r"\d{4}-\d{2}-\d{2}", date_dir)
+    meta = {"home": home.replace("_", " ") or "主队",
+            "away": away.replace("_", " ") or "客队",
+            "league": "", "kick_cst": date_dir if m else ""}
+    edit_text(chat_id, message_id, "🧠 正在提炼实战教训…")
+    card, ok = analyzer.distill_lesson(report, meta["home"], meta["away"],
+                                       meta["league"])
+    if not ok:
+        edit_text(chat_id, message_id, f"❌ 教训提炼失败：{card[:200]}")
+        return
+    try:
+        out_path = _next_case_path(meta)
+        os.makedirs(_LESSONS_DIR, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(card)
+    except OSError as e:
+        edit_text(chat_id, message_id, f"❌ 教训写入失败：{e}")
+        return
+    _send_long(chat_id, "📚 实战教训卡：\n\n" + card)
+    edit_text(chat_id, message_id, f"✅ 已归档实战教训：{out_path}")
+
+
 def _publish_date_keyboard() -> dict | None:
     """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数）。
     无任何报告时返回 None。回调 pd:<date>。"""
@@ -2141,6 +2239,8 @@ def handle_message(msg: dict) -> None:
         _cmd_review(chat_id, args)
     elif cmd == "publish":
         _cmd_publish(chat_id, args)
+    elif cmd == "lesson":
+        _cmd_lesson(chat_id)
     elif cmd == "llm":
         _cmd_llm(chat_id)
     else:
@@ -2295,6 +2395,39 @@ def handle_callback(cb: dict) -> None:
             return
         answer_callback(cb_id, "归档中…")
         _archive_lesson(chat_id, message_id, token)
+        return
+
+    # ── /lesson 独立命令：选日期(ld:)→选复盘报告(lf:)→蒸馏归档（仅管理员）──
+    if data.startswith("ld:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可归档教训")
+            return
+        date = data[3:]
+        kb = _lesson_report_keyboard(chat_id, date)
+        answer_callback(cb_id)
+        if kb is None:
+            edit_text(chat_id, message_id, f"{date} 下无复盘报告。")
+        else:
+            edit_text(chat_id, message_id, f"📅 {date} —— 选择复盘报告：", kb)
+        return
+    if data.startswith("lf:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可归档教训")
+            return
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        with _lesson_lock:
+            browse = _lesson_browse.get(chat_id)
+        if not browse or idx >= len(browse["files"]):
+            answer_callback(cb_id, "会话已过期，请重新 /lesson")
+            edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /lesson。")
+            return
+        path = os.path.join("report", browse["date"], browse["files"][idx])
+        answer_callback(cb_id, "归档中…")
+        _lesson_archive_from_file(chat_id, message_id, path)
         return
 
     # ── /publish 发布到博客的回调（pd:/pf:/gt:/gv:，仅管理员）──
