@@ -9,31 +9,18 @@ LLM 精算 —— 读全量 SOP 规则 + 调 IKuncode(OpenAI 兼容) chat/comple
 import os
 import logging
 
-import requests
 from dotenv import load_dotenv
 
-from . import config
+from . import config, llm_client
 
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
 
+# 请求头清洗迁至 llm_client.clean_header_value；此处保留别名兼容旧引用。
+_clean_header_value = llm_client.clean_header_value
 
-def _clean_header_value(raw: str) -> str:
-    """清洗将放进 HTTP 头的配置值。
-
-    从聊天/文档复制 key/url 时常混入非 ASCII 不可见字符（全角空格 U+3000、
-    零宽空格 U+200B、BOM 等），会导致 requests 编码请求头时
-    UnicodeEncodeError('latin-1')。这里去掉首尾常见不可见字符 + 所有非 ASCII，
-    并记录告警，避免整条命令崩溃。
-    """
-    s = raw.strip().strip("　​‌‍﻿\xa0")
-    ascii_only = s.encode("ascii", "ignore").decode("ascii")
-    if ascii_only != s:
-        log.warning("配置值含非 ASCII 字符，已剥离 %d 个（请检查 .env 是否复制带入"
-                    "全角符号）", len(s) - len(ascii_only))
-    return ascii_only
-
-
+# 主端点别名：probe_llm.py 直接读 analyzer.LLM_BASE_URL / LLM_API_KEY，保留不破坏。
+# 真正的多端点池/故障转移/熔断在 llm_client；这里只是主端点的只读快照。
 LLM_BASE_URL = _clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
 LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
@@ -95,145 +82,27 @@ def load_fund_rules() -> str:
 
 
 def available() -> bool:
-    return bool(LLM_BASE_URL and LLM_API_KEY)
+    return llm_client.available()
 
 
 def _call_llm(system: str, user: str, effort: str = "",
               model: str = "", timeout: int = 0, max_tokens: int = 0) -> str:
-    """统一的 chat/completions 调用 + 错误处理；失败返回错误说明串。
-    effort 非空时附带 reasoning_effort（low/medium/high/xhigh）；空则不传（旧行为）。
-    model/timeout/max_tokens 非默认值时覆盖 config 默认（走地用轻量模型/短超时）。
+    """薄委托 llm_client.chat（端点池 + 故障转移 + 熔断）。签名与语义不变：
+    effort 非空附带 reasoning_effort；model/timeout/max_tokens 非默认时覆盖 config
+    （走地/基本面/SEO 各传自己的短超时，优先于 DB 的 non_stream_timeout）。
+    失败返回错误说明串（不抛异常），前缀沿用旧格式（见 _LLM_ERR_PREFIXES）。
     """
-    payload = {
-        "model": model or config.LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-    }
-    if effort:
-        payload["reasoning_effort"] = effort
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    try:
-        r = requests.post(f"{LLM_BASE_URL}/chat/completions",
-                          json=payload, headers=headers,
-                          timeout=timeout or config.LLM_TIMEOUT)
-        if r.status_code != 200:
-            log.error("LLM HTTP %s: %s", r.status_code, r.text[:500])
-            return f"LLM 请求失败 HTTP {r.status_code}：{r.text[:300]}"
-        data = r.json()
-        choices = data.get("choices", [])
-        if not choices:
-            return f"LLM 返回无 choices：{str(data)[:300]}"
-        return choices[0].get("message", {}).get("content", "").strip() \
-            or "LLM 返回空内容"
-    except requests.exceptions.Timeout:
-        return f"LLM 超时（>{timeout or config.LLM_TIMEOUT}s）。推理较慢，可稍后重试。"
-    except UnicodeEncodeError as e:
-        log.error("LLM 请求头编码失败（key/url 含非 ASCII 字符）: %s", e)
-        return ("LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时混入了"
-                "全角符号/空格）。请检查服务器 .env 后重启。")
-    except requests.exceptions.RequestException as e:
-        log.error("LLM 网络错误: %s", e)
-        return f"LLM 网络错误：{e}"
+    return llm_client.chat(system, user, effort=effort, model=model,
+                           timeout=timeout, max_tokens=max_tokens)
 
 
 def _stream_llm(system: str, user: str, effort: str = ""):
-    """流式 chat/completions。逐增量 yield ('delta', 累积全文)；
-    正常结束 yield ('done', 全文)，出错 yield ('error', 错误串)。
-    effort 非空时附带 reasoning_effort（low/medium/high/xhigh）；空则不传。
+    """薄委托 llm_client.stream_chat。yield 事件契约不变：
+    ('delta', 累积全文) / ('done', 全文) / ('error', 错误串)。
+    流式超时用 DB 的 stream_first_byte_timeout + stream_idle_timeout；
+    仅在首字节前跨端点故障转移（见 llm_client.stream_chat）。
     """
-    import json
-    payload = {
-        "model": config.LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": config.LLM_MAX_TOKENS,
-        "stream": True,
-    }
-    if effort:
-        payload["reasoning_effort"] = effort
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    acc = ""
-    reasoning_acc = ""          # 推理模型把思考放 delta.reasoning_content
-    finish_reason = None
-    usage = None
-    try:
-        r = requests.post(f"{LLM_BASE_URL}/chat/completions",
-                          json=payload, headers=headers, stream=True,
-                          timeout=config.LLM_TIMEOUT)
-        if r.status_code != 200:
-            body = r.text[:300]
-            log.error("LLM HTTP %s: %s", r.status_code, body)
-            yield ("error", f"LLM 请求失败 HTTP {r.status_code}：{body}")
-            return
-        # 强制 UTF-8 解码：部分网关流式响应头不声明 charset，requests 会
-        # 默认按 latin-1 解 iter_lines(decode_unicode=True) → 中文乱码。
-        r.encoding = "utf-8"
-        for line in r.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            body = line[6:].strip()
-            if body == "[DONE]":
-                break
-            try:
-                d = json.loads(body)
-            except json.JSONDecodeError:
-                continue
-            if d.get("usage"):
-                usage = d["usage"]
-            # 末尾常有只带 usage、choices 为空的收尾帧；choices[0] 前必须判空
-            choices = d.get("choices") or []
-            if not choices:
-                continue
-            if choices[0].get("finish_reason"):
-                finish_reason = choices[0]["finish_reason"]
-            delta = choices[0].get("delta") or {}
-            # 推理模型的思考过程：常见字段名 reasoning_content / reasoning
-            reasoning_acc += (delta.get("reasoning_content")
-                              or delta.get("reasoning") or "")
-            content = delta.get("content", "")
-            if content:
-                acc += content
-                yield ("delta", acc)
-        if not acc.strip():
-            # 空正文：把能拿到的诊断信息全记下来，定位是 length(推理吃光额度)/
-            # content_filter(被审查)/还是只产出了推理无正文。
-            log.error("LLM 空正文 finish_reason=%s usage=%s reasoning_len=%d",
-                      finish_reason, usage, len(reasoning_acc))
-            hint = ""
-            if finish_reason == "length":
-                hint = ("（finish_reason=length：推理把 max_tokens 吃光了，正文没产出。"
-                        "已建议调高 LLM_MAX_TOKENS 或缩短规则。）")
-            elif finish_reason == "content_filter":
-                hint = "（finish_reason=content_filter：被内容审查拦截。）"
-            elif reasoning_acc.strip():
-                hint = ("（只产出了推理内容、无正文，可能 max_tokens 不足或网关吞了"
-                        " content 字段。）")
-            elif finish_reason:
-                hint = f"（finish_reason={finish_reason}）"
-            yield ("error", f"LLM 返回空内容{hint}")
-            return
-        yield ("done", acc.strip())
-    except requests.exceptions.Timeout:
-        yield ("error", f"LLM 超时（>{config.LLM_TIMEOUT}s）。"
-                        f"gpt-5.5 推理较慢，可稍后重试。")
-    except UnicodeEncodeError as e:
-        log.error("LLM 请求头编码失败（key/url 含非 ASCII 字符）: %s", e)
-        yield ("error", "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时"
-                        "混入了全角符号/空格）。请检查服务器 .env 后重启。")
-    except requests.exceptions.RequestException as e:
-        log.error("LLM 流式网络错误: %s", e)
-        yield ("error", f"LLM 网络错误：{e}")
+    yield from llm_client.stream_chat(system, user, effort=effort)
 
 
 def _analyze_prompts(csv_text: str, fundamentals: str,

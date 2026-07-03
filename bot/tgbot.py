@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
 
-from . import config, db, api_client, analyzer, ghost_publish
+from . import config, db, api_client, analyzer, llm_client, ghost_publish
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -91,13 +91,17 @@ ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
     | ADMIN_CHAT_IDS
 
 # 仅管理员可用的配置类命令（访客调用会被拒绝）
-_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish"}
+_ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
 # 等待用户回复自定义侧重的会话状态：chat_id -> (fixture_id, effort)
 # 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, tuple[int, str]] = {}
+
+# 等待管理员回复「LLM 参数新值」的会话状态：chat_id -> 参数 key（LLM_SETTING_SPECS 键）。
+# 点 /llm 面板某参数按钮(ls:<key>)后置位，下一条纯数字文本被当作新值消费、校验范围后写库。
+_pending_llm_set: dict[int, str] = {}
 
 # 等待用户回复「场次号」的会话状态：chat_id -> 命令名（如 "review"/"analyze"）。
 # 用户点菜单/直接发不带参数的命令后置位（force_reply 追问），下一条纯数字回复
@@ -261,6 +265,7 @@ def setup_commands() -> None:
         {"command": "add", "description": "加联赛：/add 关键词 搜了点 或 /add id season"},
         {"command": "remove", "description": "删除关注联赛"},
         {"command": "publish", "description": "把历史归档报告发布到 Ghost 博客（管理员）"},
+        {"command": "llm", "description": "LLM 端点测试/故障转移/熔断参数面板（管理员）"},
     ]
     resp = _post("setMyCommands", {"commands": commands})
     if resp and resp.get("ok"):
@@ -376,6 +381,7 @@ _HELP_ADMIN_EXTRA = (
     "/add &lt;关键词&gt; — 搜联赛点按钮加（如 /add 瑞典）；或 /add &lt;id&gt; &lt;season&gt;\n"
     "/remove &lt;id&gt; — 删联赛\n"
     "/publish — 把 report/ 历史归档报告发布到 Ghost 博客（选日期→选报告→标题→可见性）\n"
+    "/llm — LLM 端点连通性测试 + 故障转移/熔断参数面板（测试延迟、改重试/超时/熔断阈值）\n"
 )
 HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
 
@@ -1782,6 +1788,126 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         send(chat_id, f"📁 复盘已归档：{path}")
 
 
+# ─── /llm 管理面板（端点池 + 熔断状态 + 可调参数；仅管理员）──────────────────
+_BREAKER_ZH = {"CLOSED": "✅正常", "OPEN": "🔴熔断", "HALF_OPEN": "🟡半开"}
+
+
+def _fmt_num(v: float) -> str:
+    """参数值展示：整数去掉 .0（阈值/秒数都是整数语义）。"""
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
+def _llm_panel_text() -> str:
+    """三段面板文字：端点池 / 熔断状态 / 可调参数。"""
+    if not llm_client.available():
+        return ("⚠️ 未配置任何 LLM 端点（.env 缺 LLM_BASE_URL / LLM_API_KEY）。\n"
+                "配置后重启 bot 即可用。多端点见 .env 的 LLM_ENDPOINTS。")
+    eps = llm_client.endpoints()
+    stats = llm_client.breaker_stats()
+    settings = llm_client.get_settings()
+
+    lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条）</b>"]
+    for i, (ep, st) in enumerate(zip(eps, stats)):
+        badge = _BREAKER_ZH.get(st["state"], st["state"])
+        extra = ""
+        if st["state"] == "OPEN":
+            extra = f"，{st['open_remain']}s 后半开探活"
+        elif st["state"] == "HALF_OPEN":
+            extra = f"，已成功 {st['half_ok']}"
+        rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
+            if st["total"] else "无样本"
+        lines.append(
+            f"{i}. <b>{ep['label']}</b> {badge}{extra}\n"
+            f"   <code>{ep['base_url']}</code>\n"
+            f"   连续失败 {st['consecutive']} · 错误率 {rate}")
+
+    lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
+    for key, spec in config.LLM_SETTING_SPECS.items():
+        cur = _fmt_num(settings.get(key, spec["default"]))
+        lines.append(f"· {spec['label']}：<b>{cur}</b>"
+                     f"（{spec['min']}~{spec['max']}）")
+    return "\n".join(lines)
+
+
+def _llm_panel_keyboard() -> dict:
+    """面板内联键盘：测试按钮 + 每端点重置 + 9 参数改值 + 刷新/重置全部。"""
+    if not llm_client.available():
+        return {"inline_keyboard": []}
+    stats = llm_client.breaker_stats()
+    rows: list[list[dict]] = []
+
+    # 测试区：全部测试 + 逐端点测试（每行两个）
+    rows.append([{"text": "🧪 全部测试连通性", "callback_data": "lt:all"}])
+    test_row: list[dict] = []
+    for i, st in enumerate(stats):
+        test_row.append({"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}"})
+        if st["state"] in ("OPEN", "HALF_OPEN"):
+            test_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
+        if len(test_row) >= 2:
+            rows.append(test_row)
+            test_row = []
+    if test_row:
+        rows.append(test_row)
+
+    # 参数区：每行两个参数按钮（文案带当前值）
+    settings = llm_client.get_settings()
+    param_row: list[dict] = []
+    for key, spec in config.LLM_SETTING_SPECS.items():
+        cur = _fmt_num(settings.get(key, spec["default"]))
+        param_row.append({"text": f"{spec['label']}={cur}",
+                          "callback_data": f"ls:{key}"})
+        if len(param_row) >= 2:
+            rows.append(param_row)
+            param_row = []
+    if param_row:
+        rows.append(param_row)
+
+    rows.append([{"text": "🔄 刷新", "callback_data": "lm:"},
+                 {"text": "↩️ 参数恢复默认", "callback_data": "lx:reset"}])
+    return {"inline_keyboard": rows}
+
+
+def _cmd_llm(chat_id: int) -> None:
+    """/llm 管理面板入口（仅管理员，权限在分发处已校验）。"""
+    send(chat_id, _llm_panel_text(), _llm_panel_keyboard())
+
+
+def _llm_refresh(chat_id: int, message_id: int) -> None:
+    """原地重绘面板（测试/改值/重置后调用）。"""
+    edit_text(chat_id, message_id, _llm_panel_text(), _llm_panel_keyboard())
+
+
+def _llm_run_probe(chat_id: int, message_id: int, target: str) -> None:
+    """执行连通性探针（可能数秒，跑在 chat 专属线程池里）。
+    target='all' 测全部，否则测单个端点序号。测完把结果拼进面板顶部并重绘。"""
+    try:
+        if target == "all":
+            results = llm_client.probe_all()
+        else:
+            idx = int(target)
+            res = llm_client.probe(idx)
+            res["label"] = (llm_client.endpoints()[idx]["label"]
+                            if 0 <= idx < len(llm_client.endpoints()) else f"端点{idx}")
+            results = [res]
+    except (ValueError, IndexError):
+        send(chat_id, "端点序号错误。")
+        return
+
+    lines = ["<b>🧪 连通性测试结果</b>"]
+    for r in results:
+        if r["ok"]:
+            model = f" · {r['model']}" if r.get("model") else ""
+            lines.append(f"✅ {r['label']}：HTTP {r['http_status']} · "
+                         f"{r['latency_ms']}ms{model}")
+        else:
+            status = r["http_status"] if r["http_status"] is not None else "无响应"
+            err = f" · {r['error']}" if r.get("error") else ""
+            lines.append(f"❌ {r['label']}：{status} · {r['latency_ms']}ms{err}")
+    lines.append("")
+    lines.append(_llm_panel_text())
+    edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
+
+
 def _prompt_fixarg(chat_id: int, cmd: str) -> None:
     """命令未带场次号时，用 force_reply 追问，并置位 _pending_fixarg。
     用户随后只需回一条纯数字（场次号），免去手打命令+空格+号。"""
@@ -1826,6 +1952,40 @@ def handle_message(msg: dict) -> None:
             info["title"] = text.strip()
             send(chat_id, f"标题已设：{text.strip()}\n选择可见性以发布：",
                  _publish_visibility_keyboard(token))
+            return
+
+    # 若该 chat 正在等待「LLM 参数新值」输入（点了 /llm 某参数按钮），优先消费
+    if chat_id in _pending_llm_set:
+        key = _pending_llm_set.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消") or text.startswith("/"):
+            send(chat_id, "已取消改值。")
+            if not text.startswith("/"):
+                return
+            # 改发了别的命令：落到下方按新命令处理
+        else:
+            spec = config.LLM_SETTING_SPECS.get(key)
+            raw = text.strip()
+            try:
+                val = float(raw)
+            except ValueError:
+                send(chat_id, f"「{raw}」不是数字。请重新在 /llm 面板点该参数再输入。")
+                return
+            if spec is None:
+                send(chat_id, "未知参数，请重新 /llm。")
+                return
+            if not (spec["min"] <= val <= spec["max"]):
+                send(chat_id, f"⛔ {spec['label']} 需在 {spec['min']}~{spec['max']} 之间"
+                              f"（你输入了 {_fmt_num(val)}）。{spec['help']}\n"
+                              f"请重新在 /llm 面板点该参数再输入。")
+                return
+            conn = db.get_conn()
+            try:
+                db.set_llm_setting(conn, key, val)
+            finally:
+                conn.close()
+            llm_client.reload_settings()   # 令缓存失效，下次调用即用新值
+            send(chat_id, f"✅ 已设 {spec['label']} = {_fmt_num(val)}（即时生效）。"
+                          f"\n发 /llm 查看面板。")
             return
 
     # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
@@ -1910,6 +2070,8 @@ def handle_message(msg: dict) -> None:
         _cmd_review(chat_id, args)
     elif cmd == "publish":
         _cmd_publish(chat_id, args)
+    elif cmd == "llm":
+        _cmd_llm(chat_id)
     else:
         send(chat_id, "未知命令，发 /help 看用法")
 
@@ -2088,6 +2250,60 @@ def handle_callback(cb: dict) -> None:
                     info["selected"].add(idx)
         answer_callback(cb_id)
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
+        return
+
+    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / ls:改参数 / lm:刷新 / lx:重置参数，仅管理员）──
+    if data.startswith(("lt:", "lr:", "ls:", "lm:", "lx:")):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可操作")
+            return
+        if data.startswith("lt:"):
+            # 连通性测试可能数秒 → 丢该 chat 专属线程池，不阻塞轮询
+            answer_callback(cb_id, "测试中…")
+            _submit_for_chat(chat_id, _llm_run_probe, chat_id, message_id, data[3:])
+            return
+        if data.startswith("lr:"):
+            try:
+                idx = int(data[3:])
+            except ValueError:
+                answer_callback(cb_id, "序号错误")
+                return
+            ok = llm_client.reset_breaker(idx)
+            answer_callback(cb_id, "已重置该端点熔断" if ok else "序号越界")
+            _llm_refresh(chat_id, message_id)
+            return
+        if data.startswith("ls:"):
+            key = data[3:]
+            spec = config.LLM_SETTING_SPECS.get(key)
+            if spec is None:
+                answer_callback(cb_id, "未知参数")
+                return
+            _pending_llm_set[chat_id] = key
+            answer_callback(cb_id, f"请回复 {spec['label']} 的新值")
+            send(chat_id,
+                 f"✏️ 修改 <b>{spec['label']}</b>（当前 "
+                 f"{_fmt_num(llm_client.get_settings().get(key, spec['default']))}）\n"
+                 f"{spec['help']}\n"
+                 f"请回复一个 {spec['min']}~{spec['max']} 的数字（发 /cancel 取消）。",
+                 {"force_reply": True,
+                  "input_field_placeholder": f"{spec['min']}~{spec['max']}"})
+            return
+        if data.startswith("lx:"):
+            if data == "lx:reset":
+                conn = db.get_conn()
+                try:
+                    db.reset_llm_settings(conn)
+                finally:
+                    conn.close()
+                llm_client.reload_settings()
+                answer_callback(cb_id, "参数已恢复默认")
+                _llm_refresh(chat_id, message_id)
+            else:
+                answer_callback(cb_id)
+            return
+        # lm: 刷新
+        answer_callback(cb_id)
+        _llm_refresh(chat_id, message_id)
         return
 
     # /fixtures 过去/未来切换 + 翻页 + 刷新（访客可点）。格式 fx:<view>[:<page>[:r]]

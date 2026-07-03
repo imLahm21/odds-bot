@@ -5,8 +5,9 @@ LLM 连通性探针 —— 实测 IKuncode chat/completions 能否打通
   python probe_llm.py          # 发一个最小请求，确认通
   python probe_llm.py effort    # 逐档测 reasoning_effort（重点验 xhigh 是否被网关接受）
   python probe_llm.py full     # 用真实规则+一场比赛跑完整精算（耗 token）
+  python probe_llm.py pool      # 端点池：解析 .env 端点、逐条探针、打印熔断态与 9 参数
 
-先跑无参数版确认连通和返回结构，再决定要不要 effort / full。
+先跑无参数版确认连通和返回结构，再决定要不要 effort / full / pool。
 """
 
 import sys
@@ -103,11 +104,50 @@ def probe_full():
     print(report[:2000])
 
 
+def probe_pool():
+    """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 9 参数。
+    需先 init_db（读 llm_settings）；未 init 时 llm_client 回退 config 默认。"""
+    from bot import llm_client, db
+    try:
+        db.init_db()   # 确保 llm_settings 表存在并已 seed
+    except Exception as e:
+        print(f"（init_db 失败，参数将回退 config 默认）：{e}")
+
+    eps = llm_client.endpoints()
+    print(f"解析到 {len(eps)} 个端点：")
+    for i, ep in enumerate(eps):
+        print(f"  [{i}] {ep['label']} → {ep['base_url']}")
+    if not eps:
+        sys.exit("未配置任何端点（.env 缺 LLM_BASE_URL / LLM_API_KEY）")
+
+    print("\n当前 9 参数（DB llm_settings / 回退 config 默认）：")
+    for k, v in llm_client.get_settings().items():
+        print(f"  {k:<28} = {v}")
+
+    print("\n逐端点连通性探针（最小 chat 请求）：")
+    print("=" * 60)
+    for r in llm_client.probe_all():
+        if r["ok"]:
+            print(f"  ✅ [{r['label']}] HTTP {r['http_status']} · "
+                  f"{r['latency_ms']}ms · {r.get('model', '')}")
+        else:
+            status = r["http_status"] if r["http_status"] is not None else "无响应"
+            print(f"  ❌ [{r['label']}] {status} · {r['latency_ms']}ms · "
+                  f"{r.get('error', '')}")
+
+    print("\n各端点熔断器初始态：")
+    for st in llm_client.breaker_stats():
+        print(f"  [{st['label']}] state={st['state']} 连续失败={st['consecutive']} "
+              f"错误率={st['error_rate']:.0f}% 样本={st['total']}")
+
+
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "full":
         probe_full()
     elif arg == "effort":
         probe_effort()
+    elif arg == "pool":
+        probe_pool()
     else:
         probe_minimal()
