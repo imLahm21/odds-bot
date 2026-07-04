@@ -1981,7 +1981,8 @@ def _llm_panel_text() -> str:
     stats = llm_client.breaker_stats()
     settings = llm_client.get_settings()
 
-    lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条，启用 {llm_client.enabled_count()}）</b>"]
+    lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条，启用 {llm_client.enabled_count()}）</b>",
+             "（✅=已启用会连通 / ⬜=已停用会跳过；点按钮翻转，精算只走 ✅ 的端点）"]
     for i, (ep, st) in enumerate(zip(eps, stats)):
         on = llm_client.is_enabled(i)
         sw = "🟢启用" if on else "⚪停用"
@@ -2017,11 +2018,13 @@ def _llm_panel_keyboard() -> dict:
     rows.append([{"text": "🧪 全部测试连通性", "callback_data": "lt:all"}])
     for i, st in enumerate(stats):
         on = llm_client.is_enabled(i)
+        # 开关按钮沿用 /leagues、/bookmakers 的约定：✅/⬜ 显示【当前状态】，
+        # 点击即翻转（le:<idx>:<目标状态 1开/0关>）。不用「启用/停用」动词，
+        # 避免与状态文字里的「🟢启用/⚪停用」语义打架（那是状态，这是动作）。
+        mark = "✅" if on else "⬜"
         ep_row: list[dict] = [
             {"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}"},
-            # 点击在启用/停用间切换：le:<idx>:<目标状态 1开/0关>
-            ({"text": f"⚪ 停用 {i}", "callback_data": f"le:{i}:0"} if on
-             else {"text": f"🟢 启用 {i}", "callback_data": f"le:{i}:1"}),
+            {"text": f"{mark} 端点{i}", "callback_data": f"le:{i}:{0 if on else 1}"},
         ]
         if st["state"] in ("OPEN", "HALF_OPEN"):
             ep_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
