@@ -1647,9 +1647,10 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
         send(chat_id, "🧠 正在分析基本面（轻量模型预处理）…")
         fund_brief, ok = analyzer.analyze_fundamentals(
             funds, meta["home"], meta["away"], meta["league"])
-        _send_long(chat_id, "🧩 基本面\n" + fund_brief)
+        # 轻量模型输出常带 ### / ** 等 markdown 符号，TG 纯文本展示会露出，剥成干净文字
+        _send_long(chat_id, _md_to_tg("🧩 基本面\n" + fund_brief))
     else:
-        _send_long(chat_id, "🧩 基本面\n" + funds)
+        _send_long(chat_id, _md_to_tg("🧩 基本面\n" + funds))
 
     # 末条带「预设精算 / 自定义侧重」两个按钮
     if not analyzer.available():
