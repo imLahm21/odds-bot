@@ -1640,7 +1640,16 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     except Exception as e:
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
-    _send_long(chat_id, "🧩 基本面\n" + funds)
+
+    # 展示用轻量模型预处理后的「基本面概述」，而非罗列原始近况/交锋/赛程/积分榜长数据。
+    # 有数据才预处理；失败/未配置/无数据则回退展示原始 funds（analyze_fundamentals 内部保证）。
+    if funds and not funds.startswith("（基本面"):
+        send(chat_id, "🧠 正在分析基本面（轻量模型预处理）…")
+        fund_brief, ok = analyzer.analyze_fundamentals(
+            funds, meta["home"], meta["away"], meta["league"])
+        _send_long(chat_id, "🧩 基本面\n" + fund_brief)
+    else:
+        _send_long(chat_id, "🧩 基本面\n" + funds)
 
     # 末条带「预设精算 / 自定义侧重」两个按钮
     if not analyzer.available():
