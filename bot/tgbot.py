@@ -1081,8 +1081,7 @@ def _odds_digest(fid: int) -> tuple[str, dict] | tuple[None, None]:
                 elif closer:
                     slot["ah"] = (hc, hw, aw)
 
-    header = f"📊 <b>{home} vs {away}</b>\n{league}  开球 {kick_cst}\n" \
-             f"盘口走势（主锚 Pinnacle，缺则 Bet365）："
+    header = f"📊 <b>{home} vs {away}</b>\n{league}  开球 {kick_cst}"
     table = ["节点     欧赔H/D/A         让球  主水/客水"]
     n_nodes = 0
     for (snap, node) in sorted(snaps.keys()):
@@ -1103,9 +1102,11 @@ def _odds_digest(fid: int) -> tuple[str, dict] | tuple[None, None]:
             ah = "—"
         table.append(f"{label} {eu:<16} {ah}")
 
+    # header 单独返回供对话框展示（不再逐节点罗列 <pre> 表格，太冗长）；
+    # digest 仍拼出完整表格以备他用，但 /analyze 展示只用 header。
     digest = header + "\n<pre>" + "\n".join(table) + "</pre>"
     meta = {"home": home, "away": away, "league": league,
-            "kick_cst": kick_cst, "nodes": n_nodes}
+            "kick_cst": kick_cst, "nodes": n_nodes, "header": header}
     return digest, meta
 
 
@@ -1623,9 +1624,11 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
         send(chat_id, f"fixture {fid} 暂无盘口数据")
         return
 
-    # 盘口走势预览（含 <pre> 表格，需 HTML 渲染）
-    _send_long(chat_id, digest, plain=False)
-    send(chat_id, f"已获取 {meta['nodes']} 个节点的盘口走势。正在拉取基本面…")
+    # 只发头部说明（队名/联赛/开球），不再逐节点罗列盘口大表——太冗长；
+    # 完整盘口数据仍照常喂给 SOP 精算，展示精简不影响预测。
+    send(chat_id, f"{meta['header']}\n"
+                  f"已获取 {meta['nodes']} 个节点的盘口走势。正在拉取基本面…",
+         plain=False)
 
     # 基本面（读库 + 调 API，失败不阻断）
     try:
