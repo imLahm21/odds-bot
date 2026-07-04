@@ -80,6 +80,16 @@ CREATE TABLE IF NOT EXISTS llm_settings (
     updated_at TEXT
 );
 
+-- LLM 端点手动开关：由 TG /llm 面板点开/关，llm_client 选路时跳过被停用的端点。
+-- 与熔断(自动隔离故障端点)是两个独立维度：这里是运维「只连哪个」的手动控制。
+-- 端点 secret 不落库；这里只按签名(label|base_url)记录「哪些端点被手动停用」，
+-- 表中有记录且 disabled=1 即停用，无记录默认启用（新端点默认连通）。
+CREATE TABLE IF NOT EXISTS llm_endpoint_state (
+    sig        TEXT PRIMARY KEY,             -- 端点签名 label|base_url（不含 key）
+    disabled   INTEGER NOT NULL DEFAULT 0,   -- 1=手动停用，0=启用
+    updated_at TEXT
+);
+
 -- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
 -- 避免污染赛前 SOP 的 CSV。只存 main:true 主盘口线(走地只看主盘)。
 CREATE TABLE IF NOT EXISTS live_odds_history (
@@ -350,6 +360,24 @@ def reset_llm_settings(conn: sqlite3.Connection) -> None:
         "INSERT INTO llm_settings (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
         "updated_at=excluded.updated_at", rows)
+    conn.commit()
+
+
+# ─── LLM 端点手动开关（TG /llm 面板读写，llm_client 选路时读取）──────────────
+def get_disabled_endpoints(conn: sqlite3.Connection) -> set[str]:
+    """返回被手动停用的端点签名集合。表中无记录的端点默认启用。"""
+    return {r[0] for r in conn.execute(
+        "SELECT sig FROM llm_endpoint_state WHERE disabled=1").fetchall()}
+
+
+def set_endpoint_disabled(conn: sqlite3.Connection, sig: str,
+                          disabled: bool) -> None:
+    """UPSERT 单个端点的停用状态（sig=label|base_url，不含 key）。"""
+    conn.execute(
+        "INSERT INTO llm_endpoint_state (sig, disabled, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(sig) DO UPDATE SET disabled=excluded.disabled, "
+        "updated_at=excluded.updated_at",
+        (sig, 1 if disabled else 0, _now_utc_iso()))
     conn.commit()
 
 

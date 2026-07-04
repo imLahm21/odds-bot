@@ -1981,8 +1981,10 @@ def _llm_panel_text() -> str:
     stats = llm_client.breaker_stats()
     settings = llm_client.get_settings()
 
-    lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条）</b>"]
+    lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条，启用 {llm_client.enabled_count()}）</b>"]
     for i, (ep, st) in enumerate(zip(eps, stats)):
+        on = llm_client.is_enabled(i)
+        sw = "🟢启用" if on else "⚪停用"
         badge = _BREAKER_ZH.get(st["state"], st["state"])
         extra = ""
         if st["state"] == "OPEN":
@@ -1992,7 +1994,7 @@ def _llm_panel_text() -> str:
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
         lines.append(
-            f"{i}. <b>{ep['label']}</b> {badge}{extra}\n"
+            f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
             f"   连续失败 {st['consecutive']} · 错误率 {rate}")
 
@@ -2011,18 +2013,19 @@ def _llm_panel_keyboard() -> dict:
     stats = llm_client.breaker_stats()
     rows: list[list[dict]] = []
 
-    # 测试区：全部测试 + 逐端点测试（每行两个）
+    # 测试区：全部测试 + 逐端点一行（测试 / 开关 / 熔断时重置）
     rows.append([{"text": "🧪 全部测试连通性", "callback_data": "lt:all"}])
-    test_row: list[dict] = []
     for i, st in enumerate(stats):
-        test_row.append({"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}"})
+        on = llm_client.is_enabled(i)
+        ep_row: list[dict] = [
+            {"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}"},
+            # 点击在启用/停用间切换：le:<idx>:<目标状态 1开/0关>
+            ({"text": f"⚪ 停用 {i}", "callback_data": f"le:{i}:0"} if on
+             else {"text": f"🟢 启用 {i}", "callback_data": f"le:{i}:1"}),
+        ]
         if st["state"] in ("OPEN", "HALF_OPEN"):
-            test_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
-        if len(test_row) >= 2:
-            rows.append(test_row)
-            test_row = []
-    if test_row:
-        rows.append(test_row)
+            ep_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
+        rows.append(ep_row)
 
     # 参数区：每行两个参数按钮（文案带当前值）
     settings = llm_client.get_settings()
@@ -2482,8 +2485,8 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
-    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / ls:改参数 / lm:刷新 / lx:重置参数，仅管理员）──
-    if data.startswith(("lt:", "lr:", "ls:", "lm:", "lx:")):
+    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / le:开关端点 / ls:改参数 / lm:刷新 / lx:重置参数，仅管理员）──
+    if data.startswith(("lt:", "lr:", "le:", "ls:", "lm:", "lx:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可操作")
             return
@@ -2500,6 +2503,25 @@ def handle_callback(cb: dict) -> None:
                 return
             ok = llm_client.reset_breaker(idx)
             answer_callback(cb_id, "已重置该端点熔断" if ok else "序号越界")
+            _llm_refresh(chat_id, message_id)
+            return
+        if data.startswith("le:"):
+            # le:<idx>:<1开/0关> 手动开关端点
+            try:
+                _, sidx, sflag = data.split(":")
+                idx, want_on = int(sidx), sflag == "1"
+            except ValueError:
+                answer_callback(cb_id, "参数错误")
+                return
+            ok = llm_client.set_enabled(idx, want_on)
+            if not ok:
+                answer_callback(cb_id, "序号越界")
+                return
+            # 全部停用时给出显式提醒（此时任何精算都会失败）
+            if llm_client.enabled_count() == 0:
+                answer_callback(cb_id, "⚠️ 已停用，当前无启用端点！")
+            else:
+                answer_callback(cb_id, "已启用该端点" if want_on else "已停用该端点")
             _llm_refresh(chat_id, message_id)
             return
         if data.startswith("ls:"):

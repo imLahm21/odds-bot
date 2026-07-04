@@ -95,6 +95,12 @@ def _parse_endpoints() -> list[dict]:
 _ENDPOINTS: list[dict] = _parse_endpoints()
 
 
+def _sig(ep: dict) -> str:
+    """端点签名（label|base_url，不含 key），作 DB 开关状态的稳定主键——
+    不依赖易变的数组下标，增删端点后仍能对上原来的开关记录。"""
+    return f"{ep['label']}|{ep['base_url']}"
+
+
 def available() -> bool:
     """至少有一个可用端点（key + base_url 齐全）。"""
     return bool(_ENDPOINTS)
@@ -103,6 +109,72 @@ def available() -> bool:
 def endpoints() -> list[dict]:
     """只读端点列表（label/base_url，不含 key）供 TG 面板展示。"""
     return [{"label": e["label"], "base_url": e["base_url"]} for e in _ENDPOINTS]
+
+
+# ─── 端点手动开关（DB 懒加载，TG 改后 reload_endpoint_state 失效）────────────
+# 与熔断（自动隔离故障端点）正交：这里是运维「只连哪个」的手动控制。
+# 停用集合存被停用的端点签名；表中无记录的端点默认启用。
+_disabled_cache: set[str] | None = None
+_disabled_lock = threading.Lock()
+
+
+def _load_disabled() -> set[str]:
+    """从 db.llm_endpoint_state 读被停用的端点签名；DB 异常时回退空集（全启用）。"""
+    try:
+        conn = db.get_conn()
+        try:
+            return db.get_disabled_endpoints(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("读 llm_endpoint_state 失败，默认全部端点启用: %s", e)
+        return set()
+
+
+def _get_disabled() -> set[str]:
+    """取停用签名集合（进程内缓存，首次访问懒加载）。"""
+    global _disabled_cache
+    if _disabled_cache is None:
+        with _disabled_lock:
+            if _disabled_cache is None:
+                _disabled_cache = _load_disabled()
+    return _disabled_cache
+
+
+def reload_endpoint_state() -> None:
+    """令开关缓存失效（TG 改开关后调用），下次选路重读 DB。"""
+    global _disabled_cache
+    with _disabled_lock:
+        _disabled_cache = None
+
+
+def is_enabled(idx: int) -> bool:
+    """指定端点当前是否启用（未被手动停用）。越界视为未启用。"""
+    if not (0 <= idx < len(_ENDPOINTS)):
+        return False
+    return _sig(_ENDPOINTS[idx]) not in _get_disabled()
+
+
+def enabled_count() -> int:
+    """当前启用（未被手动停用）的端点数。"""
+    return sum(1 for i in range(len(_ENDPOINTS)) if is_enabled(i))
+
+
+def set_enabled(idx: int, enabled: bool) -> bool:
+    """手动开/关指定端点并落库，刷新缓存。越界返回 False。"""
+    if not (0 <= idx < len(_ENDPOINTS)):
+        return False
+    try:
+        conn = db.get_conn()
+        try:
+            db.set_endpoint_disabled(conn, _sig(_ENDPOINTS[idx]), not enabled)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("写端点开关失败 idx=%d: %s", idx, e)
+        return False
+    reload_endpoint_state()
+    return True
 
 
 # ─── 9 个可调参数缓存（DB 懒加载，TG 改后 reload_settings 失效）──────────────
@@ -344,7 +416,10 @@ def chat(system: str, user: str, effort: str = "",
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
     all_timeout = True            # 是否全部端点都是超时类失败
+    disabled = _get_disabled()
     for idx, ep in enumerate(_ENDPOINTS):
+        if _sig(ep) in disabled:          # 手动停用的端点：不参与选路
+            continue
         br = _breakers[idx]
         if not br.allow():
             labeled.append(f"{ep['label']}熔断跳过")
@@ -359,7 +434,10 @@ def chat(system: str, user: str, effort: str = "",
         if not was_to:
             all_timeout = False
 
-    if not raw_errs:   # 全部端点被熔断跳过
+    if not raw_errs:   # 无任何端点尝试：要么全被手动停用，要么全被熔断跳过
+        if enabled_count() == 0:
+            return ("LLM 请求失败（所有端点均被手动停用，请用 /llm 面板开启至少"
+                    "一个端点）")
         return ("LLM 请求失败（所有端点均处于熔断中，暂无可用端点，"
                 "请稍后重试或用 /llm 重置熔断）")
     if len(_ENDPOINTS) == 1:
@@ -486,7 +564,10 @@ def stream_chat(system: str, user: str, effort: str = ""):
                        effort, True)
 
     last_err = None
+    disabled = _get_disabled()
     for idx, ep in enumerate(_ENDPOINTS):
+        if _sig(ep) in disabled:          # 手动停用的端点：不参与选路
+            continue
         br = _breakers[idx]
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
@@ -512,6 +593,9 @@ def stream_chat(system: str, user: str, effort: str = ""):
                 break
         if failed_pre:
             continue   # 首字节前失败，尝试下一端点
+    if last_err is None and enabled_count() == 0:
+        yield ("error", "LLM 全部端点均被手动停用（请用 /llm 面板开启至少一个端点）")
+        return
     yield ("error", last_err or "LLM 全部端点不可用（请用 /llm 测试/重置端点）")
 
 
