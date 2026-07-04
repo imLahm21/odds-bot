@@ -1703,17 +1703,10 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
 
-    # 两阶段：先用轻量模型把原始基本面分析成研判，再喂主 SOP（失败/超时回退原始）。
-    # 仅当基本面确有数据时才预处理；上游拉取已失败则跳过。
-    if funds and not funds.startswith("（基本面"):
-        send(chat_id, "🧠 正在分析基本面（轻量模型预处理）…")
-        fund_brief, ok = analyzer.analyze_fundamentals(
-            funds, meta["home"], meta["away"], meta["league"])
-        if ok:
-            funds = ("（以下为基本面方法论研判：原始数据已由轻量模型按"
-                     "国家队/赛事情境/大小球规则预处理）\n\n" + fund_brief)
-        else:
-            funds = ("⚠️ 基本面预处理失败，已回退原始数据。\n\n" + funds)
+    # 精算阶段不再用轻量模型预处理基本面：主 SOP（gpt-5.5）的 system prompt 已
+    # 加载国家队/赛事情境/大小球等全套规则，有能力直接分析原始基本面并并入推算。
+    # 故把原始基本面数据直接喂主 SOP，由重模型一次性完成基本面研判 + 盘口精算，
+    # 省去一次轻量调用与等待。（第一步展示的轻量概述仅供用户预览，与此独立。）
 
     # 流式精算 + 原地进度播报
     tag = "✍️自定义" if extra_instruction.strip() else "🎯预设"
