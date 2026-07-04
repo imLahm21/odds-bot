@@ -16,6 +16,7 @@ import os
 import re
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 
 import jwt
 import markdown
@@ -395,7 +396,10 @@ def report_to_post(report_md: str, *, title: str | None = None,
         away_slug = _slugify(away)
         if home_slug and away_slug:   # 两队都有英文才生成，避免 'vs-prediction' 这种残缺
             suffix_en = "review" if is_review else "prediction"
-            slug = f"{home_slug}-vs-{away_slug}-{suffix_en}"
+            # 末尾加发布日期（CST，UTC+8）做后缀，避免同两队多场比赛 slug 冲突，
+            # 如 liao-ning-tie-ren-chong-qing-tong-liang-long-prediction-20260704
+            pub_date = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+            slug = f"{home_slug}-vs-{away_slug}-{suffix_en}-{pub_date}"
 
     # 摘要：取「## 赛事：…」一行。始终从 meta_src 取——盲推开头有标准的
     # 「## 赛事：… 开球时间：…」，比第二步对照的「开球：」格式更规整（利于后续联赛名提取）。
