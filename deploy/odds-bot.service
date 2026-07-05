@@ -1,0 +1,26 @@
+# 赔率轮询守护进程 —— systemd 单元
+# 安装：
+#   sudo cp deploy/odds-bot.service /etc/systemd/system/odds-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now odds-bot
+#   journalctl -u odds-bot -f        # 看日志
+#
+# 换服务器/换用户时，改下面两处路径里的 ubuntu 与 odds-bot 为实际值即可。
+[Unit]
+Description=Odds polling daemon (Telegram bot + scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/odds-bot
+ExecStart=/home/ubuntu/odds-bot/venv/bin/python -m bot.daemon
+Restart=always
+RestartSec=5
+# 崩溃/重启风暴保护：10 分钟内最多重启 5 次，超了停机等人工介入
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# 备份任务本体（由 odds-backup.timer 定时触发，oneshot 跑完即退）
+# 换服务器/换用户时，改 User 与路径里的 ubuntu / odds-bot 为实际值。
+[Unit]
+Description=Odds-bot backup job (tar + upload to Google Drive)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/odds-bot
+ExecStart=/usr/bin/env bash /home/ubuntu/odds-bot/deploy/backup.sh
+# 备份脚本自带的可调参数（如需改保留天数/remote 名，在此覆盖环境变量）：
+# Environment=RETAIN_DAYS=14
+# Environment=RCLONE_REMOTE=gdrive
+# Environment=REMOTE_DIR=odds-bot-backups

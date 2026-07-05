@@ -1,0 +1,19 @@
+# 每天定时触发全局备份 → Google Drive
+# 安装（与 odds-backup.service 一起）：
+#   sudo cp deploy/odds-backup.service /etc/systemd/system/
+#   sudo cp deploy/odds-backup.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now odds-backup.timer
+#   systemctl list-timers odds-backup.timer   # 确认下次触发时间
+#
+# 触发时刻：北京时间每天 04:00（下方用 Asia/Shanghai 显式指定时区，
+# 不依赖服务器本地时区，云主机默认 UTC 也能对准北京 4 点）。
+[Unit]
+Description=Daily odds-bot backup to Google Drive
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target
