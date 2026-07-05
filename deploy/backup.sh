@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 全局备份 → 打包 → 上传 Google Drive（rclone）→ 清理超期备份
+# 全局备份 → 打包 → 上传到【多个】云盘（rclone）→ 清理超期备份
 #
 # 备份内容（只备 git 里没有、丢了不可恢复的）：
 #   .env       所有 API 密钥/LLM 端点/Ghost 凭证（gitignore，最关键）
@@ -11,13 +11,15 @@
 #   bash deploy/backup.sh              # 手动跑一次
 #   由 systemd timer 每天北京时间 04:00 自动调用（见 odds-backup.*）
 #
-# 依赖：sqlite3、tar、rclone（且已配好名为 gdrive 的 remote）
+# 依赖：sqlite3、tar、rclone（且已配好下述各 remote）
 set -euo pipefail
 
 # ── 可调参数 ─────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-/home/ubuntu/odds-bot}"   # 项目根目录
-RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"              # rclone remote 名
-REMOTE_DIR="${REMOTE_DIR:-odds-bot-backups}"          # Drive 上的目标文件夹
+# 多云盘：空格分隔的 rclone remote 名，逐个上传（双保险，一个挂了还有另一个）。
+# 兼容旧单 remote 变量 RCLONE_REMOTE（若设了就用它，否则用默认的 gdrive pikpak）。
+RCLONE_REMOTES="${RCLONE_REMOTES:-${RCLONE_REMOTE:-gdrive pikpak}}"
+REMOTE_DIR="${REMOTE_DIR:-odds-bot-backups}"          # 各云盘上的目标文件夹
 LOCAL_KEEP_DIR="${LOCAL_KEEP_DIR:-/home/ubuntu/odds-backups}"  # 本地暂存目录
 RETAIN_DAYS="${RETAIN_DAYS:-14}"                      # 云端 + 本地保留天数
 
@@ -46,20 +48,30 @@ fi
 tar czf "$ARCHIVE" "${TARGETS[@]}"
 echo "[ok] 已打包：$ARCHIVE（$(du -h "$ARCHIVE" | cut -f1)）"
 
-# ── 上传 Google Drive ────────────────────────────────────────────────────────
-rclone copy "$ARCHIVE" "${RCLONE_REMOTE}:${REMOTE_DIR}/" --stats-one-line
-echo "[ok] 已上传到 ${RCLONE_REMOTE}:${REMOTE_DIR}/"
-
-# ── 清理超期备份（云端 + 本地）───────────────────────────────────────────────
-# 云端：删 Drive 上修改时间早于 RETAIN_DAYS 的备份文件
-rclone delete "${RCLONE_REMOTE}:${REMOTE_DIR}/" \
-    --min-age "${RETAIN_DAYS}d" --include "odds-backup_*.tar.gz" || \
-    echo "[warn] 云端清理失败（忽略，下次再清）"
-echo "[ok] 已清理云端 >${RETAIN_DAYS} 天的旧备份"
+# ── 逐个云盘上传 + 清理超期 ──────────────────────────────────────────────────
+# 单个 remote 失败不中断其它（一个云盘挂了还有另一个），末尾汇总成败。
+upload_ok=0
+upload_fail=0
+for remote in $RCLONE_REMOTES; do
+    if rclone copy "$ARCHIVE" "${remote}:${REMOTE_DIR}/" --stats-one-line; then
+        echo "[ok] 已上传到 ${remote}:${REMOTE_DIR}/"
+        upload_ok=$((upload_ok + 1))
+        # 该云盘上清理超期备份
+        rclone delete "${remote}:${REMOTE_DIR}/" \
+            --min-age "${RETAIN_DAYS}d" --include "odds-backup_*.tar.gz" 2>/dev/null || \
+            echo "[warn] ${remote} 云端清理失败（忽略，下次再清）"
+    else
+        echo "[error] 上传到 ${remote} 失败（其它云盘继续）"
+        upload_fail=$((upload_fail + 1))
+    fi
+done
 
 # 本地：同样只留 RETAIN_DAYS 天，避免服务器磁盘堆满
 find "$LOCAL_KEEP_DIR" -name "odds-backup_*.tar.gz" \
     -mtime "+${RETAIN_DAYS}" -delete || true
 echo "[ok] 已清理本地 >${RETAIN_DAYS} 天的旧备份"
 
-echo "[done] 备份完成 @ ${STAMP}"
+if [ "$upload_ok" -eq 0 ]; then
+    echo "[error] 所有云盘上传均失败！本地备份仍在 $ARCHIVE"; exit 1
+fi
+echo "[done] 备份完成 @ ${STAMP}（成功 ${upload_ok} 个云盘，失败 ${upload_fail} 个）"

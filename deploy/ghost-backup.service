@@ -1,0 +1,15 @@
+# Ghost 全站备份任务（由 ghost-backup.timer 定时触发，oneshot 跑完即退）
+# 换服务器/换用户时改 User 与路径。
+[Unit]
+Description=Ghost site backup job (mysqldump + content volume + config → clouds)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/odds-bot
+ExecStart=/usr/bin/env bash /home/ubuntu/odds-bot/deploy/ghost-backup.sh
+# 可覆盖参数（一般不用）：
+# Environment=RETAIN_DAYS=14
+# Environment=RCLONE_REMOTES=gdrive pikpak

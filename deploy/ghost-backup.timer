@@ -1,0 +1,17 @@
+# 每天定时触发 Ghost 全站备份 → 云盘
+# 安装：
+#   sudo cp deploy/ghost-backup.service /etc/systemd/system/
+#   sudo cp deploy/ghost-backup.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ghost-backup.timer
+#
+# 触发时刻：北京时间每天 04:30（比 odds 备份晚半小时错开，避免同时跑抢 CPU/带宽）。
+[Unit]
+Description=Daily Ghost site backup to clouds
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target
