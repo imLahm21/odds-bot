@@ -1399,9 +1399,10 @@ def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
     edit_text(chat_id, message_id, f"✅ 已归档实战教训：{out_path}")
 
 
-def _publish_date_keyboard() -> dict | None:
-    """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数）。
-    无任何报告时返回 None。回调 pd:<date>。"""
+def _publish_date_keyboard(page: int = 0) -> dict | None:
+    """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数，分页）。
+    每个日期一行 pd:<date>；底部一行翻页 pdp:<page>。无任何报告时返回 None。
+    日期会随天数累积变长，故分页——与 /leagues 面板同一套翻页约定。"""
     import os
     base = "report"
     if not os.path.isdir(base):
@@ -1417,8 +1418,23 @@ def _publish_date_keyboard() -> dict | None:
     if not dates:
         return None
     dates.sort(reverse=True)   # 最新日期在前
+
+    per_page = config.PUBLISH_DATES_PER_PAGE
+    pages = max(1, (len(dates) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    chunk = dates[page * per_page:(page + 1) * per_page]
     rows = [[{"text": f"{date}（{n}）", "callback_data": f"pd:{date}"}]
-            for date, n in dates]
+            for date, n in chunk]
+
+    # 翻页行：‹ 上一页 | 页码 | 下一页 ›（仅多页时显示；首/末页对应按钮占位）
+    if pages > 1:
+        nav = []
+        nav.append({"text": "‹ 上一页", "callback_data": f"pdp:{page - 1}"}
+                   if page > 0 else {"text": " ", "callback_data": "pdp:noop"})
+        nav.append({"text": f"{page + 1}/{pages}", "callback_data": "pdp:noop"})
+        nav.append({"text": "下一页 ›", "callback_data": f"pdp:{page + 1}"}
+                   if page < pages - 1 else {"text": " ", "callback_data": "pdp:noop"})
+        rows.append(nav)
     return {"inline_keyboard": rows}
 
 
@@ -2270,6 +2286,23 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
     answer_callback(cb_id)
 
     # pd:<date> —— 列该日期的报告
+    # pdp:<page> —— 日期列表翻页（noop 为占位按钮，点了不动）
+    if data.startswith("pdp:"):
+        arg = data[4:]
+        if arg == "noop":
+            answer_callback(cb_id)
+            return
+        try:
+            page = int(arg)
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        answer_callback(cb_id)
+        kb = _publish_date_keyboard(page)
+        if kb is not None:
+            edit_markup(chat_id, message_id, kb)
+        return
+
     if data.startswith("pd:"):
         date = data[3:]
         kb = _publish_report_keyboard(chat_id, date)
@@ -2442,8 +2475,8 @@ def handle_callback(cb: dict) -> None:
         _lesson_archive_from_file(chat_id, message_id, path)
         return
 
-    # ── /publish 发布到博客的回调（pd:/pf:/gt:/gv:，仅管理员）──
-    if data.startswith(("pd:", "pf:", "gt:", "gv:")):
+    # ── /publish 发布到博客的回调（pdp:翻页/pd:选日期/pf:选报告/gt:/gv:，仅管理员）──
+    if data.startswith(("pdp:", "pd:", "pf:", "gt:", "gv:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可发布")
             return

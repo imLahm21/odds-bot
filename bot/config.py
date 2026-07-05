@@ -231,6 +231,7 @@ TELEGRAM_API = "https://api.telegram.org"
 TG_POLL_TIMEOUT = 50          # long polling 超时（秒）
 TG_LEAGUES_PER_ROW = 2        # 联赛按钮每行个数
 TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
+PUBLISH_DATES_PER_PAGE = 8    # /publish 日期列表每页条数（随天数累积，需翻页）
 TG_MSG_MAX = 4000             # 单条消息最大字符（Telegram 上限 4096，留余量）
 # 访客每日 /analyze 次数上限（管理员不受限）。防额度被刷；0 或负数=不限制。
 VISITOR_ANALYZE_DAILY_LIMIT = 10
