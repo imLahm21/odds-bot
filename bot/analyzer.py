@@ -404,6 +404,8 @@ def analyze_stream(csv_text: str, fundamentals: str,
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user, effort):
         if kind == "delta":
+            # 每收到一块就透传一个轻量事件，供 bot 循环高频检查中断（消费方忽略未知事件）
+            yield ("progress",)
             for m in head_re.finditer(payload):
                 n = int(m.group(1))
                 if n in _STAGE_NAMES and n not in seen:

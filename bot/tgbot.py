@@ -76,6 +76,71 @@ def _submit_for_chat(chat_id: int, fn, *args) -> None:
     pool.submit(_run)
 
 
+# ─── 精算/复盘：独立分析线程池 + 可中断任务注册表 ────────────────────────────
+# 关键：/analyze、/review 是最耗时的操作（LLM 1~3 分钟，复盘两遍可达 6 分钟）。
+# 若它们跑在 per-chat 执行器里，会占死该 chat 的唯一工作线程——同一用户在分析
+# 期间发的任何命令（含「停止」按钮）都排在它后面，永远轮不到，停止键反被它卡死。
+# 故把精算/复盘搬到这个独立池：per-chat 执行器只留给快命令 + 停止键，秒回；
+# 停止键点击能立即处理并去中断正在跑的分析。max_workers 限总并发，避免多人同时
+# 精算压垮 1C1G。
+_ANALYSIS_MAX_CONCURRENT = 4
+_analysis_pool = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_CONCURRENT,
+                                    thread_name_prefix="analysis")
+
+# 进行中的分析任务：chat_id -> {"cancel": threading.Event, "kind": "精算"/"复盘"}。
+# 同一 chat 同时只允许一个分析任务（第二次触发会被拒，提示先停止或等待）。
+# 停止键置位对应 Event，分析循环每收到一块流式数据就检查、置位则收尾退出。
+_analysis_tasks: dict[int, dict] = {}
+_analysis_lock = threading.Lock()
+
+# 清空内联键盘的常量（收尾时移除「停止」按钮）
+_NO_KB = {"inline_keyboard": []}
+
+
+def _analysis_busy(chat_id: int) -> str | None:
+    """该 chat 是否有进行中的分析任务；有则返回其类型（用于提示），否则 None。"""
+    with _analysis_lock:
+        t = _analysis_tasks.get(chat_id)
+        return t["kind"] if t else None
+
+
+def _analysis_cancel(chat_id: int) -> str | None:
+    """请求中断该 chat 的分析任务：置位其 cancel 事件。
+    返回被中断任务的类型（用于提示），无进行中任务返回 None。"""
+    with _analysis_lock:
+        t = _analysis_tasks.get(chat_id)
+        if not t:
+            return None
+        t["cancel"].set()
+        return t["kind"]
+
+
+def _submit_analysis(chat_id: int, kind: str, fn, *args) -> bool:
+    """把一个分析任务提交到独立分析池，并登记到中断注册表。
+    fn 的最后一个参数会追加为 cancel 事件（threading.Event）。
+    同一 chat 已有进行中的分析则拒绝，返回 False。"""
+    cancel = threading.Event()
+    with _analysis_lock:
+        if chat_id in _analysis_tasks:
+            return False
+        _analysis_tasks[chat_id] = {"cancel": cancel, "kind": kind}
+
+    def _run() -> None:
+        try:
+            fn(*args, cancel)
+        except Exception:
+            log.exception("分析任务出错 chat=%s kind=%s", chat_id, kind)
+        finally:
+            with _analysis_lock:
+                # 仅当仍是本任务时才清（防用户停止后又快速发起新任务时误清新任务）
+                cur = _analysis_tasks.get(chat_id)
+                if cur is not None and cur["cancel"] is cancel:
+                    _analysis_tasks.pop(chat_id, None)
+
+    _analysis_pool.submit(_run)
+    return True
+
+
 def _parse_ids(raw: str) -> set[int]:
     return {int(x) for x in raw.replace(" ", "").split(",")
             if x.lstrip("-").isdigit()}
@@ -1686,10 +1751,11 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
 
 
 def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
-             effort: str = "") -> None:
+             effort: str = "", cancel: "threading.Event | None" = None) -> None:
     """第二步：真正跑 SOP 精算。
     extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
     effort 为推理强度（low/medium/high/xhigh），透传给 analyzer。
+    cancel 为中断事件：置位后流式循环尽快收尾退出（用户点了停止按钮）。
     """
     from . import fundamentals
     if not analyzer.available():
@@ -1737,6 +1803,8 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         title += f"\n侧重：{extra_instruction.strip()[:80]}"
     total = analyzer._TOTAL_STAGES
     done_stages: list[str] = []
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止精算", "callback_data": "stopan:"}]]}
 
     def progress_text(cur_n: int | None, cur_name: str | None) -> str:
         lines = [title, ""]
@@ -1750,21 +1818,29 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
                 lines.append(f"⬜ {n}. {name}")
         return "\n".join(lines)
 
-    msg_id = send(chat_id, progress_text(1, "数据提取"))
+    msg_id = send(chat_id, progress_text(1, "数据提取"), stop_kb)
     report = None
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
                                       meta["away"], meta["league"],
                                       extra_instruction, effort):
+        # 每块数据都检查中断：用户点了停止按钮就立即收尾（不再等 LLM 跑完）
+        if cancel is not None and cancel.is_set():
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          title + "\n\n🛑 已按你的要求停止精算。", _NO_KB)
+            else:
+                send(chat_id, "🛑 已停止精算。")
+            return
         if ev[0] == "stage":
             _, n, name = ev
             done_stages = [analyzer._STAGE_NAMES[i] for i in range(1, n)]
             if msg_id:
-                edit_text(chat_id, msg_id, progress_text(n, name))
+                edit_text(chat_id, msg_id, progress_text(n, name), stop_kb)
         elif ev[0] == "done":
             report = ev[1]
         elif ev[0] == "error":
             if msg_id:
-                edit_text(chat_id, msg_id, f"❌ 精算失败：{ev[1]}")
+                edit_text(chat_id, msg_id, f"❌ 精算失败：{ev[1]}", _NO_KB)
             else:
                 send(chat_id, f"❌ 精算失败：{ev[1]}")
             return
@@ -1773,7 +1849,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         send(chat_id, "❌ 精算未产出报告，请稍后重试。")
         return
     if msg_id:
-        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 7 步完成，报告如下：")
+        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 7 步完成，报告如下：", _NO_KB)
     _send_long(chat_id, _md_to_tg(report))   # TG 显示纯文本；归档仍用原始 report
     path = _archive_report(meta, report, chat_id=chat_id)
     if path:
@@ -1808,12 +1884,16 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
 
 
 def _run_review(chat_id: int, fid: int, effort: str = "",
-                sub_mode: str = "all") -> None:
+                sub_mode: str = "all",
+                cancel: "threading.Event | None" = None) -> None:
     """对已结束的比赛做复盘。sub_mode 三选一：
       "blind"   只跑第一步盲推（仅凭盘口正向跑 SOP 得预判）→ 归档 _review_blind.md
       "compare" 只跑第二步对照（从归档读盲推预判 + 揭晓比分做归因）→ 归档 _review.md
       "all"     两步全跑（盲推 + 对照，合并归档 _review.md）——默认
-    effort 为推理强度，同时用于两遍。"""
+    effort 为推理强度，同时用于两遍。
+    cancel 为中断事件：置位后当前流式遍尽快收尾退出（用户点了停止按钮）。"""
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止复盘", "callback_data": "stopan:"}]]}
     from . import api_client
     if not analyzer.available():
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
@@ -1866,18 +1946,25 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
                     lines.append(f"⬜ {n}. {name}")
             return "\n".join(lines)
 
-        msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]))
+        msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]), stop_kb)
         for ev in analyzer.review_blind_stream(csv_str, meta["home"],
                                                meta["away"], meta["league"],
                                                effort):
+            if cancel is not None and cancel.is_set():
+                if msg_a:
+                    edit_text(chat_id, msg_a,
+                              blind_title + "\n\n🛑 已按你的要求停止复盘。", _NO_KB)
+                else:
+                    send(chat_id, "🛑 已停止复盘。")
+                return
             if ev[0] == "stage":
                 if msg_a:
-                    edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]))
+                    edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]), stop_kb)
             elif ev[0] == "done":
                 forecast = ev[1]
             elif ev[0] == "error":
                 if msg_a:
-                    edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}")
+                    edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}", _NO_KB)
                 else:
                     send(chat_id, f"❌ 盲推失败：{ev[1]}")
                 return
@@ -1885,7 +1972,8 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
             send(chat_id, "❌ 盲推未产出预判，复盘中止。")
             return
         if msg_a:
-            edit_text(chat_id, msg_a, blind_title + "\n\n✅ 盲推完成，预判如下：")
+            edit_text(chat_id, msg_a,
+                      blind_title + "\n\n✅ 盲推完成，预判如下：", _NO_KB)
         _send_long(chat_id, _md_to_tg("🔮 第一步·盲推预判\n\n" + forecast))
 
     # 只盲推：归档预判后结束，不跑对照
@@ -1917,6 +2005,11 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         # 成功用研判；失败回退原始数据（仍可供归因，只是未经方法论提炼）
         fund_brief = brief if ok else raw_funds
 
+    # 进第二遍前检查中断（盲推刚跑完、基本面预处理也可能耗时，先给一次退出机会）
+    if cancel is not None and cancel.is_set():
+        send(chat_id, "🛑 已停止复盘（盲推已完成，未继续对照）。")
+        return
+
     # ── 第二遍：揭晓比分，对照归因（6 步）──
     send(chat_id, "🎬 第二步【对照】：揭晓真实比分，对照盲推预判做归因复盘…")
     title = (f"⏳ 第二步·对照复盘 {meta['home']} vs {meta['away']}\n"
@@ -1935,19 +2028,26 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
                 lines.append(f"⬜ {n}. {name}")
         return "\n".join(lines)
 
-    msg_id = send(chat_id, progress_text(1))
+    msg_id = send(chat_id, progress_text(1), stop_kb)
     report = None
     for ev in analyzer.review_stream(csv_str, forecast, result_text,
                                      meta["home"], meta["away"], meta["league"],
                                      effort, fund_brief):
+        if cancel is not None and cancel.is_set():
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          title + "\n\n🛑 已按你的要求停止复盘。", _NO_KB)
+            else:
+                send(chat_id, "🛑 已停止复盘。")
+            return
         if ev[0] == "stage":
             if msg_id:
-                edit_text(chat_id, msg_id, progress_text(ev[1]))
+                edit_text(chat_id, msg_id, progress_text(ev[1]), stop_kb)
         elif ev[0] == "done":
             report = ev[1]
         elif ev[0] == "error":
             if msg_id:
-                edit_text(chat_id, msg_id, f"❌ 对照复盘失败：{ev[1]}")
+                edit_text(chat_id, msg_id, f"❌ 对照复盘失败：{ev[1]}", _NO_KB)
             else:
                 send(chat_id, f"❌ 对照复盘失败：{ev[1]}")
             return
@@ -1956,7 +2056,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         send(chat_id, "❌ 对照复盘未产出报告，请稍后重试。")
         return
     if msg_id:
-        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 6 步完成，复盘如下：")
+        edit_text(chat_id, msg_id, title + "\n\n✅ 全部 6 步完成，复盘如下：", _NO_KB)
     _send_long(chat_id, _md_to_tg(report))   # TG 纯文本；归档 full 仍用原始 md
     # 归档：盲推预判 + 对照复盘合并存一份
     full = ("# 第一步·盲推预判（不看比分）\n\n" + forecast
@@ -2196,12 +2296,18 @@ def handle_message(msg: dict) -> None:
             # 用户改发了别的命令，放弃自定义、按正常命令处理
             send(chat_id, "（已取消上一条自定义精算输入，改为执行新命令）")
         else:
-            send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
-            try:
-                _run_sop(chat_id, fid, extra_instruction=text, effort=eff)
-            except Exception:
-                log.exception("自定义 SOP 精算执行出错")
-                send(chat_id, "精算执行出错，请查看服务器日志。")
+            # 提交到独立分析池（不占 per-chat 执行器）——期间该 chat 仍可用其它命令
+            # 与「停止」按钮。同一 chat 已有分析在跑则拒绝。
+            busy = _analysis_busy(chat_id)
+            if busy:
+                send(chat_id, f"⚠️ 你已有一个{busy}任务在进行中，"
+                              f"请先点它下方「🛑 停止」或等它完成，再发起新的。")
+                return
+            ok = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid, text, eff)
+            if ok:
+                send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
+            else:
+                send(chat_id, "⚠️ 你已有一个分析任务在进行中，请先停止或等待。")
             return
 
     # 若该 chat 正在等待「场次号」输入（点了不带参数的命令后），优先消费这条
@@ -2406,6 +2512,17 @@ def handle_callback(cb: dict) -> None:
     message_id = msg.get("message_id")
     if not _authorized(chat_id):
         answer_callback(cb_id, "未授权")
+        return
+
+    # ── 停止精算/复盘（stopan:）──
+    # 该点击走 per-chat 执行器（快命令通道），不会被正在分析池里跑的任务阻塞，
+    # 故能即时置位 cancel 事件，让分析循环在下一块数据到达时收尾退出。
+    if data == "stopan:":
+        kind = _analysis_cancel(chat_id)
+        if kind:
+            answer_callback(cb_id, f"已请求停止{kind}，正在收尾…")
+        else:
+            answer_callback(cb_id, "当前没有进行中的分析任务")
         return
 
     # ── /fixtures 每场的「复盘/精算」直达按钮（访客可点，复用既有命令逻辑）──
@@ -2708,19 +2825,22 @@ def handle_callback(cb: dict) -> None:
             # 复盘：mode = rb(只盲推)/rc(只对照)/ra(两步全跑)
             sub_map = {"rb": "blind", "rc": "compare", "ra": "all"}
             sub_mode = sub_map.get(mode, "all")
-            answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…")
-            try:
-                _run_review(chat_id, fid, effort=eff, sub_mode=sub_mode)
-            except Exception:
-                log.exception("复盘执行出错")
-                send(chat_id, "复盘执行出错，请查看服务器日志。")
+            # 提交到独立分析池：期间该 chat 仍可用其它命令与「停止」按钮
+            if _analysis_busy(chat_id):
+                answer_callback(cb_id, "已有分析在跑，请先停止或等待")
+                return
+            ok = _submit_analysis(chat_id, "复盘", _run_review,
+                                  chat_id, fid, eff, sub_mode)
+            answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…" if ok
+                            else "已有分析在跑，请先停止或等待")
         else:
-            answer_callback(cb_id, f"强度：{eff_label}，已开始精算…")
-            try:
-                _run_sop(chat_id, fid, effort=eff)
-            except Exception:
-                log.exception("SOP 精算执行出错")
-                send(chat_id, "精算执行出错，请查看服务器日志。")
+            if _analysis_busy(chat_id):
+                answer_callback(cb_id, "已有分析在跑，请先停止或等待")
+                return
+            ok = _submit_analysis(chat_id, "精算", _run_sop,
+                                  chat_id, fid, "", eff)
+            answer_callback(cb_id, f"强度：{eff_label}，已开始精算…" if ok
+                            else "已有分析在跑，请先停止或等待")
         return
 
     # 配置类按钮（联赛/庄家开关、翻页、搜索添加）仅管理员可点
