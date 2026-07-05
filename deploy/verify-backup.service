@@ -1,0 +1,13 @@
+# 备份完整性抽查任务（由 verify-backup.timer 每周触发）
+# 失败（退出码非 0）会在 systemctl status / journalctl 里标红，便于发现坏备份。
+[Unit]
+Description=Weekly backup integrity check (download latest + test extract)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/odds-bot
+ExecStart=/usr/bin/env bash /home/ubuntu/odds-bot/deploy/verify-backup.sh
+# Environment=RCLONE_REMOTES=gdrive pikpak

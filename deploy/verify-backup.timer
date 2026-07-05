@@ -1,0 +1,17 @@
+# 每周抽查一次备份完整性 → 及早发现坏备份
+# 安装：
+#   sudo cp deploy/verify-backup.service /etc/systemd/system/
+#   sudo cp deploy/verify-backup.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now verify-backup.timer
+#
+# 触发时刻：每周日北京时间 05:00（在每日 04:00/04:30 备份完成之后，验最新那份）。
+[Unit]
+Description=Weekly backup integrity check
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target
