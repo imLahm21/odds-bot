@@ -83,62 +83,61 @@ def _submit_for_chat(chat_id: int, fn, *args) -> None:
 # 故把精算/复盘搬到这个独立池：per-chat 执行器只留给快命令 + 停止键，秒回；
 # 停止键点击能立即处理并去中断正在跑的分析。max_workers 限总并发，避免多人同时
 # 精算压垮 1C1G。
-_ANALYSIS_MAX_CONCURRENT = 4
+_ANALYSIS_MAX_CONCURRENT = 6      # 全局同时在跑的分析上限（保护 1C1G，超出则排队）
+_ANALYSIS_MAX_PER_CHAT = 3        # 单个 chat 同时在跑的分析上限（防单人开到失控）
 _analysis_pool = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_CONCURRENT,
                                     thread_name_prefix="analysis")
 
-# 进行中的分析任务：chat_id -> {"cancel": threading.Event, "kind": "精算"/"复盘"}。
-# 同一 chat 同时只允许一个分析任务（第二次触发会被拒，提示先停止或等待）。
+# 进行中的分析任务：task_id -> {"chat_id", "cancel": Event, "kind": "精算"/"复盘"}。
+# 按 task_id（非 chat_id）做键，故【同一 chat 可并行多个】分析/复盘；每个任务的
+# 停止按钮带自己的 task_id（stopan:<task_id>），点哪个停哪个、互不影响。
 # 停止键置位对应 Event，分析循环每收到一块流式数据就检查、置位则收尾退出。
-_analysis_tasks: dict[int, dict] = {}
+_analysis_tasks: dict[str, dict] = {}
 _analysis_lock = threading.Lock()
 
 # 清空内联键盘的常量（收尾时移除「停止」按钮）
 _NO_KB = {"inline_keyboard": []}
 
 
-def _analysis_busy(chat_id: int) -> str | None:
-    """该 chat 是否有进行中的分析任务；有则返回其类型（用于提示），否则 None。"""
-    with _analysis_lock:
-        t = _analysis_tasks.get(chat_id)
-        return t["kind"] if t else None
+def _analysis_count_for_chat(chat_id: int) -> int:
+    """该 chat 当前进行中的分析任务数（调用方须持 _analysis_lock）。"""
+    return sum(1 for t in _analysis_tasks.values() if t["chat_id"] == chat_id)
 
 
-def _analysis_cancel(chat_id: int) -> str | None:
-    """请求中断该 chat 的分析任务：置位其 cancel 事件。
-    返回被中断任务的类型（用于提示），无进行中任务返回 None。"""
+def _analysis_cancel(task_id: str) -> str | None:
+    """请求中断指定 task_id 的分析任务：置位其 cancel 事件。
+    返回被中断任务的类型（用于提示），无此任务返回 None。"""
     with _analysis_lock:
-        t = _analysis_tasks.get(chat_id)
+        t = _analysis_tasks.get(task_id)
         if not t:
             return None
         t["cancel"].set()
         return t["kind"]
 
 
-def _submit_analysis(chat_id: int, kind: str, fn, *args) -> bool:
+def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
     """把一个分析任务提交到独立分析池，并登记到中断注册表。
-    fn 的最后一个参数会追加为 cancel 事件（threading.Event）。
-    同一 chat 已有进行中的分析则拒绝，返回 False。"""
-    cancel = threading.Event()
+    fn 的末两个参数会追加为 (task_id, cancel 事件)。
+    返回新任务的 task_id；该 chat 并行数已达上限则返回 None（调用方据此提示）。"""
     with _analysis_lock:
-        if chat_id in _analysis_tasks:
-            return False
-        _analysis_tasks[chat_id] = {"cancel": cancel, "kind": kind}
+        if _analysis_count_for_chat(chat_id) >= _ANALYSIS_MAX_PER_CHAT:
+            return None
+        task_id = uuid.uuid4().hex[:10]
+        cancel = threading.Event()
+        _analysis_tasks[task_id] = {"chat_id": chat_id, "cancel": cancel,
+                                    "kind": kind}
 
     def _run() -> None:
         try:
-            fn(*args, cancel)
+            fn(*args, task_id, cancel)
         except Exception:
             log.exception("分析任务出错 chat=%s kind=%s", chat_id, kind)
         finally:
             with _analysis_lock:
-                # 仅当仍是本任务时才清（防用户停止后又快速发起新任务时误清新任务）
-                cur = _analysis_tasks.get(chat_id)
-                if cur is not None and cur["cancel"] is cancel:
-                    _analysis_tasks.pop(chat_id, None)
+                _analysis_tasks.pop(task_id, None)
 
     _analysis_pool.submit(_run)
-    return True
+    return task_id
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -1751,11 +1750,12 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
 
 
 def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
-             effort: str = "", cancel: "threading.Event | None" = None) -> None:
+             effort: str = "", task_id: str = "",
+             cancel: "threading.Event | None" = None) -> None:
     """第二步：真正跑 SOP 精算。
     extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
     effort 为推理强度（low/medium/high/xhigh），透传给 analyzer。
-    cancel 为中断事件：置位后流式循环尽快收尾退出（用户点了停止按钮）。
+    task_id/cancel：本任务的中断句柄——停止按钮带 task_id，置位 cancel 后循环收尾。
     """
     from . import fundamentals
     if not analyzer.available():
@@ -1804,7 +1804,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     total = analyzer._TOTAL_STAGES
     done_stages: list[str] = []
     stop_kb = {"inline_keyboard": [[
-        {"text": "🛑 停止精算", "callback_data": "stopan:"}]]}
+        {"text": "🛑 停止精算", "callback_data": f"stopan:{task_id}"}]]}
 
     def progress_text(cur_n: int | None, cur_name: str | None) -> str:
         lines = [title, ""]
@@ -1884,16 +1884,16 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
 
 
 def _run_review(chat_id: int, fid: int, effort: str = "",
-                sub_mode: str = "all",
+                sub_mode: str = "all", task_id: str = "",
                 cancel: "threading.Event | None" = None) -> None:
     """对已结束的比赛做复盘。sub_mode 三选一：
       "blind"   只跑第一步盲推（仅凭盘口正向跑 SOP 得预判）→ 归档 _review_blind.md
       "compare" 只跑第二步对照（从归档读盲推预判 + 揭晓比分做归因）→ 归档 _review.md
       "all"     两步全跑（盲推 + 对照，合并归档 _review.md）——默认
     effort 为推理强度，同时用于两遍。
-    cancel 为中断事件：置位后当前流式遍尽快收尾退出（用户点了停止按钮）。"""
+    task_id/cancel：本任务的中断句柄——停止按钮带 task_id，置位后当前流式遍收尾。"""
     stop_kb = {"inline_keyboard": [[
-        {"text": "🛑 停止复盘", "callback_data": "stopan:"}]]}
+        {"text": "🛑 停止复盘", "callback_data": f"stopan:{task_id}"}]]}
     from . import api_client
     if not analyzer.available():
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
@@ -2296,18 +2296,14 @@ def handle_message(msg: dict) -> None:
             # 用户改发了别的命令，放弃自定义、按正常命令处理
             send(chat_id, "（已取消上一条自定义精算输入，改为执行新命令）")
         else:
-            # 提交到独立分析池（不占 per-chat 执行器）——期间该 chat 仍可用其它命令
-            # 与「停止」按钮。同一 chat 已有分析在跑则拒绝。
-            busy = _analysis_busy(chat_id)
-            if busy:
-                send(chat_id, f"⚠️ 你已有一个{busy}任务在进行中，"
-                              f"请先点它下方「🛑 停止」或等它完成，再发起新的。")
-                return
-            ok = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid, text, eff)
-            if ok:
+            # 提交到独立分析池（不占 per-chat 执行器）——期间该 chat 仍可用其它命令、
+            # 停止按钮，且可再并行发起新的分析（受每 chat 上限约束）。
+            tid = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid, text, eff)
+            if tid:
                 send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
             else:
-                send(chat_id, "⚠️ 你已有一个分析任务在进行中，请先停止或等待。")
+                send(chat_id, f"⚠️ 你同时进行的分析已达上限"
+                              f"（{_ANALYSIS_MAX_PER_CHAT} 个），请先停止一个或等待。")
             return
 
     # 若该 chat 正在等待「场次号」输入（点了不带参数的命令后），优先消费这条
@@ -2514,15 +2510,17 @@ def handle_callback(cb: dict) -> None:
         answer_callback(cb_id, "未授权")
         return
 
-    # ── 停止精算/复盘（stopan:）──
+    # ── 停止精算/复盘（stopan:<task_id>）──
     # 该点击走 per-chat 执行器（快命令通道），不会被正在分析池里跑的任务阻塞，
-    # 故能即时置位 cancel 事件，让分析循环在下一块数据到达时收尾退出。
-    if data == "stopan:":
-        kind = _analysis_cancel(chat_id)
+    # 故能即时置位对应任务的 cancel 事件，让该分析循环在下一块数据到达时收尾退出。
+    # 带 task_id：同一 chat 并行多个分析时，点哪条进度的按钮就停哪条，互不影响。
+    if data.startswith("stopan:"):
+        task_id = data[len("stopan:"):]
+        kind = _analysis_cancel(task_id)
         if kind:
             answer_callback(cb_id, f"已请求停止{kind}，正在收尾…")
         else:
-            answer_callback(cb_id, "当前没有进行中的分析任务")
+            answer_callback(cb_id, "该任务已结束或不存在")
         return
 
     # ── /fixtures 每场的「复盘/精算」直达按钮（访客可点，复用既有命令逻辑）──
@@ -2825,22 +2823,16 @@ def handle_callback(cb: dict) -> None:
             # 复盘：mode = rb(只盲推)/rc(只对照)/ra(两步全跑)
             sub_map = {"rb": "blind", "rc": "compare", "ra": "all"}
             sub_mode = sub_map.get(mode, "all")
-            # 提交到独立分析池：期间该 chat 仍可用其它命令与「停止」按钮
-            if _analysis_busy(chat_id):
-                answer_callback(cb_id, "已有分析在跑，请先停止或等待")
-                return
-            ok = _submit_analysis(chat_id, "复盘", _run_review,
-                                  chat_id, fid, eff, sub_mode)
-            answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…" if ok
-                            else "已有分析在跑，请先停止或等待")
+            # 提交到独立分析池：期间该 chat 仍可用其它命令、停止按钮，也可再并行
+            tid = _submit_analysis(chat_id, "复盘", _run_review,
+                                   chat_id, fid, eff, sub_mode)
+            answer_callback(cb_id, f"强度：{eff_label}，已开始复盘…" if tid
+                            else f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），请先停止一个")
         else:
-            if _analysis_busy(chat_id):
-                answer_callback(cb_id, "已有分析在跑，请先停止或等待")
-                return
-            ok = _submit_analysis(chat_id, "精算", _run_sop,
-                                  chat_id, fid, "", eff)
-            answer_callback(cb_id, f"强度：{eff_label}，已开始精算…" if ok
-                            else "已有分析在跑，请先停止或等待")
+            tid = _submit_analysis(chat_id, "精算", _run_sop,
+                                   chat_id, fid, "", eff)
+            answer_callback(cb_id, f"强度：{eff_label}，已开始精算…" if tid
+                            else f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），请先停止一个")
         return
 
     # 配置类按钮（联赛/庄家开关、翻页、搜索添加）仅管理员可点
