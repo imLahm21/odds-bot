@@ -47,7 +47,8 @@ echo "[ok] MySQL 导出完成（$sql_size）"
 
 # ── 2. ghost-content volume（图片/主题）──────────────────────────────────────
 VOL_PATH="/var/lib/docker/volumes/${GHOST_VOLUME}/_data"
-if [ -d "$VOL_PATH" ]; then
+# 用 sudo 判存在：该目录属 root，普通用户 test -d 会误判为不存在。
+if sudo test -d "$VOL_PATH"; then
     # volume 属 root，用 sudo 打包；-C 让归档内路径干净
     sudo tar czf "$STAGE/ghost-content.tar.gz" -C "$VOL_PATH" .
     echo "[ok] content 目录已打包（$(sudo du -sh "$VOL_PATH" | cut -f1)）"
