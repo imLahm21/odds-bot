@@ -322,7 +322,8 @@ def _leagues_keyboard(page: int = 0) -> dict:
     buttons, line = [], []
     for lid, name, season, enabled in chunk:
         mark = "✅" if enabled else "⬜"
-        line.append({"text": f"{mark} {name}",
+        label = config.league_label(lid, name)   # 带中文对照，与 /fixtures 一致
+        line.append({"text": f"{mark} {label}",
                      "callback_data": f"tl:{lid}:{page}"})
         if len(line) >= config.TG_LEAGUES_PER_ROW:
             buttons.append(line)
