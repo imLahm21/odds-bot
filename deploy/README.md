@@ -19,6 +19,7 @@
 | `ghost-restore.sh` | Ghost 恢复：灌回 MySQL + 还原 content + 重启容器 |
 | `verify-backup.sh` | 备份完整性抽查：下载最新备份、试解压、校验关键文件 |
 | `verify-backup.service` / `.timer` | 每周日 05:00 自动抽查 |
+| `notify.sh` | TG 通知助手：三个备份脚本 source 它，成/败推管理员对话框（curl 直调 Telegram，读 .env 的 token+管理员 chat_id，独立于 bot 进程） |
 
 ## 极简速查
 
@@ -47,3 +48,13 @@ systemctl list-timers 'odds-backup.timer' 'ghost-backup.timer' 'verify-backup.ti
 - `RETAIN_DAYS`（默认 14）：保留天数
 - `REMOTE_DIR`：云盘目标文件夹（odds=`odds-bot-backups`，ghost=`ghost-backups`）
 - Ghost 专用：`GHOST_DIR` / `MYSQL_CONTAINER` / `GHOST_VOLUME`
+- `BACKUP_NOTIFY`（默认开，设 `0` 关）：备份成/败是否推 TG 管理员对话框
+
+## TG 备份通知
+
+三个备份脚本都会在结束时把结果推给管理员：成功推 ✅、失败推 ❌（verify 还会带上未通过的明细）。
+
+- 读项目 `.env` 的 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ADMIN_CHAT_IDS`（未配则回退 `TELEGRAM_ALLOWED_CHAT_IDS`）。
+- 用 `curl` 直调 Telegram，**独立于 bot 进程**——bot 没在跑也能收到。
+- 关掉：在 `.service` 里加 `Environment=BACKUP_NOTIFY=0`，或临时 `BACKUP_NOTIFY=0 bash deploy/backup.sh`。
+- 只推管理员，访客收不到。

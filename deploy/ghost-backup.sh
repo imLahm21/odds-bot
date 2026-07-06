@@ -28,6 +28,14 @@ RETAIN_DAYS="${RETAIN_DAYS:-14}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 STAGE="$(mktemp -d)"                       # 临时组装目录
 trap 'rm -rf "$STAGE"' EXIT
+
+# TG 通知：备份成/败推管理员对话框。放在 mktemp 的 EXIT 陷阱之后——notify_on_exit 会
+# 捕获并串联已有陷阱（先清理 $STAGE 再发通知），不覆盖清理逻辑。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/notify.sh
+source "$SCRIPT_DIR/notify.sh"
+notify_on_exit "Ghost 每日备份"
+
 mkdir -p "$LOCAL_KEEP_DIR"
 
 # ── 1. MySQL 一致快照（从容器内 dump，密码取自容器自己的环境变量）─────────────

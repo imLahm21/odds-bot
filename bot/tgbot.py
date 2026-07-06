@@ -305,6 +305,11 @@ def alert_admins(text: str, dedup_key: str | None = None) -> None:
         send(cid, text, plain=True)
 
 
+def clear_alert_dedup(dedup_key: str) -> None:
+    """清掉某告警去重键，使同类告警当日可再次推送（如手动重置端点后）。"""
+    _alerted_on.pop(dedup_key, None)
+
+
 def send_document(chat_id: int, filename: str, content: bytes,
                   caption: str = "") -> None:
     """以文件形式发送（multipart 上传）。content 为文件字节。"""
@@ -2886,6 +2891,9 @@ def run_polling(stop_flag=lambda: False) -> None:
         log.error("未配置 TELEGRAM_BOT_TOKEN，bot 不启动")
         return
     log.info("Telegram bot 启动，白名单 %d 人", len(ALLOWED_CHAT_IDS))
+    # 注入 LLM 告警钩子：熔断打开/自动恢复时经 alert_admins 只推管理员（访客无感知）。
+    # 依赖注入而非 llm_client 直接 import tgbot，避免循环依赖。
+    llm_client.set_alert_hook(alert_admins, clear_alert_dedup)
     # 启动时打印实际读到的广播目标，便于排查 /publish 不弹通知按钮：
     # 若这里是 0 个，说明 .env 的 TELEGRAM_BROADCAST_TARGETS 没被读到（未配/格式错/未重启）。
     bt = config.TELEGRAM_BROADCAST_TARGETS

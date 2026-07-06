@@ -1,6 +1,7 @@
 # ===== 密钥与配置 (绝不上传) =====
 .env
 .env.*
+*.env
 auth.json
 *.pem
 *.key

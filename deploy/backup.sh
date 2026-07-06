@@ -14,6 +14,12 @@
 # 依赖：sqlite3、tar、rclone（且已配好下述各 remote）
 set -euo pipefail
 
+# TG 通知：备份成/败推管理员对话框（读 .env 的 token + 管理员 chat_id，独立于 bot 进程）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/notify.sh
+source "$SCRIPT_DIR/notify.sh"
+notify_on_exit "odds 每日备份"
+
 # ── 可调参数 ─────────────────────────────────────────────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-/home/ubuntu/odds-bot}"   # 项目根目录
 # 多云盘：空格分隔的 rclone remote 名，逐个上传（双保险，一个挂了还有另一个）。

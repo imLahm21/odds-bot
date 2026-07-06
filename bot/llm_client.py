@@ -36,6 +36,45 @@ load_dotenv()
 log = logging.getLogger("odds_bot.llm")
 
 
+# ─── 管理员告警钩子（依赖注入，避免 llm_client → tgbot 循环 import）──────────
+# tgbot 已 import llm_client；llm_client 不能反向 import tgbot。故这里留一个可注入
+# 的回调，由 tgbot 启动时调 set_alert_hook(alert_admins) 装上。未装（如探针/离线）
+# 时静默降级为只写日志。签名对齐 tgbot.alert_admins(text, dedup_key=None)。
+_alert_hook = None
+_alert_dedup_clear = None
+
+
+def set_alert_hook(fn, dedup_clear=None) -> None:
+    """注入管理员告警回调。
+    fn(text: str, dedup_key: str | None) -> None —— 发告警（当日按 dedup_key 去重）。
+    dedup_clear(dedup_key: str) -> None —— 可选，清掉某去重键（手动重置端点后调，
+    使再次熔断/恢复能重新告警）。"""
+    global _alert_hook, _alert_dedup_clear
+    _alert_hook = fn
+    _alert_dedup_clear = dedup_clear
+
+
+def _alert(text: str, dedup_key: str | None = None) -> None:
+    """向管理员告警（若已注入钩子），否则只记日志。绝不因告警失败影响主流程。"""
+    log.warning("LLM 告警: %s", text)
+    if _alert_hook is None:
+        return
+    try:
+        _alert_hook(text, dedup_key)
+    except Exception:
+        log.exception("LLM 告警钩子执行失败（忽略，不影响主流程）")
+
+
+def _clear_alert_dedup(dedup_key: str) -> None:
+    """清掉某告警去重键（若注入了 dedup_clear）。静默失败。"""
+    if _alert_dedup_clear is None:
+        return
+    try:
+        _alert_dedup_clear(dedup_key)
+    except Exception:
+        log.exception("清告警去重键失败（忽略）")
+
+
 # ─── 请求头清洗（从 analyzer 迁来，analyzer 改为 import 本函数）──────────────
 def clean_header_value(raw: str) -> str:
     """清洗将放进 HTTP 头的配置值。
@@ -220,8 +259,9 @@ class Breaker:
     故 TG 改阈值后立即对在途判定生效。用滚动计数窗口(deque)算错误率，
     非精确时间桶——1C1G 够用。计时用 time.monotonic()（不受系统时钟跳变影响）。"""
 
-    def __init__(self, idx: int) -> None:
+    def __init__(self, idx: int, label: str = "") -> None:
         self.idx = idx
+        self.label = label or f"端点{idx}"
         self._lock = threading.Lock()
         self.state = "CLOSED"
         self.consecutive = 0                 # 连续失败数（成功即清零）
@@ -244,7 +284,10 @@ class Breaker:
             return True   # HALF_OPEN：放行探测
 
     def record(self, ok: bool) -> None:
-        """喂一次调用结果，驱动状态迁移。"""
+        """喂一次调用结果，驱动状态迁移。
+        状态迁移在锁内决策、锁外发告警（Telegram HTTP 不可持锁调用）。"""
+        event = None            # 'open' | 'recover'，锁外据此告警
+        reason = ""
         with self._lock:
             self.window.append(bool(ok))
             if ok:
@@ -253,15 +296,32 @@ class Breaker:
                     self.half_ok += 1
                     if self.half_ok >= get_settings()["recovery_success_threshold"]:
                         self._close()
+                        event = "recover"
             else:
                 self.consecutive += 1
                 if self.state == "HALF_OPEN":
                     self._open()               # 半开期任一失败 → 立刻回 OPEN
+                    # 半开探测又失败：不算「新打开」，避免与首次 open 告警重复刷屏
                 elif self.state == "CLOSED":
                     st = get_settings()
-                    if (self.consecutive >= st["failure_threshold"]
-                            or self._rate_tripped(st)):
+                    if self.consecutive >= st["failure_threshold"]:
                         self._open()
+                        event = "open"
+                        reason = f"连续失败 {self.consecutive} 次"
+                    elif self._rate_tripped(st):
+                        self._open()
+                        event = "open"
+                        total = len(self.window)
+                        fails = sum(1 for x in self.window if not x)
+                        reason = f"错误率 {fails / total * 100:.0f}%（{fails}/{total}）"
+        if event == "open":
+            wait = int(get_settings()["recovery_wait_seconds"])
+            _alert(f"🔴 LLM 端点【{self.label}】已熔断（{reason}），暂停派发，"
+                   f"{wait}s 后自动半开探活。可在 TG 发 /llm 查看或手动重置。",
+                   dedup_key=f"llm_open_{self.idx}")
+        elif event == "recover":
+            _alert(f"✅ LLM 端点【{self.label}】已自动恢复（半开探测成功，熔断关闭），"
+                   f"重新纳入派发。", dedup_key=f"llm_recover_{self.idx}")
 
     def _rate_tripped(self, st: dict[str, float]) -> bool:
         total = len(self.window)
@@ -282,9 +342,13 @@ class Breaker:
         self.window.clear()
 
     def reset(self) -> None:
-        """管理员在 /llm 手动重置：强制回 CLOSED、清统计。"""
+        """管理员在 /llm 手动重置：强制回 CLOSED、清统计。手动重置不告警
+        （是管理员主动操作，无需再通知自己）。同时清 open/recover 的当日去重键，
+        使重置后若再次熔断/恢复能重新告警。"""
         with self._lock:
             self._close()
+        _clear_alert_dedup(f"llm_open_{self.idx}")
+        _clear_alert_dedup(f"llm_recover_{self.idx}")
 
     def stats(self) -> dict:
         """供 /llm 面板展示：状态/连续失败/错误率/距半开剩余秒。"""
@@ -301,7 +365,8 @@ class Breaker:
                     "half_ok": self.half_ok, "open_remain": remain}
 
 
-_breakers: list[Breaker] = [Breaker(i) for i in range(len(_ENDPOINTS))]
+_breakers: list[Breaker] = [Breaker(i, _ENDPOINTS[i]["label"])
+                            for i in range(len(_ENDPOINTS))]
 
 
 def breaker_stats() -> list[dict]:
