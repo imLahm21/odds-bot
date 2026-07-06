@@ -273,6 +273,207 @@ def distill_lesson(review_report: str, home: str, away: str,
     return out.strip(), True
 
 
+# ─── 实战教训「三写一改」归档：路由判断 + 结构化方案生成（重档 gpt-5.5）─────────
+# 这两步是重逻辑活（判归入哪个主题、写规则节、联动多处），一律走 .env 的重档
+# LLM_MODEL（gpt-5.5, high），不用 distill_lesson 的轻档 mini。落盘由 lesson_archive
+# 做确定性文件编辑，编号/插入位置由代码算，LLM 只产文本内容与路由建议。
+
+_LESSONS_DIR = os.path.join("rules", "实战教训")
+_lesson_route_cache: str | None = None
+
+
+def load_lesson_route_context() -> str:
+    """读『主题路由表』(reference_case_lessons.md) + 各 feedback_*.md 顶部触发条件，
+    拼成一段供 route_lesson 判归属的上下文。模块级缓存（规则库不常变）。"""
+    global _lesson_route_cache
+    if _lesson_route_cache is not None:
+        return _lesson_route_cache
+    import re
+    parts = []
+    overview = os.path.join(_LESSONS_DIR, "reference_case_lessons.md")
+    try:
+        with open(overview, encoding="utf-8") as f:
+            txt = f.read()
+        # 只取「主题路由表」段（到「## 通用防错清单」前），避免整篇塞进 prompt
+        m = re.search(r"## 主题路由表.*?(?=\n## )", txt, re.S)
+        if m:
+            parts.append("===== 主题路由表 =====\n" + m.group(0).strip())
+    except OSError:
+        pass
+    # 各主题文件顶部触发条件（frontmatter 后第一段 > 触发条件…）
+    try:
+        for name in sorted(os.listdir(_LESSONS_DIR)):
+            if not (name.startswith("feedback_") and name.endswith(".md")):
+                continue
+            slug = name[len("feedback_"):-len(".md")]
+            try:
+                with open(os.path.join(_LESSONS_DIR, name), encoding="utf-8") as f:
+                    body = f.read()
+            except OSError:
+                continue
+            trig = re.search(r"> \*\*触发条件\*\*：.*?(?=\n\n|\n## )", body, re.S)
+            head = trig.group(0).strip() if trig else ""
+            parts.append(f"----- slug={slug} ({name}) -----\n{head}")
+    except OSError:
+        pass
+    _lesson_route_cache = "\n\n".join(parts)
+    return _lesson_route_cache
+
+
+def route_lesson(review_report: str, home: str, away: str,
+                 league: str) -> tuple[dict | None, str | None]:
+    """判定新复盘教训应归入哪个 feedback_*.md 主题。重档 gpt-5.5。
+
+    返回 (dict, None) 成功 / (None, 原因) 失败——调用方据此降级为仅存数据卡。
+    dict: {recommended: slug, candidates: [slug...], reason: str,
+           need_new_topic: bool, new_topic_slug: str|None}
+    """
+    import json
+    import re as _re
+    if not available():
+        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+    if not review_report.strip():
+        return None, "复盘报告为空"
+    ctx = load_lesson_route_context()
+    system = (
+        "你是足球赔率教训库的归档路由器。下面给你【现有主题路由表 + 各主题触发条件】"
+        "和一份【赛后复盘报告】。判断这条新教训最该归入哪个现有主题文件（slug），"
+        "并给出 1~3 个候选（按贴合度排序）。只有当核心教训确实不属于任何现有主题时，"
+        "才置 need_new_topic=true 并起一个新 slug（小写+下划线，如 corner_flow）。\n"
+        "只输出一个 JSON 对象，不要 markdown 代码块、不要多余文字。字段：\n"
+        '  "recommended": 最贴合的现有主题 slug（need_new_topic=true 时置空串）；\n'
+        '  "candidates": slug 数组（1~3 个，recommended 排第一）；\n'
+        '  "reason": 一句话中文理由（≤60字）；\n'
+        '  "need_new_topic": 布尔；\n'
+        '  "new_topic_slug": 需新建时的 slug，否则 null。\n'
+        "硬规则：① slug 必须来自给定列表（除非 need_new_topic）；"
+        "② 优先归入现有主题，新建是例外；③ 只依据给定内容判断。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}（{league}）\n\n"
+        f"### 现有主题（路由表 + 触发条件）\n{ctx}\n\n"
+        f"### 赛后复盘报告\n{review_report}\n"
+    )
+    raw = _call_llm(system, user,
+                    effort=config.LLM_EFFORT_DEFAULT,
+                    model=config.LLM_MODEL,
+                    timeout=config.LLM_TIMEOUT,
+                    max_tokens=4000)
+    m = _re.search(r"\{.*\}", raw or "", _re.S)
+    if not m:
+        log.warning("教训路由未返回 JSON：%s", (raw or "")[:120])
+        return None, (raw or "LLM 无返回")[:200]
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None, "LLM 返回非合法 JSON"
+    cands = [str(s).strip() for s in (d.get("candidates") or []) if str(s).strip()]
+    rec = str(d.get("recommended", "")).strip()
+    need_new = bool(d.get("need_new_topic"))
+    if not cands and rec:
+        cands = [rec]
+    if not rec and cands:
+        rec = cands[0]
+    if not rec and not need_new:
+        return None, "LLM 未给出推荐主题"
+    return {
+        "recommended": rec,
+        "candidates": cands,
+        "reason": str(d.get("reason", "")).strip()[:80],
+        "need_new_topic": need_new,
+        "new_topic_slug": (str(d.get("new_topic_slug")).strip()
+                           if d.get("new_topic_slug") else None),
+    }, None
+
+
+def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
+                         topic_file_text: str, *, section_letter: str,
+                         is_new_topic: bool = False
+                         ) -> tuple[dict | None, str | None]:
+    """产出「三写一改」的结构化文本方案。重档 gpt-5.5。
+
+    编号（案例#、case_NN、字母节）由 lesson_archive 计算后回填占位符——这里只让
+    LLM 用给定的 section_letter 写内容。返回 (plan_dict, None) 或 (None, 原因)。
+    plan_dict 字段见下方 system prompt 说明。
+    """
+    import json
+    import re as _re
+    if not available():
+        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+    home, away = meta.get("home", ""), meta.get("away", "")
+    league = meta.get("league", "")
+    date = (meta.get("kick_cst") or "")[:10]
+    existing = ("（新建主题，无现有内容）" if is_new_topic
+                else topic_file_text)
+    system = (
+        "你是足球赔率教训库的归档编辑。把一份【赛后复盘报告】写成可直接并入教训库的"
+        "结构化材料。参考给定【目标主题文件现有内容】的写法（节标题、规则编号、"
+        "来源引用、检查项句式），保持风格一致。\n"
+        f"本次在该主题文件新增 **{section_letter} 节**（字母已定，直接用）。\n"
+        "只输出一个 JSON 对象，不要 markdown 代码块、不要多余文字。字段：\n"
+        '  "card_md": 数据卡全文（Markdown）。四段结构：# 案例（数据存档）：'
+        "[主队] [比分] [客队]（[日期] [赛事]）\\n\\n## 结果 / ## 关键信号 / "
+        "## 教训与规则 / ## 衍生规则。顶部第一行是引用行（指向主题文件该节 + 案例号"
+        "占位符 {CASE_NO}）；\n"
+        f'  "rule_section_md": 主题文件新增的「## {section_letter}. <标题>」整节，'
+        "首行为『> 来源：<对阵>（<日期> <赛事>）。<原判错误一句话>。存档："
+        "{CARD_LINK}。』，随后 2~4 条『**规则 "
+        f"{section_letter}1：…**』；若与既有节是姊妹场景可加一段『与 X 的区别』；\n"
+        '  "checklist_items": 字符串数组，每条形如 "- [ ] 触发条件？→ 应做动作"，'
+        f"对应新增规则；\n"
+        '  "index_row": {"teams":"主 比分 客","date":"YYYY-MM-DD","league":"赛事",'
+        '"result":"赛果一句话","topic_ref":"<主题缩写> ' + section_letter + '"}；\n'
+        '  "trigger_extension": 若本案扩展了主题触发边界，给一句话（会追加到主题文件'
+        "顶部触发条件与路由表）；否则 null；\n"
+        '  "related_case_append": 追加到主题文件『## 相关』末尾案例列表的一项文本。\n'
+        "硬规则：① 只依据复盘报告，不编造数据；② 全中文；③ 数据卡≤400字，突出可复用"
+        "规律；④ 占位符 {CASE_NO}/{CARD_LINK} 原样保留，不要自己编号或写文件名；"
+        "⑤ 若复盘预测正确，如实写成正确案例。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}（{league}）  日期：{date}\n"
+        f"## 目标主题：{topic_slug}（新增 {section_letter} 节）\n\n"
+        f"### 目标主题文件现有内容\n{existing}\n\n"
+        f"### 赛后复盘报告\n{review_report}\n"
+    )
+    raw = _call_llm(system, user,
+                    effort=config.LLM_EFFORT_DEFAULT,
+                    model=config.LLM_MODEL,
+                    timeout=config.LLM_TIMEOUT,
+                    max_tokens=8000)
+    m = _re.search(r"\{.*\}", raw or "", _re.S)
+    if not m:
+        log.warning("归档方案未返回 JSON：%s", (raw or "")[:120])
+        return None, (raw or "LLM 无返回")[:200]
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None, "LLM 返回非合法 JSON"
+    card = str(d.get("card_md", "")).strip()
+    sect = str(d.get("rule_section_md", "")).strip()
+    if not card or not sect:
+        return None, "LLM 返回缺 card_md / rule_section_md"
+    items = [str(x).strip() for x in (d.get("checklist_items") or [])
+             if str(x).strip()]
+    row = d.get("index_row") or {}
+    return {
+        "card_md": card,
+        "rule_section_md": sect,
+        "checklist_items": items,
+        "index_row": {
+            "teams": str(row.get("teams", f"{home} vs {away}")).strip(),
+            "date": str(row.get("date", date)).strip(),
+            "league": str(row.get("league", league)).strip(),
+            "result": str(row.get("result", "")).strip(),
+            "topic_ref": str(row.get("topic_ref",
+                                     f"{topic_slug} {section_letter}")).strip(),
+        },
+        "trigger_extension": (str(d.get("trigger_extension")).strip()
+                              if d.get("trigger_extension") else None),
+        "related_case_append": str(d.get("related_case_append", "")).strip(),
+    }, None
+
+
 def fan_fundamentals_brief(free_md: str, home: str, away: str,
                            league: str) -> str:
     """发布期：把报告免费正文里的球队近况/交锋/赛程改写成一段面向普通球迷的

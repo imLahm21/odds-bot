@@ -29,7 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
 
-from . import config, db, api_client, analyzer, llm_client, ghost_publish
+from . import (config, db, api_client, analyzer, llm_client, ghost_publish,
+               lesson_archive)
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -188,8 +189,13 @@ _pending_pub_title: dict[int, str] = {}
 _publish_lock = threading.Lock()
 
 # ─── /review 复盘后「可选归档为实战教训」的会话状态（仅管理员）──────────────────
-# 待归档态：token -> {"report", "meta"}。复盘完成后生成短 token，避免整篇报告塞进
-# callback_data。点「📚 归档为实战教训」(ls:<token>:go) 后据 token 取回蒸馏落盘。
+# 待归档态：token -> 承载「三写一改」向导的多步上下文，避免整篇报告塞进 callback_data：
+#   {"report", "meta",              # 第0步装载
+#    "route",                       # 第1步 route_lesson 结果
+#    "slug", "is_new", "letter",    # 选定主题后
+#    "plan", "changeset"}           # 第2步 compose 后
+# 向导：ls:<token>:go 触发第1步(路由)→ la:<token>:<slug> 选主题+产方案预览
+#      → lc:<token>:go 确认原子落盘 / lc:<token>:no 取消。
 _lesson_pending: dict[str, dict] = {}
 _lesson_lock = threading.Lock()
 # /lesson 独立命令的浏览态：chat_id -> {"date", "files"}。选日期(ld:)后置位，
@@ -1326,44 +1332,32 @@ def _load_blind_forecast(meta: dict, chat_id: int | None = None) -> str | None:
     return None
 
 
-# ─── 复盘 → 实战教训归档 ─────────────────────────────────────────────────────
+# ─── 复盘 → 实战教训归档（三写一改向导）──────────────────────────────────────
 _LESSONS_DIR = os.path.join("rules", "实战教训")
 
 
 def _next_case_path(meta: dict) -> str:
-    """为一张新的实战教训卡拼路径：rules/实战教训/<日期YYYYMMDD>_case_<编号>_<主>_vs_<客>.md
-    编号取目录里现有 case_NN 的最大值 +1（两位补零），与既有命名一致。"""
+    """降级用：只落一张孤立数据卡时的路径（三写一改失败时的回退）。
+    rules/实战教训/<日期YYYYMMDD>_case_<编号>_<主>_vs_<客>.md，case_NN 取目录最大 +1。"""
     import os
     import re
     date = (meta.get("kick_cst") or "")[:10].replace("-", "") or "00000000"
     teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
-    # 文件名安全化：去掉路径分隔与非常见字符（联赛队名可能含 / 等）
     teams = re.sub(r"[\\/:*?\"<>|]", "", teams)
-    mx = 0
-    try:
-        for name in os.listdir(_LESSONS_DIR):
-            m = re.search(r"_case_(\d+)_", name)
-            if m:
-                mx = max(mx, int(m.group(1)))
-    except OSError:
-        pass
-    return os.path.join(_LESSONS_DIR, f"{date}_case_{mx + 1:02d}_{teams}.md")
+    no = lesson_archive.next_data_card_no(_LESSONS_DIR)
+    return os.path.join(_LESSONS_DIR, f"{date}_case_{no:02d}_{teams}.md")
 
 
-def _archive_lesson(chat_id: int, message_id: int, token: str) -> None:
-    """把缓存的复盘报告蒸馏成实战教训卡并写入 rules/实战教训/。消费后清缓存。"""
+def _archive_degrade_card(chat_id: int, message_id: int, meta: dict,
+                          report: str, reason: str) -> None:
+    """降级路径：三写一改的 LLM 步骤失败时，仅蒸馏并落一张孤立数据卡，
+    明确提示未做联动，请手动补。绝不半套落盘 feedback/索引。"""
     import os
-    with _lesson_lock:
-        info = _lesson_pending.pop(token, None)
-    if not info:
-        edit_text(chat_id, message_id, "⏳ 会话已过期，复盘教训未归档。")
-        return
-    meta, report = info["meta"], info["report"]
-    edit_text(chat_id, message_id, "🧠 正在提炼实战教训…")
     card, ok = analyzer.distill_lesson(report, meta["home"], meta["away"],
-                                       meta["league"])
+                                       meta.get("league", ""))
     if not ok:
-        edit_text(chat_id, message_id, f"❌ 教训提炼失败：{card[:200]}")
+        edit_text(chat_id, message_id,
+                  f"❌ 归档失败：{reason}；且教训卡蒸馏也失败：{card[:150]}")
         return
     try:
         path = _next_case_path(meta)
@@ -1373,8 +1367,154 @@ def _archive_lesson(chat_id: int, message_id: int, token: str) -> None:
     except OSError as e:
         edit_text(chat_id, message_id, f"❌ 教训写入失败：{e}")
         return
-    _send_long(chat_id, "📚 实战教训卡：\n\n" + card)
-    edit_text(chat_id, message_id, f"✅ 已归档实战教训：{path}")
+    _send_long(chat_id, "📚 实战教训卡（仅数据卡，未联动规则库）：\n\n" + card)
+    edit_text(chat_id, message_id,
+              f"⚠️ {reason}\n已降级为仅存数据卡：{path}\n"
+              "未追加规则节/检查项/索引，请按 ARCHIVING_PROTOCOL 手动补三写一改。")
+
+
+def _lesson_topic_keyboard(token: str, route: dict) -> dict:
+    """第1步：据路由结果列候选主题按钮（推荐项标 ⭐），末行「➕ 新建主题」。
+    回调 la:<token>:<slug>；新建为 la:<token>:__new__。"""
+    rec = route.get("recommended", "")
+    rows = []
+    for slug in route.get("candidates", []):
+        label = ("⭐ " if slug == rec else "") + slug
+        rows.append([{"text": label, "callback_data": f"la:{token}:{slug}"}])
+    if route.get("need_new_topic") and route.get("new_topic_slug"):
+        rows.append([{"text": f"➕ 新建主题：{route['new_topic_slug']}",
+                      "callback_data": f"la:{token}:__new__"}])
+    else:
+        rows.append([{"text": "➕ 新建主题", "callback_data": f"la:{token}:__new__"}])
+    rows.append([{"text": "❌ 取消", "callback_data": f"lc:{token}:no"}])
+    return {"inline_keyboard": rows}
+
+
+def _lesson_step_route(chat_id: int, message_id: int, token: str) -> None:
+    """第1步：跑 route_lesson（gpt-5.5），列候选主题让管理员选。"""
+    with _lesson_lock:
+        info = _lesson_pending.get(token)
+    if not info:
+        edit_text(chat_id, message_id, "⏳ 会话已过期，请重新发起归档。")
+        return
+    meta, report = info["meta"], info["report"]
+    edit_text(chat_id, message_id, "🧭 正在判断归入哪个教训主题（gpt-5.5）…")
+    route, err = analyzer.route_lesson(report, meta["home"], meta["away"],
+                                       meta.get("league", ""))
+    if not route:
+        _archive_degrade_card(chat_id, message_id, meta, report,
+                              f"路由判断失败（{err}）")
+        with _lesson_lock:
+            _lesson_pending.pop(token, None)
+        return
+    with _lesson_lock:
+        if token in _lesson_pending:
+            _lesson_pending[token]["route"] = route
+    rec = route.get("recommended") or route.get("new_topic_slug") or "（无）"
+    edit_text(chat_id, message_id,
+              f"🧭 推荐归入：<b>{rec}</b>\n理由：{route.get('reason','')}\n\n"
+              "请选择最终归入的主题（或新建）：",
+              _lesson_topic_keyboard(token, route))
+
+
+def _lesson_step_compose(chat_id: int, message_id: int, token: str,
+                         slug_choice: str) -> None:
+    """第2步：管理员选定主题 → compose_archive_plan（gpt-5.5）+ 采番 → 发预览。"""
+    import os
+    with _lesson_lock:
+        info = _lesson_pending.get(token)
+    if not info:
+        edit_text(chat_id, message_id, "⏳ 会话已过期，请重新发起归档。")
+        return
+    meta, report = info["meta"], info["report"]
+    route = info.get("route", {})
+    is_new = (slug_choice == "__new__")
+    if is_new:
+        slug = route.get("new_topic_slug") or "new_topic"
+        topic_text = ""
+        letter = "A"
+    else:
+        slug = slug_choice
+        try:
+            with open(os.path.join(_LESSONS_DIR,
+                                   lesson_archive.slug_to_filename(slug)),
+                      encoding="utf-8") as f:
+                topic_text = f.read()
+        except OSError:
+            _archive_degrade_card(chat_id, message_id, meta, report,
+                                  f"主题文件不存在：{slug}")
+            with _lesson_lock:
+                _lesson_pending.pop(token, None)
+            return
+        letter = lesson_archive.next_section_letter(topic_text)
+    edit_text(chat_id, message_id,
+              f"🧠 正在为主题 <b>{slug}</b> 生成 {letter} 节归档方案（gpt-5.5）…")
+    plan, err = analyzer.compose_archive_plan(
+        report, meta, slug, topic_text,
+        section_letter=letter, is_new_topic=is_new)
+    if not plan:
+        _archive_degrade_card(chat_id, message_id, meta, report,
+                              f"归档方案生成失败（{err}）")
+        with _lesson_lock:
+            _lesson_pending.pop(token, None)
+        return
+    plan["_section_letter"] = letter
+    try:
+        cs = lesson_archive.build_changeset(plan, meta, slug,
+                                            is_new_topic=is_new)
+    except Exception as e:            # noqa: BLE001 采番/组装异常也降级
+        log.warning("changeset 组装失败: %s", e)
+        _archive_degrade_card(chat_id, message_id, meta, report,
+                              f"归档方案组装失败（{e}）")
+        with _lesson_lock:
+            _lesson_pending.pop(token, None)
+        return
+    with _lesson_lock:
+        if token in _lesson_pending:
+            _lesson_pending[token].update(
+                {"slug": slug, "is_new": is_new, "letter": letter,
+                 "plan": plan, "changeset": cs})
+    # 预览：改动摘要 + 数据卡全文 + 规则节
+    summary = "\n".join(cs["summary"])
+    _send_long(chat_id,
+               f"📋 归档预览（案例 #{cs['case_no']}，主题 {slug} {letter} 节）\n\n"
+               f"【改动清单】\n{summary}\n\n"
+               f"【数据卡】\n{plan['card_md']}\n\n"
+               f"【新增规则节】\n{plan['rule_section_md']}")
+    edit_text(chat_id, message_id,
+              "以上为将写入的内容预览。确认后原子落盘 4 处文件（不自动 git 提交，"
+              "你可事后 git diff 审阅再提交）。",
+              {"inline_keyboard": [[
+                  {"text": "✅ 确认落盘", "callback_data": f"lc:{token}:go"},
+                  {"text": "❌ 取消", "callback_data": f"lc:{token}:no"},
+              ]]})
+
+
+def _lesson_step_apply(chat_id: int, message_id: int, token: str) -> None:
+    """第3步：原子落盘 + 自检。"""
+    with _lesson_lock:
+        info = _lesson_pending.pop(token, None)
+    if not info or "changeset" not in info:
+        edit_text(chat_id, message_id, "⏳ 会话已过期，请重新发起归档。")
+        return
+    cs, slug = info["changeset"], info["slug"]
+    edit_text(chat_id, message_id, "💾 正在原子落盘…")
+    try:
+        lesson_archive.apply_changeset(cs)
+    except Exception as e:            # noqa: BLE001
+        log.warning("原子落盘失败: %s", e)
+        edit_text(chat_id, message_id,
+                  f"❌ 落盘失败（原文件未改动）：{e}")
+        return
+    problems = lesson_archive.run_self_check(cs, slug)
+    files = "\n".join(f"  • {p}" for p in cs["files"])
+    chk = ("✅ 自检通过" if not problems
+           else "⚠️ 自检发现问题：\n" + "\n".join(f"  • {p}" for p in problems))
+    edit_text(chat_id, message_id,
+              f"✅ 已归档实战教训（案例 #{cs['case_no']}）\n\n"
+              f"落盘文件：\n{files}\n\n{chk}\n\n"
+              "提示：改动未提交 git，请 <code>git diff rules/实战教训/</code> "
+              "审阅后手动 commit。")
 
 
 def _lesson_date_keyboard() -> dict | None:
@@ -1433,7 +1573,8 @@ def _cmd_lesson(chat_id: int) -> None:
 
 
 def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
-    """读一份已归档的复盘报告 → 蒸馏成教训卡 → 写入 rules/实战教训/。供 /lesson 用。"""
+    """独立 /lesson 入口：读一份历史复盘报告 → 装载上下文 → 进三写一改向导第1步。
+    （与 /review 后按钮汇流到同一向导。）"""
     import os
     import re
     try:
@@ -1451,22 +1592,10 @@ def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
     meta = {"home": home.replace("_", " ") or "主队",
             "away": away.replace("_", " ") or "客队",
             "league": "", "kick_cst": date_dir if m else ""}
-    edit_text(chat_id, message_id, "🧠 正在提炼实战教训…")
-    card, ok = analyzer.distill_lesson(report, meta["home"], meta["away"],
-                                       meta["league"])
-    if not ok:
-        edit_text(chat_id, message_id, f"❌ 教训提炼失败：{card[:200]}")
-        return
-    try:
-        out_path = _next_case_path(meta)
-        os.makedirs(_LESSONS_DIR, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(card)
-    except OSError as e:
-        edit_text(chat_id, message_id, f"❌ 教训写入失败：{e}")
-        return
-    _send_long(chat_id, "📚 实战教训卡：\n\n" + card)
-    edit_text(chat_id, message_id, f"✅ 已归档实战教训：{out_path}")
+    token = uuid.uuid4().hex[:12]
+    with _lesson_lock:
+        _lesson_pending[token] = {"report": report, "meta": meta}
+    _lesson_step_route(chat_id, message_id, token)
 
 
 def _publish_date_keyboard(page: int = 0) -> dict | None:
@@ -2579,7 +2708,9 @@ def handle_callback(cb: dict) -> None:
         return
 
     # ── 复盘后归档实战教训（ls:<token>:go|no，仅管理员）──
-    if data.startswith("ls:"):
+    # 归档向导的 ls: 是三段式 ls:<token>:go/no；/llm 面板的 ls:<key> 是两段式，
+    # 按段数区分，两段式放行给后面的 /llm 面板 handler 处理。
+    if data.startswith("ls:") and data.count(":") == 2:
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可归档教训")
             return
@@ -2594,8 +2725,42 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "已跳过")
             edit_text(chat_id, message_id, "已跳过，未归档实战教训。")
             return
-        answer_callback(cb_id, "归档中…")
-        _archive_lesson(chat_id, message_id, token)
+        answer_callback(cb_id, "判断归属中…")
+        _lesson_step_route(chat_id, message_id, token)   # 进三写一改向导第1步
+        return
+
+    # ── 三写一改向导：la:<token>:<slug> 选主题+产方案预览 ──
+    if data.startswith("la:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可归档教训")
+            return
+        try:
+            _, token, slug_choice = data.split(":", 2)
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        answer_callback(cb_id, "生成方案中…")
+        _lesson_step_compose(chat_id, message_id, token, slug_choice)
+        return
+
+    # ── 三写一改向导：lc:<token>:go 确认落盘 / :no 取消 ──
+    if data.startswith("lc:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可归档教训")
+            return
+        try:
+            _, token, action = data.split(":")
+        except ValueError:
+            answer_callback(cb_id, "参数错误")
+            return
+        if action == "no":
+            with _lesson_lock:
+                _lesson_pending.pop(token, None)
+            answer_callback(cb_id, "已取消")
+            edit_text(chat_id, message_id, "已取消，未落盘。")
+            return
+        answer_callback(cb_id, "落盘中…")
+        _lesson_step_apply(chat_id, message_id, token)
         return
 
     # ── /lesson 独立命令：选日期(ld:)→选复盘报告(lf:)→蒸馏归档（仅管理员）──
