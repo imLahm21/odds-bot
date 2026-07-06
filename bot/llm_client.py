@@ -93,29 +93,51 @@ def clean_header_value(raw: str) -> str:
 
 
 # ─── 端点池（.env 解析，进程启动一次）───────────────────────────────────────
+def _parse_model_map(spec: str) -> dict:
+    """解析端点第 4 段「重模型:轻模型」→ {"heavy": ..., "light": ...}。
+      - 空/缺省 → {}（该端点不映射，两档都用全局默认）
+      - "gpt-5.5:gpt-5-codex" → 重档映射 gpt-5.5、轻档映射 gpt-5-codex
+      - "gpt-5.5"（无冒号）→ 只映射重档，轻档不变（{"heavy": "gpt-5.5"}）
+      - ":gpt-5-codex"（重档留空）→ 只映射轻档
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return {}
+    heavy, _, light = spec.partition(":")
+    m: dict = {}
+    heavy, light = heavy.strip(), light.strip()
+    if heavy:
+        m["heavy"] = heavy
+    if light:
+        m["light"] = light
+    return m
+
+
 def _parse_endpoints() -> list[dict]:
     """主端点 = LLM_BASE_URL/LLM_API_KEY（0 号，向后兼容）。
-    追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条 `key|base_url|标签`：
+    追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条 `key|base_url|标签|重模型:轻模型`：
       - base_url 省略 → 复用主端点 URL（用户「通常同一 base_url」的场景）
       - 标签省略 → 自动编号「端点N」
-    按 (key, base_url) 去重，避免同一端点被重复探测/统计。
+      - 第 4 段（模型映射）省略 → 不映射，两档都用全局默认（向后兼容）
+    条数不限（想加几条加几条）。按 (key, base_url) 去重，避免同一端点被重复探测/统计。
     """
     main_url = clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
     main_key = clean_header_value(os.getenv("LLM_API_KEY", ""))
     eps: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    def _add(key: str, url: str, label: str) -> None:
+    def _add(key: str, url: str, label: str, model_map: dict) -> None:
         if not (key and url):
             return
         sig = (key, url)
         if sig in seen:
             return
         seen.add(sig)
-        eps.append({"key": key, "base_url": url, "label": label})
+        eps.append({"key": key, "base_url": url, "label": label,
+                    "model_map": model_map})
 
     if main_url and main_key:
-        _add(main_key, main_url, "主端点")
+        _add(main_key, main_url, "主端点", {})   # 主端点默认不映射
 
     raw = os.getenv("LLM_ENDPOINTS", "")
     for item in re.split(r"[,\n]", raw):
@@ -127,7 +149,8 @@ def _parse_endpoints() -> list[dict]:
         url = (clean_header_value(parts[1]).rstrip("/")
                if len(parts) > 1 and parts[1] else main_url)
         label = parts[2] if len(parts) > 2 and parts[2] else f"端点{len(eps) + 1}"
-        _add(key, url, label)
+        model_map = _parse_model_map(parts[3]) if len(parts) > 3 else {}
+        _add(key, url, label, model_map)
     return eps
 
 
@@ -140,14 +163,38 @@ def _sig(ep: dict) -> str:
     return f"{ep['label']}|{ep['base_url']}"
 
 
+# 轻档逻辑模型名集合（走地/基本面/SEO 都用同名 gpt-5.4-mini，用 set 兼容将来分化）
+_LIGHT_MODELS = {config.LLM_LIVE_MODEL, config.FUND_ANALYZE_MODEL}
+
+
+def _resolve_model(logical: str, ep: dict) -> str:
+    """把调用方传的【逻辑模型名】按该端点的映射翻译成【真实模型名】。
+      - 端点无映射（无第 4 段）→ 原样返回 logical。
+      - logical == config.LLM_MODEL（重档）→ 用映射 heavy（无则原样）。
+      - logical ∈ 轻档集合 → 用映射 light（无则原样）。
+      - 其它（调用方显式传了别的模型）→ 原样返回，稳妥兜底。
+    例：Anyrouter 映射 {heavy:gpt-5.5, light:gpt-5-codex}，
+        _resolve_model("gpt-5.4-mini", anyrouter) == "gpt-5-codex"。
+    """
+    mm = ep.get("model_map") or {}
+    if not mm:
+        return logical
+    if logical == config.LLM_MODEL:
+        return mm.get("heavy", logical)
+    if logical in _LIGHT_MODELS:
+        return mm.get("light", logical)
+    return logical
+
+
 def available() -> bool:
     """至少有一个可用端点（key + base_url 齐全）。"""
     return bool(_ENDPOINTS)
 
 
 def endpoints() -> list[dict]:
-    """只读端点列表（label/base_url，不含 key）供 TG 面板展示。"""
-    return [{"label": e["label"], "base_url": e["base_url"]} for e in _ENDPOINTS]
+    """只读端点列表（label/base_url/model_map，不含 key）供 TG 面板展示。"""
+    return [{"label": e["label"], "base_url": e["base_url"],
+             "model_map": e.get("model_map") or {}} for e in _ENDPOINTS]
 
 
 # ─── 端点手动开关（DB 懒加载，TG 改后 reload_endpoint_state 失效）────────────
@@ -475,8 +522,8 @@ def chat(system: str, user: str, effort: str = "",
     st = get_settings()
     read_to = int(timeout or st["non_stream_timeout"])
     max_retries = int(st["max_retries"])
-    payload = _payload(model or config.LLM_MODEL, system, user,
-                       max_tokens or config.LLM_MAX_TOKENS, effort, False)
+    logical = model or config.LLM_MODEL        # 逻辑模型名，选到端点后按映射翻译
+    tok = max_tokens or config.LLM_MAX_TOKENS
 
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
@@ -490,6 +537,9 @@ def chat(system: str, user: str, effort: str = "",
             labeled.append(f"{ep['label']}熔断跳过")
             all_timeout = False
             continue
+        # 每端点按映射翻译模型名再构造 payload（Anyrouter 轻档→gpt-5-codex 等）
+        payload = _payload(_resolve_model(logical, ep), system, user,
+                           tok, effort, False)
         content, ok, err, was_to = _do_chat(ep, payload, read_to, max_retries)
         br.record(ok)
         if ok:
@@ -625,8 +675,6 @@ def stream_chat(system: str, user: str, effort: str = ""):
     st = get_settings()
     first_byte_to = int(st["stream_first_byte_timeout"])
     idle_to = int(st["stream_idle_timeout"])
-    payload = _payload(config.LLM_MODEL, system, user, config.LLM_MAX_TOKENS,
-                       effort, True)
 
     last_err = None
     disabled = _get_disabled()
@@ -637,6 +685,9 @@ def stream_chat(system: str, user: str, effort: str = ""):
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
             continue
+        # 主 SOP 走重档；每端点按映射翻译（Anyrouter 兜底跑 gpt-5.5）
+        payload = _payload(_resolve_model(config.LLM_MODEL, ep), system, user,
+                           config.LLM_MAX_TOKENS, effort, True)
         produced = False        # 是否已向用户吐过正文 delta
         failed_pre = False      # 首字节前失败 → 可切下一端点
         for ev in _stream_one(ep, payload, first_byte_to, idle_to):
@@ -665,19 +716,29 @@ def stream_chat(system: str, user: str, effort: str = ""):
 
 
 # ─── 连通性探针（最小 chat 请求；不计入 Breaker 统计）───────────────────────
-def probe(idx: int) -> dict:
+def probe(idx: int, which: str = "heavy") -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
-    返回 {ok, http_status, latency_ms, model, error, breaker_state}。
+    which='heavy' 测重档逻辑模型（config.LLM_MODEL，如 gpt-5.5），'light' 测轻档
+    （config.LLM_LIVE_MODEL，如 gpt-5.4-mini）；都经该端点映射翻译成真实模型名
+    （Anyrouter 测重→gpt-5.5、测轻→gpt-5-codex）。
+    返回 {ok, http_status, latency_ms, model, req_model, which, error, breaker_state}。
     max_tokens 用 16（而非 1）：部分推理模型对过小预算会 400，16 既够连通判定又极廉价。
     纯诊断——不喂 Breaker，避免健康检查污染故障转移的错误率。
+
+    ⚠️ 假通判定：不再「HTTP 200 就算通」。要求 200 且返回体解析出 choices（有正文或
+    有效结构）才判 ✅。200 但无 choices（如网关回错误体/无该模型权限/base_url 缺 /v1）
+    → ok=False，标「200 但无补全内容」，让 Anyrouter 那种 53ms 假通当场露馅。
     """
     if not (0 <= idx < len(_ENDPOINTS)):
         return {"ok": False, "http_status": None, "latency_ms": 0,
-                "model": "", "error": "端点序号越界", "breaker_state": "-"}
+                "model": "", "req_model": "", "which": which,
+                "error": "端点序号越界", "breaker_state": "-"}
     ep = _ENDPOINTS[idx]
+    logical = config.LLM_LIVE_MODEL if which == "light" else config.LLM_MODEL
+    req_model = _resolve_model(logical, ep)
     st = get_settings()
     probe_to = min(30, int(st["non_stream_timeout"]))   # 探针用短超时，不等满
-    payload = {"model": config.LLM_MODEL,
+    payload = {"model": req_model,
                "messages": [{"role": "user", "content": "ping"}],
                "max_tokens": 16}
     bstate = _breakers[idx].state
@@ -689,35 +750,46 @@ def probe(idx: int) -> dict:
     except requests.exceptions.Timeout:
         return {"ok": False, "http_status": None,
                 "latency_ms": int((monotonic() - t0) * 1000),
-                "model": "", "error": f"超时（>{probe_to}s）", "breaker_state": bstate}
+                "model": "", "req_model": req_model, "which": which,
+                "error": f"超时（>{probe_to}s）", "breaker_state": bstate}
     except requests.exceptions.RequestException as e:
         return {"ok": False, "http_status": None,
                 "latency_ms": int((monotonic() - t0) * 1000),
-                "model": "", "error": str(e)[:120], "breaker_state": bstate}
+                "model": "", "req_model": req_model, "which": which,
+                "error": str(e)[:120], "breaker_state": bstate}
     latency = int((monotonic() - t0) * 1000)
     model = ""
     err = ""
+    ok = False
     try:
         data = r.json()
-        if r.status_code == 200:
-            model = (data.get("model")
-                     or data.get("choices", [{}])[0].get("message", {})
-                        .get("content", ""))[:40]
-        else:
-            err = str(data.get("error", data))[:150]
     except ValueError:
-        if r.status_code != 200:
+        data = None
+    if r.status_code == 200:
+        # 假通拆穿：200 必须真有 choices 结构才算通
+        choices = (data or {}).get("choices") if isinstance(data, dict) else None
+        if choices:
+            ok = True
+            model = str((data.get("model") or req_model))[:40]  # 回显真实响应模型名
+        else:
+            body = (str(data)[:150] if data is not None else r.text[:150])
+            err = (f"HTTP 200 但无补全内容（疑似假通：检查 base_url 是否缺 /v1、"
+                   f"或该端点无 {req_model} 权限）：{body}")
+    else:
+        if isinstance(data, dict):
+            err = str(data.get("error", data))[:150]
+        else:
             err = r.text[:150]
-    return {"ok": r.status_code == 200, "http_status": r.status_code,
-            "latency_ms": latency, "model": model, "error": err,
-            "breaker_state": bstate}
+    return {"ok": ok, "http_status": r.status_code,
+            "latency_ms": latency, "model": model, "req_model": req_model,
+            "which": which, "error": err, "breaker_state": bstate}
 
 
-def probe_all() -> list[dict]:
-    """对全部端点依次探针，返回每条结果（含 label）。"""
+def probe_all(which: str = "heavy") -> list[dict]:
+    """对全部端点依次探针，返回每条结果（含 label）。which 透传给 probe。"""
     out = []
     for i in range(len(_ENDPOINTS)):
-        res = probe(i)
+        res = probe(i, which)
         res["label"] = _ENDPOINTS[i]["label"]
         out.append(res)
     return out

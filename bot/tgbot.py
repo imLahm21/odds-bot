@@ -2116,10 +2116,22 @@ def _llm_panel_text() -> str:
             extra = f"，已成功 {st['half_ok']}"
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
+        # 模型映射（第4段）：有则显示「重→X 轻→Y」，无则标「默认模型」
+        mm = ep.get("model_map") or {}
+        if mm:
+            parts = []
+            if mm.get("heavy"):
+                parts.append(f"重→{mm['heavy']}")
+            if mm.get("light"):
+                parts.append(f"轻→{mm['light']}")
+            mm_line = "　映射：" + " ".join(parts)
+        else:
+            mm_line = "　映射：默认（重 gpt-5.5 / 轻 gpt-5.4-mini）"
         lines.append(
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
-            f"   连续失败 {st['consecutive']} · 错误率 {rate}")
+            f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
+            f"  {mm_line}")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():
@@ -2136,16 +2148,21 @@ def _llm_panel_keyboard() -> dict:
     stats = llm_client.breaker_stats()
     rows: list[list[dict]] = []
 
-    # 测试区：全部测试 + 逐端点一行（测试 / 开关 / 熔断时重置）
-    rows.append([{"text": "🧪 全部测试连通性", "callback_data": "lt:all"}])
+    # 测试区：全部测试分重/轻/两者三档（lt:all:<which>）+ 逐端点一行（测试重档 / 开关 / 熔断时重置）
+    rows.append([
+        {"text": "🧪 测全部·重", "callback_data": "lt:all:heavy"},
+        {"text": "🧪 测全部·轻", "callback_data": "lt:all:light"},
+        {"text": "🧪 两者", "callback_data": "lt:all:both"},
+    ])
     for i, st in enumerate(stats):
         on = llm_client.is_enabled(i)
         # 开关按钮沿用 /leagues、/bookmakers 的约定：✅/⬜ 显示【当前状态】，
         # 点击即翻转（le:<idx>:<目标状态 1开/0关>）。不用「启用/停用」动词，
         # 避免与状态文字里的「🟢启用/⚪停用」语义打架（那是状态，这是动作）。
+        # 逐端点「测试」默认测重档 gpt-5.5（测轻/两者用上面的「测全部」系列）。
         mark = "✅" if on else "⬜"
         ep_row: list[dict] = [
-            {"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}"},
+            {"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}:heavy"},
             {"text": f"{mark} 端点{i}", "callback_data": f"le:{i}:{0 if on else 1}"},
         ]
         if st["state"] in ("OPEN", "HALF_OPEN"):
@@ -2180,32 +2197,50 @@ def _llm_refresh(chat_id: int, message_id: int) -> None:
     edit_text(chat_id, message_id, _llm_panel_text(), _llm_panel_keyboard())
 
 
-def _llm_run_probe(chat_id: int, message_id: int, target: str) -> None:
+_WHICH_ZH = {"heavy": "重", "light": "轻"}
+
+
+def _fmt_probe_line(r: dict) -> str:
+    """单条探针结果 → 展示行。含档位(重/轻) + 请求的真实模型名，假通用 ❗ 与 ❌ 区分。"""
+    tier = _WHICH_ZH.get(r.get("which", "heavy"), "")
+    req = r.get("req_model", "")
+    label = f"{r['label']} {tier} {req}".strip()
+    if r["ok"]:
+        model = f" · 应答 {r['model']}" if r.get("model") else ""
+        return f"✅ {label}：HTTP {r['http_status']} · {r['latency_ms']}ms{model}"
+    status = r["http_status"] if r["http_status"] is not None else "无响应"
+    err = f" · {r['error']}" if r.get("error") else ""
+    # HTTP 200 却失败 = 假通（无补全内容），用 ❗ 与「真断」的 ❌ 区分，更醒目
+    icon = "❗" if r.get("http_status") == 200 else "❌"
+    return f"{icon} {label}：{status} · {r['latency_ms']}ms{err}"
+
+
+def _llm_run_probe(chat_id: int, message_id: int, target: str,
+                   which: str = "heavy") -> None:
     """执行连通性探针（可能数秒，跑在 chat 专属线程池里）。
-    target='all' 测全部，否则测单个端点序号。测完把结果拼进面板顶部并重绘。"""
+    target='all' 测全部，否则测单个端点序号。which=heavy/light/both。
+    both 对每端点各测重、轻两次；测完把结果拼进面板顶部并重绘。"""
+    whiches = ["heavy", "light"] if which == "both" else [which]
     try:
-        if target == "all":
-            results = llm_client.probe_all()
-        else:
-            idx = int(target)
-            res = llm_client.probe(idx)
-            res["label"] = (llm_client.endpoints()[idx]["label"]
-                            if 0 <= idx < len(llm_client.endpoints()) else f"端点{idx}")
-            results = [res]
+        results: list[dict] = []
+        for w in whiches:
+            if target == "all":
+                results.extend(llm_client.probe_all(w))
+            else:
+                idx = int(target)
+                res = llm_client.probe(idx, w)
+                res["label"] = (llm_client.endpoints()[idx]["label"]
+                                if 0 <= idx < len(llm_client.endpoints())
+                                else f"端点{idx}")
+                results.append(res)
     except (ValueError, IndexError):
         send(chat_id, "端点序号错误。")
         return
 
-    lines = ["<b>🧪 连通性测试结果</b>"]
-    for r in results:
-        if r["ok"]:
-            model = f" · {r['model']}" if r.get("model") else ""
-            lines.append(f"✅ {r['label']}：HTTP {r['http_status']} · "
-                         f"{r['latency_ms']}ms{model}")
-        else:
-            status = r["http_status"] if r["http_status"] is not None else "无响应"
-            err = f" · {r['error']}" if r.get("error") else ""
-            lines.append(f"❌ {r['label']}：{status} · {r['latency_ms']}ms{err}")
+    title = {"heavy": "重档 gpt-5.5", "light": "轻档",
+             "both": "重档+轻档"}.get(which, which)
+    lines = [f"<b>🧪 连通性测试结果（{title}）</b>"]
+    lines += [_fmt_probe_line(r) for r in results]
     lines.append("")
     lines.append(_llm_panel_text())
     edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
@@ -2648,9 +2683,16 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "仅管理员可操作")
             return
         if data.startswith("lt:"):
-            # 连通性测试可能数秒 → 丢该 chat 专属线程池，不阻塞轮询
+            # lt:<target>:<which>，target=all 或端点序号，which=heavy/light/both。
+            # 缺 which 段兼容旧格式（默认 heavy）。连通性测试可能数秒 → 丢该 chat
+            # 专属线程池，不阻塞轮询（both 会发 2N 个请求，更该异步）。
+            rest = data[3:].split(":")
+            target = rest[0]
+            which = rest[1] if len(rest) > 1 and rest[1] in (
+                "heavy", "light", "both") else "heavy"
             answer_callback(cb_id, "测试中…")
-            _submit_for_chat(chat_id, _llm_run_probe, chat_id, message_id, data[3:])
+            _submit_for_chat(chat_id, _llm_run_probe, chat_id, message_id,
+                             target, which)
             return
         if data.startswith("lr:"):
             try:

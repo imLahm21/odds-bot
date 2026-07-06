@@ -264,6 +264,9 @@ CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
 # IKuncode（OpenAI 兼容），从 .env 读：
 #   LLM_BASE_URL=https://api.ikuncode.cc/v1
 #   LLM_API_KEY=sk-xxx
+# LLM_MODEL 是【重档逻辑模型】：主 SOP 精算（流式）用它。llm_client 的端点级模型映射
+# 按「传入模型名 == LLM_MODEL」判定这是重档，翻译成该端点的真实模型名（见 _resolve_model）。
+# 例：Anyrouter 端点映射 gpt-5.5:gpt-5-codex → 重档仍 gpt-5.5、轻档换 gpt-5-codex。
 LLM_MODEL = "gpt-5.5"
 LLM_TIMEOUT = 300             # 秒，gpt-5.5 high 推理 + 长报告，给足超时
 LLM_MAX_TOKENS = 32000        # 报告输出上限。gpt-5.5 是推理模型，先消耗大量
@@ -329,7 +332,10 @@ LLM_SETTING_SPECS: dict[str, dict] = {
 # gpt-5.5(推理模型)先烧大量 reasoning token 再出正文，单次可能几十秒~1min+，会拖住
 # 下一轮抓取。故走地单独用轻量模型 + 最低推理档 + 短超时 + 小输出（研判仅 3~5 句）。
 # 赛前 7 步精算继续用上面的 LLM_MODEL=gpt-5.5 high 不变。
-LLM_LIVE_MODEL = "gpt-5.4-mini"   # 走地轻量模型
+# LLM_LIVE_MODEL / FUND_ANALYZE_MODEL 是【轻档逻辑模型】：走地/基本面/SEO 用它们。
+# llm_client 按「传入模型名 ∈ 轻档集合」判定为轻档，翻译成该端点的真实模型名。
+# 若某端点没有 gpt-5.4-mini（如 Anyrouter），在 .env 端点第4段写映射 …:gpt-5-codex 即可。
+LLM_LIVE_MODEL = "gpt-5.4-mini"   # 走地轻量模型（轻档逻辑模型）
 LLM_LIVE_EFFORT = "low"           # 走地推理强度（最低档，求快）
 LLM_LIVE_TIMEOUT = 30             # 走地超时（秒）：超过即跳过研判，不阻塞盘口快报
 LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 mini 的少量推理 + 3~5 句正文

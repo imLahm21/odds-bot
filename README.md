@@ -215,10 +215,20 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 LLM_BASE_URL=https://api.ikuncode.cc/v1
 LLM_API_KEY=你的LLM密钥
 # 可选：多端点故障转移。主端点=上面的 LLM_BASE_URL/LLM_API_KEY；这里追加备用，
-# 逗号或换行分隔，每条 key|base_url|标签（base_url 省略则复用主端点 URL）。
-# 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复。
-# 管理员在 TG 发 /llm 可测各端点连通性/延迟，并实时改重试/超时/熔断参数（免重启）。
-LLM_ENDPOINTS=sk-备用1|,sk-备用2|https://api.other.com/v1|备用商
+# 逗号或换行分隔、条数不限（想加几条加几条，/llm 面板按端点数自动展示）。
+# 每条格式：key|base_url|标签|重模型:轻模型
+#   - base_url 省略 → 复用主端点 URL
+#   - 标签省略 → 自动编号「端点N」
+#   - 第4段「重模型:轻模型」省略 → 不映射，两档都用默认（重 gpt-5.5 / 轻 gpt-5.4-mini）
+# 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复；熔断/恢复会 TG 告警管理员。
+# 管理员发 /llm 可测各端点连通性/延迟（可选测重/轻/两者），并实时改重试/超时/熔断参数（免重启）。
+#
+# 模型映射用途：某端点没有你默认的模型时，在第4段声明它支持的名字。
+#   例：Anyrouter 只有 gpt-5.5 和 gpt-5-codex（没有 gpt-5.4-mini），就写：
+#   LLM_ENDPOINTS=sk-anyrouter|https://anyrouter.top/v1|Anyrouter|gpt-5.5:gpt-5-codex
+#   → 这条上重档仍用 gpt-5.5、轻档(走地/基本面/SEO)自动换成 gpt-5-codex。
+# ⚠️ base_url 记得带 /v1（漏了会「HTTP200 假通」——测试延迟极低、无应答模型名即是此症）。
+LLM_ENDPOINTS=sk-anyrouter|https://anyrouter.top/v1|Anyrouter|gpt-5.5:gpt-5-codex
 EOF
 ```
 

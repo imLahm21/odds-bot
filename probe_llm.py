@@ -104,8 +104,9 @@ def probe_full():
     print(report[:2000])
 
 
-def probe_pool():
+def probe_pool(which: str = "heavy"):
     """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 9 参数。
+    which='heavy' 测重档(gpt-5.5)，'light' 测轻档(gpt-5.4-mini/映射)。
     需先 init_db（读 llm_settings）；未 init 时 llm_client 回退 config 默认。"""
     from bot import llm_client, db
     try:
@@ -116,7 +117,9 @@ def probe_pool():
     eps = llm_client.endpoints()
     print(f"解析到 {len(eps)} 个端点：")
     for i, ep in enumerate(eps):
-        print(f"  [{i}] {ep['label']} → {ep['base_url']}")
+        mm = ep.get("model_map") or {}
+        mm_s = f"  映射 重→{mm.get('heavy','默认')} 轻→{mm.get('light','默认')}" if mm else "  （无映射，用默认模型）"
+        print(f"  [{i}] {ep['label']} → {ep['base_url']}{mm_s}")
     if not eps:
         sys.exit("未配置任何端点（.env 缺 LLM_BASE_URL / LLM_API_KEY）")
 
@@ -124,15 +127,18 @@ def probe_pool():
     for k, v in llm_client.get_settings().items():
         print(f"  {k:<28} = {v}")
 
-    print("\n逐端点连通性探针（最小 chat 请求）：")
+    tier = "轻档" if which == "light" else "重档"
+    print(f"\n逐端点连通性探针（{tier}，最小 chat 请求）：")
     print("=" * 60)
-    for r in llm_client.probe_all():
+    for r in llm_client.probe_all(which):
+        req = r.get("req_model", "")
         if r["ok"]:
-            print(f"  ✅ [{r['label']}] HTTP {r['http_status']} · "
-                  f"{r['latency_ms']}ms · {r.get('model', '')}")
+            print(f"  ✅ [{r['label']}] {req} · HTTP {r['http_status']} · "
+                  f"{r['latency_ms']}ms · 应答 {r.get('model', '')}")
         else:
             status = r["http_status"] if r["http_status"] is not None else "无响应"
-            print(f"  ❌ [{r['label']}] {status} · {r['latency_ms']}ms · "
+            icon = "❗" if r.get("http_status") == 200 else "❌"   # 200 假通 vs 真断
+            print(f"  {icon} [{r['label']}] {req} · {status} · {r['latency_ms']}ms · "
                   f"{r.get('error', '')}")
 
     print("\n各端点熔断器初始态：")
@@ -148,6 +154,8 @@ if __name__ == "__main__":
     elif arg == "effort":
         probe_effort()
     elif arg == "pool":
-        probe_pool()
+        # python probe_llm.py pool [heavy|light]，默认 heavy(测 gpt-5.5)
+        w = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] in ("heavy", "light") else "heavy"
+        probe_pool(w)
     else:
         probe_minimal()
