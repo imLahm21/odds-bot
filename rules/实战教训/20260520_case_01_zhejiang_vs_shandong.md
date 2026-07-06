@@ -1,6 +1,6 @@
 # 案例 18（数据存档）：浙江 4-1 山东泰山（2026-05-20 中超）
 
-> 数据存档卡。完整论证见 [reference_case_lessons.md](reference_case_lessons.md) **第十三~十五章**；速查见 [feedback_lure_variants.md](feedback_lure_variants.md)、[feedback_kelly_signals.md](feedback_kelly_signals.md)、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md)。
+> 数据存档卡。完整论证见 [feedback_lure_variants.md](feedback_lure_variants.md) C 节（浅盘升盘诱上）、[feedback_kelly_signals.md](feedback_kelly_signals.md) C 节（浅盘凯利失真）、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) A/B 节（中超主场反弹）。案例索引见 [reference_case_lessons.md](reference_case_lessons.md) 案例 18。
 
 ## 结果
 
@@ -30,4 +30,4 @@
 
 ## 衍生规则
 
-第十三章（浅盘升盘诱上）、第十四章（浅盘凯利失真）、第十五章（中超主场反弹潜力）。
+[feedback_lure_variants.md](feedback_lure_variants.md) C 节（浅盘升盘诱上）、[feedback_kelly_signals.md](feedback_kelly_signals.md) C 节（浅盘凯利失真）、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) A/B 节（中超主场反弹潜力）。

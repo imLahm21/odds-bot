@@ -1,6 +1,6 @@
 # 案例 20（数据存档）：Bournemouth 1:1 Manchester City（2026-05-20 英超第 37 轮）
 
-> 数据存档卡。六条教训摘要见 [reference_cases.md](reference_cases.md) **案例 20** 条目（冠军压力客场保平、平局赔率关键信号、本赛季状态优先、升盘回降结合平局赔率、碾压级基本面须对手崩溃、客凯利压制结合平局凯利）。
+> 数据存档卡。六条教训（冠军压力客场保平、平局赔率关键信号、本赛季状态优先、升盘回降结合平局赔率、碾压级基本面须对手崩溃、客凯利压制结合平局凯利）分见 [feedback_fundamentals_weight.md](feedback_fundamentals_weight.md) D 节、[feedback_kelly_signals.md](feedback_kelly_signals.md) G 节、[feedback_lure_variants.md](feedback_lure_variants.md) D 节、[feedback_h2h_weight.md](feedback_h2h_weight.md) E 节。案例索引见 [reference_case_lessons.md](reference_case_lessons.md) 案例 20。
 
 ## 结果
 

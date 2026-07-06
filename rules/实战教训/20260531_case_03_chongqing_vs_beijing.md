@@ -1,6 +1,6 @@
 # 案例（数据存档）：重庆铜梁龙 2-3 北京国安（2026-05-30 中超第 15 轮）
 
-> 数据存档卡。完整论证见 [reference_case_lessons.md](reference_case_lessons.md) **第二十二~二十三章**；速查见 [feedback_kelly_signals.md](feedback_kelly_signals.md)、[feedback_late_stage_shift.md](feedback_late_stage_shift.md)、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md)。
+> 数据存档卡。完整论证见 [feedback_kelly_signals.md](feedback_kelly_signals.md) F 节（Pinnacle 双重极端）、[feedback_late_stage_shift.md](feedback_late_stage_shift.md) C/D 节（剧烈降盘验凯利、分层诱导陷阱）、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) D 节（排名差+主场不败权重上限）。案例索引见 [reference_case_lessons.md](reference_case_lessons.md) 案例 24。
 
 ## 结果
 
@@ -42,4 +42,4 @@
 
 ## 衍生规则
 
-第二十二章（Pinnacle 双重极端 + 临场末端剧烈降盘 + 分层诱导）、第二十三章（中超主场不败质量 + 进攻低迷权重修正）。
+[feedback_kelly_signals.md](feedback_kelly_signals.md) F 节（Pinnacle 双重极端）、[feedback_late_stage_shift.md](feedback_late_stage_shift.md) C/D 节（临场末端剧烈降盘 + 分层诱导）、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) D 节（中超主场不败质量 + 进攻低迷权重修正）。

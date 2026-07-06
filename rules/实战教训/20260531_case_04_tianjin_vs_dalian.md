@@ -1,6 +1,6 @@
 # 案例（数据存档）：天津津门虎 1-0 大连英博（2026-05-31 中超第 15 轮）
 
-> 数据存档卡。完整论证见 [reference_case_lessons.md](reference_case_lessons.md) **第二十四章**；速查见 [feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) D 段。
+> 数据存档卡。完整论证见 [feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) E 节（保级死战动力 > 双重极端信号），关联 [feedback_kelly_signals.md](feedback_kelly_signals.md) F 节（其例外场景）。案例索引见 [reference_case_lessons.md](reference_case_lessons.md) 案例 25。
 
 ## 结果
 
@@ -30,4 +30,4 @@
 
 ## 衍生规则
 
-第二十四章（保级死战动力 > 双重极端信号）。
+[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) E 节（保级死战动力 > 双重极端信号）。
