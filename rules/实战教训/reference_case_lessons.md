@@ -24,7 +24,7 @@
 | 7 | 有 H2H 交锋数据，或两队积分差 ≤3 分 | [feedback_h2h_weight.md](feedback_h2h_weight.md) | 平局率 ≥60% 强制进首选；H2H 权重随本赛季实力差双向调整（35% ↔ 20%） |
 | 8 | 有近 10 场近况数据 | [feedback_home_away_quality.md](feedback_home_away_quality.md) | 近况按对手质量分级；主场输强队≠崩溃；客场优于主场须验证稳定性 |
 | 9 | 基本面与盘口矛盾 / 基本面一边倒（疑似碾压）/ 战意动力差异（保级、争冠、德比、疲态） | [feedback_fundamentals_weight.md](feedback_fundamentals_weight.md) | 矛盾时盘口 80%；碾压级五要素过滤诱上；冠军压力客场=保平争胜 |
-| 10 | 强队让 -1.5 及以上深盘 / 世界杯及杯赛强弱对话 | [feedback_strong_team_deep.md](feedback_strong_team_deep.md) | 深盘降赔式诱上不可过滤；高平赔冷平保权重；受让方 +1 赢盘可直接升级为反胜 |
+| 10 | 强队让 -1.5 及以上深盘 / 热门浅让（-0.5）拒绝加深 / 世界杯及杯赛强弱对话 / 多家客胜凯利偏低 | [feedback_strong_team_deep.md](feedback_strong_team_deep.md) | 深盘降赔式诱上不可过滤；高平赔冷平保权重；受让方 +1 赢盘可直接升级为反胜；浅让不升盘+客胜低凯利=受让方不败优先 |
 
 > 典型加载量：一场常规联赛命中 4~6 个文件；触发条件不满足的文件不读。
 
@@ -68,12 +68,16 @@
 | 23 | 河南 0-2 浙江 | 2026-05-30 | 中超 | 下盘客队赢球赢盘 | late_stage B；kelly E；csl C；h2h B | [20260530_case_05_henan_vs_zhejiang.md](20260530_case_05_henan_vs_zhejiang.md) |
 | 24 | 重庆铜梁龙 2-3 北京国安 | 2026-05-30 | 中超 | 客队赢球赢盘 | kelly F；late_stage C/D；csl D | [20260531_case_03_chongqing_vs_beijing.md](20260531_case_03_chongqing_vs_beijing.md) |
 | 25 | 天津津门虎 1-0 大连英博 | 2026-05-31 | 中超 | 主队赢球赢盘 | csl E（kelly F 的例外） | [20260531_case_04_tianjin_vs_dalian.md](20260531_case_04_tianjin_vs_dalian.md) |
+| 26 | Brazil 1-2 Norway | 2026-07-06 | 世界杯 | 客胜，受让方 +0.5 赢盘 | strong_team_deep C | [20260706_case_06_brazil_vs_norway.md](20260706_case_06_brazil_vs_norway.md) |
 
 > 表中主题缩写对应文件：sync_pricing=[feedback_sync_pricing.md](feedback_sync_pricing.md)、lure_variants=[feedback_lure_variants.md](feedback_lure_variants.md)、late_stage=[feedback_late_stage_shift.md](feedback_late_stage_shift.md)、kelly=[feedback_kelly_signals.md](feedback_kelly_signals.md)、csl=[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md)、h2h=[feedback_h2h_weight.md](feedback_h2h_weight.md)、home_away=[feedback_home_away_quality.md](feedback_home_away_quality.md)、fundamentals=[feedback_fundamentals_weight.md](feedback_fundamentals_weight.md)、heat_direction=[feedback_heat_direction.md](feedback_heat_direction.md)、strong_team_deep=[feedback_strong_team_deep.md](feedback_strong_team_deep.md)
 
 ## 新教训的归档规则
 
+> **机器人自动归档**：完整可执行步骤见 [ARCHIVING_PROTOCOL.md](ARCHIVING_PROTOCOL.md)（前置编号 → 路由 → 三写一改 → 自检 → 提交）。下列为要点摘录。
+
 1. 新复盘教训**先找可归入的现有主题文件**，在对应节内追加规则（含来源案例、错误判断、阈值表格），并更新其「本主题检查项」
 2. 无法归入现有主题时才新建 `feedback_<主题>.md`，并在本文件「主题路由表」加一行触发条件
-3. 有原始盘口数据需存档时，新建 `20260xxx_case_xx_<对阵>.md` 数据卡，并在「案例索引」末尾追加一行
+3. 有原始盘口数据需存档时，新建 `20260xxx_case_xx_<对阵>.md` 数据卡，并在「案例索引」末尾追加一行；**案例号与 case_xx 号是两套独立序列，分别取当前最大值 +1**
 4. 全场通用、不依赖场景触发的检查项，才可加入本文件「通用防错清单」
+5. 若扩展了某主题的**触发边界**，须同步更新该主题文件顶部「触发条件」与本文件「主题路由表」对应行（两处都改）
