@@ -665,9 +665,12 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int):
     yield ("done", acc.strip())
 
 
-def stream_chat(system: str, user: str, effort: str = ""):
+def stream_chat(system: str, user: str, effort: str = "",
+                model: str = "", max_tokens: int = 0):
     """流式调用，只在【首字节前】跨端点故障转移。yield 与旧 _stream_llm 完全一致：
     ('delta', 累积全文) / ('done', 全文) / ('error', 串)。
+    model/max_tokens 非默认时覆盖（基本面预处理传轻档 gpt-5.4-mini + 较小预算，
+    使其也能流式跑、令停止按钮低延迟生效）；未传则原样用重档 gpt-5.5 + 全局预算。
     """
     if not available():
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
@@ -675,6 +678,8 @@ def stream_chat(system: str, user: str, effort: str = ""):
     st = get_settings()
     first_byte_to = int(st["stream_first_byte_timeout"])
     idle_to = int(st["stream_idle_timeout"])
+    logical = model or config.LLM_MODEL        # 逻辑模型名，选到端点后按映射翻译
+    tok = max_tokens or config.LLM_MAX_TOKENS
 
     last_err = None
     disabled = _get_disabled()
@@ -685,9 +690,9 @@ def stream_chat(system: str, user: str, effort: str = ""):
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
             continue
-        # 主 SOP 走重档；每端点按映射翻译（Anyrouter 兜底跑 gpt-5.5）
-        payload = _payload(_resolve_model(config.LLM_MODEL, ep), system, user,
-                           config.LLM_MAX_TOKENS, effort, True)
+        # 主 SOP 走重档、基本面走轻档；每端点按映射翻译（Anyrouter 兜底翻译真实模型名）
+        payload = _payload(_resolve_model(logical, ep), system, user,
+                           tok, effort, True)
         produced = False        # 是否已向用户吐过正文 delta
         failed_pre = False      # 首字节前失败 → 可切下一端点
         for ev in _stream_one(ep, payload, first_byte_to, idle_to):

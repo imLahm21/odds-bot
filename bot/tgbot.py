@@ -77,6 +77,27 @@ def _submit_for_chat(chat_id: int, fn, *args) -> None:
     pool.submit(_run)
 
 
+# ─── 通用后台池：给「重但无需中断」的内联操作用（命令最高优先级的关键）──────────
+# 命令/停止键走 per-chat 单线程执行器（秒回）。但若在那里直接跑耗时的内联 LLM/网络
+# 活（/llm 连通性测试、教训归档的 gpt-5.5 路由/编排、/publish 的 SEO+Ghost 发文、
+# 群广播），会占死该 chat 的唯一工作线程——分析期间用户发的命令、点的停止键全排在
+# 后面，这正是「推算时命令无响应」的根因之一。故把这些重内联活丢到本多线程池异步跑，
+# per-chat 工作线程点完即回，命令与停止/新建始终即时响应，且能与正在跑的分析并行。
+# daemon 线程随进程退出；max_workers 限并发，避免多人同时触发压垮 1C1G。
+_bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
+
+
+def _submit_bg(fn, *args) -> None:
+    """把一个重内联操作丢到通用后台池异步执行（不阻塞 per-chat 工作线程）。"""
+    def _run() -> None:
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("后台任务出错: %s", getattr(fn, "__name__", fn))
+
+    _bg_pool.submit(_run)
+
+
 # ─── 精算/复盘：独立分析线程池 + 可中断任务注册表 ────────────────────────────
 # 关键：/analyze、/review 是最耗时的操作（LLM 1~3 分钟，复盘两遍可达 6 分钟）。
 # 若它们跑在 per-chat 执行器里，会占死该 chat 的唯一工作线程——同一用户在分析
@@ -1819,12 +1840,14 @@ def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
 
 
 def _cmd_analyze(chat_id: int, args: list[str]) -> None:
-    """第一步：展示某场基本面 + 盘口走势预览，附【开始SOP精算】按钮。
+    """第一步：展示盘口走势预览，附【基本面预分析 / 预设精算 / 自定义侧重】按钮。
 
-    拆分为两步——本命令只读库/拉基本面做展示，不跑 LLM；
-    用户点按钮（callback az:<fid>）才真正跑 SOP（见 _run_sop）。
+    只读库做展示（秒回），不拉基本面、不跑任何 LLM——否则会占死该 chat 的
+    per-chat 工作线程，导致分析期间其它命令与停止键无响应。基本面预分析改为
+    「可选」：用户点 🧠 按钮才拉基本面 + 轻量模型预处理（提交到分析池、带停止键、
+    可与精算并行）；直接点 🎯/✍️ 则跳过预分析进入 SOP（主 SOP 本就会自行读原始
+    基本面，跳过预分析不影响精算质量，只是少一份给人看的预览）。
     """
-    from . import fundamentals
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/analyze &lt;fixture_id&gt;（id 见 /fixtures）")
         return
@@ -1842,45 +1865,98 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     # 只发头部说明（队名/联赛/开球），不再逐节点罗列盘口大表——太冗长；
     # 完整盘口数据仍照常喂给 SOP 精算，展示精简不影响预测。
     send(chat_id, f"{meta['header']}\n"
-                  f"已获取 {meta['nodes']} 个节点的盘口走势。正在拉取基本面…",
-         plain=False)
+                  f"已获取 {meta['nodes']} 个节点的盘口走势。", plain=False)
 
-    # 基本面（读库 + 调 API，失败不阻断）
+    if not analyzer.available():
+        send(chat_id, "⚠️ 未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
+                      "无法进行 SOP 精算预测，仅能查看上方数据。")
+        return
+    # 三个按钮：基本面预分析（可选、轻量模型）/ 预设精算 / 自定义侧重
+    kb = {"inline_keyboard": [
+        [{"text": "🧠 基本面预分析（可选）", "callback_data": f"afund:{fid}"}],
+        [{"text": "🎯 预设精算", "callback_data": f"az:{fid}"},
+         {"text": "✍️ 自定义侧重", "callback_data": f"ac:{fid}"}],
+    ]}
+    send(chat_id, "请选择下一步：\n"
+                  "🧠 基本面预分析 = 先用轻量模型把两队近况/交锋/赛程/积分榜"
+                  "分析成一份可读概述（可选、较慢，可随时停止；跑基本面时仍可发其它命令）；\n"
+                  "🎯 预设精算 = 跳过预分析，直接按标准 SOP 跑结果预测；\n"
+                  "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求"
+                  "（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
+                  "🎯/✍️ 选完后再选推理强度（低/中/高/超高）。\n"
+                  "（预分析不影响精算质量——主 SOP 本就会自行研判原始基本面）", kb)
+
+
+def _run_fundamentals(chat_id: int, fid: int,
+                      task_id: str = "",
+                      cancel: "threading.Event | None" = None) -> None:
+    """可选的【基本面预分析】：拉基本面 + 轻量模型流式预处理成可读概述。
+    提交到分析池执行——期间该 chat 仍可发命令、点停止键，也可与精算并行。
+    task_id/cancel：停止按钮（stopan:<task_id>）置位 cancel 后，在下一块流式数据收尾。
+    失败/未配置/无数据则回退展示原始基本面数据（不阻断后续精算）。
+    """
+    from . import fundamentals
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止基本面预分析", "callback_data": f"stopan:{task_id}"}]]}
+    msg_id = send(chat_id, "🧠 正在拉取基本面数据…", stop_kb)
+
+    # 基本面（读库 + 调 API，失败不阻断）。拉取前后各查一次中断。
+    if cancel is not None and cancel.is_set():
+        if msg_id:
+            edit_text(chat_id, msg_id, "🛑 已停止基本面预分析。", _NO_KB)
+        return
     try:
         conn = db.get_conn()
         try:
             funds = fundamentals.build_fundamentals(conn, fid)
+            meta = db.get_fixture_meta(conn, fid)
         finally:
             conn.close()
     except Exception as e:
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
+        meta = None
+    home = meta[4] if meta else "主队"
+    away = meta[5] if meta else "客队"
+    league = meta[2] if meta else ""
 
-    # 展示用轻量模型预处理后的「基本面概述」，而非罗列原始近况/交锋/赛程/积分榜长数据。
-    # 有数据才预处理；失败/未配置/无数据则回退展示原始 funds（analyze_fundamentals 内部保证）。
-    if funds and not funds.startswith("（基本面"):
-        send(chat_id, "🧠 正在分析基本面（轻量模型预处理）…")
-        fund_brief, ok = analyzer.analyze_fundamentals(
-            funds, meta["home"], meta["away"], meta["league"])
-        # 轻量模型输出常带 ### / ** 等 markdown 符号，TG 纯文本展示会露出，剥成干净文字
-        _send_long(chat_id, _md_to_tg("🧩 基本面\n" + fund_brief))
-    else:
-        _send_long(chat_id, _md_to_tg("🧩 基本面\n" + funds))
-
-    # 末条带「预设精算 / 自定义侧重」两个按钮
-    if not analyzer.available():
-        send(chat_id, "⚠️ 未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
-                      "无法进行 SOP 精算预测，仅能查看上方数据。")
+    if cancel is not None and cancel.is_set():
+        if msg_id:
+            edit_text(chat_id, msg_id, "🛑 已停止基本面预分析。", _NO_KB)
         return
-    kb = {"inline_keyboard": [[
-        {"text": "🎯 预设精算", "callback_data": f"az:{fid}"},
-        {"text": "✍️ 自定义侧重", "callback_data": f"ac:{fid}"},
-    ]]}
-    send(chat_id, "以上为该场的基本面与盘口数据。是否用 SOP 跑结果预测？\n"
-                  "🎯 预设精算 = 直接按标准 SOP 跑；\n"
-                  "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
-                  "选完后再选推理强度（低/中/高/超高）。\n"
-                  "（gpt-5.5 推理较慢，约 1~3 分钟；强度越高越慢）", kb)
+
+    # 无数据/拉取失败：直接回退展示原始文本，不跑轻量模型
+    if not funds or funds.startswith("（基本面"):
+        if msg_id:
+            edit_text(chat_id, msg_id, "🧩 基本面（原始数据）", _NO_KB)
+        _send_long(chat_id, _md_to_tg("🧩 基本面\n" + funds))
+        return
+
+    # 轻量模型流式预处理：每块检查中断，令停止键低延迟生效
+    if msg_id:
+        edit_text(chat_id, msg_id, "🧠 正在分析基本面（轻量模型预处理，可停止）…",
+                  stop_kb)
+    brief = None
+    for ev in analyzer.analyze_fundamentals_stream(funds, home, away, league):
+        if cancel is not None and cancel.is_set():
+            if msg_id:
+                edit_text(chat_id, msg_id, "🛑 已停止基本面预分析。", _NO_KB)
+            return
+        if ev[0] == "done":
+            brief = ev[1]
+        elif ev[0] == "error":
+            # 轻量模型失败：回退展示原始基本面数据（仍有参考价值，不阻断精算）
+            log.warning("基本面预分析失败，回退原始数据: %s", ev[1][:120])
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          "🧩 基本面（轻量模型预处理失败，展示原始数据）", _NO_KB)
+            _send_long(chat_id, _md_to_tg("🧩 基本面\n" + funds))
+            return
+
+    if msg_id:
+        edit_text(chat_id, msg_id, "🧩 基本面预分析完成：", _NO_KB)
+    # 轻量模型输出常带 ### / ** 等 markdown 符号，TG 纯文本展示会露出，剥成干净文字
+    _send_long(chat_id, _md_to_tg("🧩 基本面\n" + (brief or funds)))
 
 
 def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
@@ -2659,7 +2735,8 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
             edit_text(chat_id, message_id, "❌ 已取消发布。")
             return
         answer_callback(cb_id, "发布中…")
-        _publish_do(chat_id, message_id, token, vis)
+        # SEO 概括(LLM) + Ghost 发文(HTTP) 较慢，丢后台池，不占死该 chat 工作线程
+        _submit_bg(_publish_do, chat_id, message_id, token, vis)
         return
 
 
@@ -2726,7 +2803,8 @@ def handle_callback(cb: dict) -> None:
             edit_text(chat_id, message_id, "已跳过，未归档实战教训。")
             return
         answer_callback(cb_id, "判断归属中…")
-        _lesson_step_route(chat_id, message_id, token)   # 进三写一改向导第1步
+        # gpt-5.5 路由判断较慢，丢后台池，不占死该 chat 工作线程（命令仍即时响应）
+        _submit_bg(_lesson_step_route, chat_id, message_id, token)  # 三写一改向导第1步
         return
 
     # ── 三写一改向导：la:<token>:<slug> 选主题+产方案预览 ──
@@ -2740,7 +2818,8 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "参数错误")
             return
         answer_callback(cb_id, "生成方案中…")
-        _lesson_step_compose(chat_id, message_id, token, slug_choice)
+        # gpt-5.5 编排归档方案较慢，丢后台池，不占死该 chat 工作线程
+        _submit_bg(_lesson_step_compose, chat_id, message_id, token, slug_choice)
         return
 
     # ── 三写一改向导：lc:<token>:go 确认落盘 / :no 取消 ──
@@ -2760,7 +2839,8 @@ def handle_callback(cb: dict) -> None:
             edit_text(chat_id, message_id, "已取消，未落盘。")
             return
         answer_callback(cb_id, "落盘中…")
-        _lesson_step_apply(chat_id, message_id, token)
+        # 原子落盘 + 自检涉及多文件 IO，丢后台池，不占死该 chat 工作线程
+        _submit_bg(_lesson_step_apply, chat_id, message_id, token)
         return
 
     # ── /lesson 独立命令：选日期(ld:)→选复盘报告(lf:)→蒸馏归档（仅管理员）──
@@ -2793,7 +2873,8 @@ def handle_callback(cb: dict) -> None:
             return
         path = os.path.join("report", browse["date"], browse["files"][idx])
         answer_callback(cb_id, "归档中…")
-        _lesson_archive_from_file(chat_id, message_id, path)
+        # 读报告 + gpt-5.5 路由较慢，丢后台池，不占死该 chat 工作线程
+        _submit_bg(_lesson_archive_from_file, chat_id, message_id, path)
         return
 
     # ── /publish 发布到博客的回调（pdp:翻页/pd:选日期/pf:选报告/gt:/gv:，仅管理员）──
@@ -2823,7 +2904,8 @@ def handle_callback(cb: dict) -> None:
             return
         if action == "send":
             answer_callback(cb_id, "发送中…")
-            _broadcast_do(chat_id, message_id, token)
+            # 逐目标推送(多次 HTTP)，丢后台池，不占死该 chat 工作线程
+            _submit_bg(_broadcast_do, chat_id, message_id, token)
             return
         # 切换某目标的勾选状态
         with _publish_lock:
@@ -2856,8 +2938,9 @@ def handle_callback(cb: dict) -> None:
             which = rest[1] if len(rest) > 1 and rest[1] in (
                 "heavy", "light", "both") else "heavy"
             answer_callback(cb_id, "测试中…")
-            _submit_for_chat(chat_id, _llm_run_probe, chat_id, message_id,
-                             target, which)
+            # 丢通用后台池而非 per-chat 池：连通性测试数秒，不占死该 chat 的
+            # 唯一工作线程，测试期间命令/停止键仍即时响应。
+            _submit_bg(_llm_run_probe, chat_id, message_id, target, which)
             return
         if data.startswith("lr:"):
             try:
@@ -2964,6 +3047,21 @@ def handle_callback(cb: dict) -> None:
         else:
             edit_text(chat_id, message_id, "已全部退订，当前无走地订阅。")
             edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        return
+
+    # 基本面预分析按钮（可选）：提交到分析池，带停止键、可与精算并行、不阻塞命令。
+    if data.startswith("afund:"):
+        fid_str = data[len("afund:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        tid = _submit_analysis(chat_id, "基本面预分析", _run_fundamentals,
+                               chat_id, int(fid_str))
+        if tid:
+            answer_callback(cb_id, "开始基本面预分析…")
+        else:
+            answer_callback(cb_id,
+                            f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），请先停止一个")
         return
 
     # 预设精算按钮：不直接跑，先弹推理强度选择（ae:p:<fid>:<effort>）

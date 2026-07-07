@@ -185,17 +185,9 @@ _LLM_ERR_PREFIXES = (
 )
 
 
-def analyze_fundamentals(raw_funds: str, home: str, away: str,
-                         league: str) -> tuple[str, bool]:
-    """两阶段预处理：用轻量模型把原始基本面数据分析成一份「基本面研判」。
-
-    返回 (文本, ok)：
-      ok=True  → 文本为 mini 产出的研判，供主 SOP 精算用；
-      ok=False → 文本回退为原始 raw_funds（未配置/失败/超时/空），调用方据此标注。
-    失败绝不抛异常、不阻断精算（沿用 _call_llm 的错误串返回约定）。
-    """
-    if not available():
-        return raw_funds, False
+def _fund_prompts(raw_funds: str, home: str, away: str,
+                  league: str) -> tuple[str, str]:
+    """构造基本面预处理的 (system, user) prompt，供阻塞版与流式版共用。"""
     system = (
         load_fund_rules()
         + "\n\n===== 任务（基本面分析） =====\n"
@@ -217,6 +209,21 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 原始基本面数据\n{raw_funds}\n"
     )
+    return system, user
+
+
+def analyze_fundamentals(raw_funds: str, home: str, away: str,
+                         league: str) -> tuple[str, bool]:
+    """两阶段预处理：用轻量模型把原始基本面数据分析成一份「基本面研判」。
+
+    返回 (文本, ok)：
+      ok=True  → 文本为 mini 产出的研判，供主 SOP 精算用；
+      ok=False → 文本回退为原始 raw_funds（未配置/失败/超时/空），调用方据此标注。
+    失败绝不抛异常、不阻断精算（沿用 _call_llm 的错误串返回约定）。
+    """
+    if not available():
+        return raw_funds, False
+    system, user = _fund_prompts(raw_funds, home, away, league)
     out = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
                     model=config.FUND_ANALYZE_MODEL,
@@ -226,6 +233,31 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
         log.warning("基本面预处理失败，回退原始数据: %s", out[:120])
         return raw_funds, False
     return out, True
+
+
+def analyze_fundamentals_stream(raw_funds: str, home: str, away: str,
+                                league: str):
+    """基本面预处理（流式版）。yield 事件供 bot 高频检查中断（停止按钮低延迟）：
+      ('progress',)      —— 每收到一块数据，供消费方检查 cancel
+      ('done', 研判全文)  —— 轻量模型成功产出
+      ('error', 错误串)   —— 失败（调用方据此回退展示原始数据）
+    走轻档 gpt-5.4-mini + FUND_ANALYZE_MAX_TOKENS 预算流式跑，故每块间隔即可被停止。
+    """
+    if not available():
+        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY")
+        return
+    system, user = _fund_prompts(raw_funds, home, away, league)
+    for kind, payload in llm_client.stream_chat(
+            system, user,
+            effort=config.FUND_ANALYZE_EFFORT,
+            model=config.FUND_ANALYZE_MODEL,
+            max_tokens=config.FUND_ANALYZE_MAX_TOKENS):
+        if kind == "delta":
+            yield ("progress",)
+        elif kind == "done":
+            yield ("done", payload)
+        elif kind == "error":
+            yield ("error", payload)
 
 
 def distill_lesson(review_report: str, home: str, away: str,
