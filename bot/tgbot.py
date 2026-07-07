@@ -403,7 +403,9 @@ LEAGUES_PER_PAGE = 10          # /leagues 每页联赛数（5 行 × 2）
 
 
 def _leagues_keyboard(page: int = 0) -> dict:
-    """联赛开关面板（分页）。每个按钮 callback=tl:<id>:<page>，翻转后停在本页；
+    """联赛开关面板（分页）。每个联赛占一行：
+      [✅/⬜ 中文名 英文名]（tl:<id>:<page> 翻转开关，停在本页）
+      [📅 <season>]（sea:<id>:<page> 打开该联赛的赛季选择）
     底部一行翻页按钮 lp:<page>。"""
     conn = db.get_conn()
     try:
@@ -415,17 +417,15 @@ def _leagues_keyboard(page: int = 0) -> dict:
     page = max(0, min(page, pages - 1))
     chunk = rows[page * LEAGUES_PER_PAGE:(page + 1) * LEAGUES_PER_PAGE]
 
-    buttons, line = [], []
+    buttons = []
     for lid, name, season, enabled in chunk:
         mark = "✅" if enabled else "⬜"
         label = config.league_label(lid, name)   # 带中文对照，与 /fixtures 一致
-        line.append({"text": f"{mark} {label}",
-                     "callback_data": f"tl:{lid}:{page}"})
-        if len(line) >= config.TG_LEAGUES_PER_ROW:
-            buttons.append(line)
-            line = []
-    if line:
-        buttons.append(line)
+        # 每个联赛一行：左开关、右赛季。赛季按钮带当前值，点开进赛季选择面板。
+        buttons.append([
+            {"text": f"{mark} {label}", "callback_data": f"tl:{lid}:{page}"},
+            {"text": f"📅 {season}", "callback_data": f"sea:{lid}:{page}"},
+        ])
 
     # 翻页行：‹ 上一页 | 页码 | 下一页 ›（首/末页对应按钮换成占位）
     nav = []
@@ -436,6 +436,21 @@ def _leagues_keyboard(page: int = 0) -> dict:
                if page < pages - 1 else {"text": " ", "callback_data": "lp:noop"})
     buttons.append(nav)
     return {"inline_keyboard": buttons}
+
+
+def _season_keyboard(league_id: int, page: int, cur_season: int) -> dict:
+    """某联赛的赛季选择面板。每个年份一个按钮（当前赛季标 ✅），
+    回调 sey:<id>:<page>:<season> 选定后切库并回到 /leagues 第 page 页；
+    末行「↩︎ 返回」回联赛面板不改赛季。"""
+    row = []
+    for yr in config.LEAGUE_SEASON_CHOICES:
+        mark = "✅ " if yr == cur_season else ""
+        row.append({"text": f"{mark}{yr}",
+                    "callback_data": f"sey:{league_id}:{page}:{yr}"})
+    # 每行放 3 个年份，避免一行过长
+    grid = [row[i:i + 3] for i in range(0, len(row), 3)]
+    grid.append([{"text": "↩︎ 返回联赛面板", "callback_data": f"lp:{page}"}])
+    return {"inline_keyboard": grid}
 
 
 def _search_leagues_keyboard(results: list[tuple]) -> dict:
@@ -2587,7 +2602,7 @@ def handle_message(msg: dict) -> None:
     if cmd in ("start", "help"):
         send(chat_id, _help_for(chat_id))
     elif cmd == "leagues":
-        send(chat_id, "点击切换联赛抓取开关（✅启用 / ⬜停用）：",
+        send(chat_id, "点击切换联赛抓取开关（✅启用 / ⬜停用）；点 📅 改赛季：",
              _leagues_keyboard())
     elif cmd == "bookmakers":
         send(chat_id, "点击切换庄家抓取开关：", _bookmakers_keyboard())
@@ -3145,8 +3160,9 @@ def handle_callback(cb: dict) -> None:
                             else f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），请先停止一个")
         return
 
-    # 配置类按钮（联赛/庄家开关、翻页、搜索添加）仅管理员可点
-    if data.startswith(("tl:", "tb:", "lp:", "ag:")) and not _is_admin(chat_id):
+    # 配置类按钮（联赛/庄家开关、翻页、搜索添加、改赛季）仅管理员可点
+    if data.startswith(("tl:", "tb:", "lp:", "ag:", "sea:", "sey:")) \
+            and not _is_admin(chat_id):
         answer_callback(cb_id, "仅管理员可改配置")
         return
 
@@ -3167,6 +3183,39 @@ def handle_callback(cb: dict) -> None:
             else:
                 answer_callback(cb_id)
                 edit_markup(chat_id, message_id, _leagues_keyboard(int(arg)))
+        elif data.startswith("sea:"):
+            # sea:<id>:<page> 打开某联赛的赛季选择面板（就地替换键盘）
+            try:
+                _, sid, spage = data.split(":")
+                lid, page = int(sid), int(spage)
+            except ValueError:
+                answer_callback(cb_id, "参数错误")
+                return
+            row = conn.execute(
+                "SELECT league_name, season FROM watched_leagues WHERE league_id=?",
+                (lid,)).fetchone()
+            if not row:
+                answer_callback(cb_id, "联赛不存在")
+                edit_markup(chat_id, message_id, _leagues_keyboard(page))
+                return
+            answer_callback(cb_id, "选择赛季")
+            edit_text(chat_id, message_id,
+                      f"📅 为 <b>{config.league_label(lid, row[0])}</b> 选择抓取赛季"
+                      f"（当前 {row[1]}）：\n跨年联赛（如 2025-26 赛季）按起始年 2025 记。",
+                      _season_keyboard(lid, page, row[1]))
+        elif data.startswith("sey:"):
+            # sey:<id>:<page>:<season> 选定赛季 → 切库 → 回联赛面板本页
+            try:
+                _, sid, spage, sseason = data.split(":")
+                lid, page, season = int(sid), int(spage), int(sseason)
+            except ValueError:
+                answer_callback(cb_id, "参数错误")
+                return
+            ok = db.set_league_season(conn, lid, season)
+            answer_callback(cb_id, f"赛季已设为 {season}" if ok else "联赛不存在")
+            edit_text(chat_id, message_id,
+                      "点击切换联赛抓取开关（✅启用 / ⬜停用）；点 📅 改赛季：",
+                      _leagues_keyboard(page))
         elif data.startswith("ag:"):
             # ag:<league_id>:<season> 搜索结果点选 → 添加并启用
             _, sid, sseason = data.split(":")

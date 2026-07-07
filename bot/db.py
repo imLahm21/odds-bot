@@ -438,6 +438,18 @@ def toggle_bookmaker(conn: sqlite3.Connection, bookmaker_id: int) -> int | None:
     return new
 
 
+def set_league_season(conn: sqlite3.Connection, league_id: int,
+                      season: int) -> bool:
+    """把某关注联赛的抓取赛季切到 season（覆盖旧值）。返回是否命中已有行。
+    league_id 是主键、每个联赛只持有一个 season，故这里只改 season 不动开关，
+    供 /leagues 面板「改赛季」按钮用。不存在该联赛返回 False。"""
+    cur = conn.execute(
+        "UPDATE watched_leagues SET season=? WHERE league_id=?",
+        (season, league_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def add_league(conn: sqlite3.Connection, league_id: int, name: str,
                season: int) -> None:
     """新增/更新一个关注联赛（默认启用）。"""

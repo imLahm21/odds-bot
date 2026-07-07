@@ -231,6 +231,10 @@ TELEGRAM_API = "https://api.telegram.org"
 TG_POLL_TIMEOUT = 50          # long polling 超时（秒）
 TG_LEAGUES_PER_ROW = 2        # 联赛按钮每行个数
 TG_BOOKMAKERS_PER_ROW = 3     # 庄家按钮每行个数
+# /leagues 面板「改赛季」可选年份。watched_leagues.league_id 是主键，每个联赛只
+# 持有一个 season；点某年即把该联赛的抓取赛季切到该年（覆盖旧值）。跨年联赛
+# （2025-26）在 API-Football 里标记为起始年 2025，故列 2025~2030 覆盖近几季。
+LEAGUE_SEASON_CHOICES = [2025, 2026, 2027, 2028, 2029, 2030]
 PUBLISH_DATES_PER_PAGE = 8    # /publish 日期列表每页条数（随天数累积，需翻页）
 TG_MSG_MAX = 4000             # 单条消息最大字符（Telegram 上限 4096，留余量）
 # 访客每日 /analyze 次数上限（管理员不受限）。防额度被刷；0 或负数=不限制。
