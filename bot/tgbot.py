@@ -2306,12 +2306,44 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
 
 
 # ─── /llm 管理面板（端点池 + 熔断状态 + 可调参数；仅管理员）──────────────────
-_BREAKER_ZH = {"CLOSED": "✅正常", "OPEN": "🔴熔断", "HALF_OPEN": "🟡半开"}
+_BREAKER_ZH = {"CLOSED": "✅正常", "DEGRADED": "🟠降级",
+               "OPEN": "🔴熔断", "HALF_OPEN": "🟡半开"}
 
 
 def _fmt_num(v: float) -> str:
     """参数值展示：整数去掉 .0（阈值/秒数都是整数语义）。"""
     return str(int(v)) if float(v).is_integer() else str(v)
+
+
+def _ago_zh(ts: float) -> str:
+    """epoch 秒 → 「X 秒/分钟/小时前」中文相对时间。"""
+    import time as _t
+    d = max(0, int(_t.time() - ts))
+    if d < 60:
+        return f"{d}秒前"
+    if d < 3600:
+        return f"{d // 60}分钟前"
+    if d < 86400:
+        return f"{d // 3600}小时前"
+    return f"{d // 86400}天前"
+
+
+def _fmt_last_probe(idx: int) -> str:
+    """某端点「上次测试」行。独立于熔断 badge——测过 404 会在这里显 ❗，
+    即使熔断状态仍正常（回答用户「404 了却显示正常」的困惑）。没测过标「未测过」。"""
+    r = llm_client.last_probe(idx)
+    if not r:
+        return "　上次测试：未测过（点上方 🧪 测一下）"
+    tier = _WHICH_ZH.get(r.get("which", "heavy"), "")
+    req = r.get("req_model", "")
+    when = _ago_zh(r["ts"]) if r.get("ts") else ""
+    if r["ok"]:
+        return (f"　上次测试：✅ {tier} {req} · {r['latency_ms']}ms（{when}）").rstrip()
+    status = r["http_status"] if r.get("http_status") is not None else "无响应"
+    icon = "❗" if r.get("http_status") == 200 else "❌"
+    # 错误串可能很长，面板里截断
+    err = (r.get("error") or "")[:60]
+    return f"　上次测试：{icon} {tier} {req} · {status} · {err}（{when}）"
 
 
 def _llm_panel_text() -> str:
@@ -2324,7 +2356,8 @@ def _llm_panel_text() -> str:
     settings = llm_client.get_settings()
 
     lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条，启用 {llm_client.enabled_count()}）</b>",
-             "（✅=已启用会连通 / ⬜=已停用会跳过；点按钮翻转，精算只走 ✅ 的端点）"]
+             "（✅正常=全速派发 / 🟠降级=近期偶发失败·仍用但选路降优先 / "
+             "🔴熔断=已摘除等冷却 / 🟡半开=探活中；点 ⬜/✅ 手动开关）"]
     for i, (ep, st) in enumerate(zip(eps, stats)):
         on = llm_client.is_enabled(i)
         sw = "🟢启用" if on else "⚪停用"
@@ -2334,6 +2367,8 @@ def _llm_panel_text() -> str:
             extra = f"，{st['open_remain']}s 后半开探活"
         elif st["state"] == "HALF_OPEN":
             extra = f"，已成功 {st['half_ok']}"
+        elif st["state"] == "DEGRADED":
+            extra = "，选路已降优先"
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
         # 模型映射（第4段）：有则显示「重→X 轻→Y」，无则标「默认模型」
@@ -2351,7 +2386,8 @@ def _llm_panel_text() -> str:
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
             f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
-            f"  {mm_line}")
+            f"  {mm_line}\n"
+            f"{_fmt_last_probe(i)}")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():

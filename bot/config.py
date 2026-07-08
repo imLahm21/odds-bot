@@ -305,6 +305,9 @@ LLM_SETTING_SPECS: dict[str, dict] = {
     "max_retries": {
         "default": 2, "min": 0, "max": 10,
         "label": "最大重试次数", "help": "单端点请求失败时的重试次数（0-10）"},
+    "degrade_threshold": {
+        "default": 1, "min": 1, "max": 10,
+        "label": "降级阈值", "help": "连续失败多少次进入降级预警（仍在用但选路降优先，须≤失败阈值）"},
     "failure_threshold": {
         "default": 3, "min": 3, "max": 10,
         "label": "失败阈值", "help": "连续失败多少次后打开熔断器（3-10）"},

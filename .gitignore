@@ -6,6 +6,9 @@ auth.json
 *.pem
 *.key
 secrets.*
+# Claude Code 本地配置：settings.<名>.json 常含 ANTHROPIC_AUTH_TOKEN 等密钥，绝不上传
+.claude/settings.*.json
+.claude/worktrees/
 
 # ===== 数据资产 (用备份，不进 git) =====
 # data/ 与 report/ 均不进 git：本地和服务器都各自跑 main.py 抓取，

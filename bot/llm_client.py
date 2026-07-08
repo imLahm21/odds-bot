@@ -328,13 +328,14 @@ class Breaker:
                     self.half_ok = 0
                     return True
                 return False
-            return True   # HALF_OPEN：放行探测
+            return True   # DEGRADED（仍放行、仅选路降优先）/ HALF_OPEN（放行探测）
 
     def record(self, ok: bool) -> None:
         """喂一次调用结果，驱动状态迁移。
         状态迁移在锁内决策、锁外发告警（Telegram HTTP 不可持锁调用）。"""
-        event = None            # 'open' | 'recover'，锁外据此告警
+        event = None            # 'open' | 'recover' | 'degrade'，锁外据此告警
         reason = ""
+        undegraded = False      # 降级→正常（静默），锁外清降级去重键
         with self._lock:
             self.window.append(bool(ok))
             if ok:
@@ -344,13 +345,22 @@ class Breaker:
                     if self.half_ok >= get_settings()["recovery_success_threshold"]:
                         self._close()
                         event = "recover"
+                elif self.state == "DEGRADED":
+                    # 降级态一次成功即恢复正常（抖动收敛）。静默恢复不告警，
+                    # 只清降级去重键，使日后再降级能重新告警；仅 log。
+                    self._close()
+                    undegraded = True
+                    log.info("LLM 端点【%s】降级已自动恢复正常", self.label)
             else:
                 self.consecutive += 1
                 if self.state == "HALF_OPEN":
                     self._open()               # 半开期任一失败 → 立刻回 OPEN
                     # 半开探测又失败：不算「新打开」，避免与首次 open 告警重复刷屏
-                elif self.state == "CLOSED":
+                elif self.state in ("CLOSED", "DEGRADED"):
                     st = get_settings()
+                    # 降级阈值须 ≤ 失败阈值（config 已约束；运行时再兜底防误配）
+                    deg_th = min(int(st["degrade_threshold"]),
+                                 int(st["failure_threshold"]))
                     if self.consecutive >= st["failure_threshold"]:
                         self._open()
                         event = "open"
@@ -361,14 +371,25 @@ class Breaker:
                         total = len(self.window)
                         fails = sum(1 for x in self.window if not x)
                         reason = f"错误率 {fails / total * 100:.0f}%（{fails}/{total}）"
+                    elif self.state == "CLOSED" and self.consecutive >= deg_th:
+                        self.state = "DEGRADED"   # 轻度失败 → 降级预警（仍放行）
+                        event = "degrade"
+                        reason = f"连续失败 {self.consecutive} 次（未达熔断线）"
         if event == "open":
             wait = int(get_settings()["recovery_wait_seconds"])
             _alert(f"🔴 LLM 端点【{self.label}】已熔断（{reason}），暂停派发，"
                    f"{wait}s 后自动半开探活。可在 TG 发 /llm 查看或手动重置。",
                    dedup_key=f"llm_open_{self.idx}")
+        elif event == "degrade":
+            _alert(f"🟠 LLM 端点【{self.label}】已降级（{reason}），仍在用但选路已降优先，"
+                   f"继续失败将熔断。可在 TG 发 /llm 查看。",
+                   dedup_key=f"llm_degrade_{self.idx}")
         elif event == "recover":
             _alert(f"✅ LLM 端点【{self.label}】已自动恢复（半开探测成功，熔断关闭），"
                    f"重新纳入派发。", dedup_key=f"llm_recover_{self.idx}")
+        # 降级→正常：清降级去重键，使日后再降级能重新告警（自身静默不发）
+        if undegraded or event == "recover":
+            _clear_alert_dedup(f"llm_degrade_{self.idx}")
 
     def _rate_tripped(self, st: dict[str, float]) -> bool:
         total = len(self.window)
@@ -395,6 +416,7 @@ class Breaker:
         with self._lock:
             self._close()
         _clear_alert_dedup(f"llm_open_{self.idx}")
+        _clear_alert_dedup(f"llm_degrade_{self.idx}")
         _clear_alert_dedup(f"llm_recover_{self.idx}")
 
     def stats(self) -> dict:
@@ -511,9 +533,26 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
         return content, True, "", False
 
 
+# 选路优先级：正常/半开端点优先，降级端点次之（仍用但靠后），OPEN 交由 allow() 冷却门控。
+# 手动停用端点直接排除。返回按优先级排好序的 [(idx, ep)]，调用方仍需逐个 br.allow()。
+_STATE_PRIORITY = {"CLOSED": 0, "HALF_OPEN": 0, "OPEN": 1, "DEGRADED": 2}
+
+
+def _endpoints_by_priority() -> list[tuple[int, dict]]:
+    """未手动停用的端点按选路优先级排序：正常/半开(0) < OPEN(1) < 降级(2)。
+    稳定排序，同优先级保持 .env 原顺序（多 key 冗余的先后不被打乱）。
+    降级端点排最后——健康端点先跑，降级的只在健康端点都用不上时才轮到。"""
+    disabled = _get_disabled()
+    cands = [(i, ep) for i, ep in enumerate(_ENDPOINTS)
+             if _sig(ep) not in disabled]
+    return sorted(cands, key=lambda t: _STATE_PRIORITY.get(
+        _breakers[t[0]].state, 1))
+
+
 def chat(system: str, user: str, effort: str = "",
          model: str = "", timeout: int = 0, max_tokens: int = 0) -> str:
-    """阻塞式调用，按端点顺序故障转移。失败返回错误说明串（不抛异常）。
+    """阻塞式调用，按选路优先级故障转移（正常端点先、降级端点后）。
+    失败返回错误说明串（不抛异常）。
     timeout/model/max_tokens 非默认时覆盖 config（走地/基本面/SEO 各传自己的短超时）；
     未显式传 timeout 时用 DB 的 non_stream_timeout。
     """
@@ -528,10 +567,7 @@ def chat(system: str, user: str, effort: str = "",
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
     all_timeout = True            # 是否全部端点都是超时类失败
-    disabled = _get_disabled()
-    for idx, ep in enumerate(_ENDPOINTS):
-        if _sig(ep) in disabled:          # 手动停用的端点：不参与选路
-            continue
+    for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
         br = _breakers[idx]
         if not br.allow():
             labeled.append(f"{ep['label']}熔断跳过")
@@ -682,10 +718,7 @@ def stream_chat(system: str, user: str, effort: str = "",
     tok = max_tokens or config.LLM_MAX_TOKENS
 
     last_err = None
-    disabled = _get_disabled()
-    for idx, ep in enumerate(_ENDPOINTS):
-        if _sig(ep) in disabled:          # 手动停用的端点：不参与选路
-            continue
+    for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
         br = _breakers[idx]
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
@@ -721,6 +754,27 @@ def stream_chat(system: str, user: str, effort: str = "",
 
 
 # ─── 连通性探针（最小 chat 请求；不计入 Breaker 统计）───────────────────────
+# 探针结果留痕：idx → 上次测试结果 dict（含 ts=epoch 秒）。供 /llm 面板显示「上次测试」，
+# 让「测过 404 但没进真实流量、熔断状态仍正常」的困惑得到解释。故意与 Breaker 分离——
+# 探针是运维主动诊断，不该污染故障转移的错误率统计。
+_last_probe: dict[int, dict] = {}
+_last_probe_lock = threading.Lock()
+
+
+def last_probe(idx: int) -> dict | None:
+    """取某端点上次探针结果（含 ts epoch 秒）；没测过返回 None。供面板显示。"""
+    with _last_probe_lock:
+        return _last_probe.get(idx)
+
+
+def _save_probe(idx: int, res: dict) -> dict:
+    """把探针结果留痕（打时间戳），并原样返回 res（便于 return _save_probe(...)）。"""
+    import time as _t
+    with _last_probe_lock:
+        _last_probe[idx] = {**res, "ts": _t.time()}
+    return res
+
+
 def probe(idx: int, which: str = "heavy") -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
     which='heavy' 测重档逻辑模型（config.LLM_MODEL，如 gpt-5.5），'light' 测轻档
@@ -753,15 +807,15 @@ def probe(idx: int, which: str = "heavy") -> dict:
                           json=payload, headers=_headers(ep),
                           timeout=(_CONNECT_TIMEOUT, probe_to))
     except requests.exceptions.Timeout:
-        return {"ok": False, "http_status": None,
+        return _save_probe(idx, {"ok": False, "http_status": None,
                 "latency_ms": int((monotonic() - t0) * 1000),
                 "model": "", "req_model": req_model, "which": which,
-                "error": f"超时（>{probe_to}s）", "breaker_state": bstate}
+                "error": f"超时（>{probe_to}s）", "breaker_state": bstate})
     except requests.exceptions.RequestException as e:
-        return {"ok": False, "http_status": None,
+        return _save_probe(idx, {"ok": False, "http_status": None,
                 "latency_ms": int((monotonic() - t0) * 1000),
                 "model": "", "req_model": req_model, "which": which,
-                "error": str(e)[:120], "breaker_state": bstate}
+                "error": str(e)[:120], "breaker_state": bstate})
     latency = int((monotonic() - t0) * 1000)
     model = ""
     err = ""
@@ -785,9 +839,9 @@ def probe(idx: int, which: str = "heavy") -> dict:
             err = str(data.get("error", data))[:150]
         else:
             err = r.text[:150]
-    return {"ok": ok, "http_status": r.status_code,
+    return _save_probe(idx, {"ok": ok, "http_status": r.status_code,
             "latency_ms": latency, "model": model, "req_model": req_model,
-            "which": which, "error": err, "breaker_state": bstate}
+            "which": which, "error": err, "breaker_state": bstate})
 
 
 def probe_all(which: str = "heavy") -> list[dict]:
