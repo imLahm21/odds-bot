@@ -1,6 +1,6 @@
 # ── 旧交互式脚本 main.py 依赖（The Odds API）──
 pandas==3.0.2
-requests==2.32.5
+requests==2.33.0
 python-dotenv==1.2.2
 
 # ── 新轮询守护进程 bot/ 依赖（API-Football）──
