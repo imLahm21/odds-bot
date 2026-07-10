@@ -9,7 +9,7 @@
 ![API-Football](https://img.shields.io/badge/API--Football-v3-00A859)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-OpenAI--compatible-412991)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](https://opensource.org/license/MIT)
 
 [English](README.md) | [中文](README.zh.md)
 
@@ -130,3 +130,9 @@ python -m bot.daemon
 sqlite3 odds.db "SELECT count(*) FROM odds_history;"
 sqlite3 odds.db "SELECT home_team, away_team, commence_utc FROM fixtures ORDER BY commence_utc LIMIT 10;"
 ```
+
+---
+
+## 许可证
+
+基于 [MIT 许可证](https://opensource.org/license/MIT) 发布，详见 [`LICENSE`](LICENSE)。
