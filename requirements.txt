@@ -1,5 +1,9 @@
 # ── 旧交互式脚本 main.py 依赖（The Odds API）──
-pandas==3.0.2
+# pandas 仅旧 main.py 用；bot/ 守护进程不需要。放宽版本以兼容旧 Python
+# （精确钉 3.0.x 在较旧的 Python 上装不了，会中断整份 pip install）。
+# 只跑 bot 的服务器可跳过 pandas：pip install -r requirements.txt 若因它失败，
+# 改用 requirements-bot.txt 或手动装 bot 依赖即可。
+pandas>=2.0
 requests==2.34.2
 python-dotenv==1.2.2
 

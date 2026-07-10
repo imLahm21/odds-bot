@@ -1,0 +1,10 @@
+# bot/ 守护进程运行所需依赖（不含旧 main.py 的 pandas）。
+# 服务器只跑轮询守护进程 + Telegram bot 时用这份，避免 pandas 在旧 Python 上装不上：
+#   pip install -r requirements-bot.txt
+requests==2.34.2
+python-dotenv==1.2.2
+apscheduler==3.11.2
+
+# Ghost 博客发布（/publish 命令）
+PyJWT==2.13.0
+markdown==3.10.2
