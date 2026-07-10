@@ -2,7 +2,7 @@
 
 # odds-bot
 
-**足球赔率轮询抓取与精算后台**
+**Automated Football Odds Polling & Handicap Analysis Backend**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)
@@ -11,77 +11,85 @@
 ![LLM](https://img.shields.io/badge/LLM-OpenAI--compatible-412991)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-[English](README.en.md) | [中文](README.md)
+[English](README.md) | [中文](README.zh.md)
 
 </div>
 
-基于 **API-Football** 的全自动轮询守护进程：定时抓取关注联赛的欧赔/亚盘/大小球盘口，
-按时间序列存入 SQLite，供精算 SOP（见 `CLAUDE.md`）分析使用。可选挂接 Telegram bot 远程操控，
-以及 OpenAI 兼容的 LLM 端点做赛前精算 / 赛后复盘。
+A fully automated polling daemon built on **API-Football**: it periodically scrapes European odds,
+Asian handicap, and over/under lines for watched leagues, stores them as a time series in SQLite,
+and feeds them to an analysis SOP (see `CLAUDE.md`). Optionally exposes a Telegram bot for remote
+control and hooks into any OpenAI-compatible LLM endpoint for pre-match projection and post-match review.
 
 ---
 
-## ⚠️ 重要声明
+## ⚠️ Important Notice
 
-使用本项目前请务必阅读：
+Please read the following carefully before using this project:
 
-- **📚 仅供学习研究**：本项目仅用于技术学习与研究，不构成任何博彩建议、投资指导或下注推荐。
-- **⚖️ 合规使用**：请在符合你所在国家/地区法律法规的前提下使用，严禁用于任何非法用途。
-- **🧾 免责声明**：因使用本项目导致的任何资金损失、账号封禁、服务中断、数据丢失或其它直接/间接损害，作者概不负责。
-- **🔑 第三方服务**：你需自行申请并遵守所配置的第三方 API（API-Football、LLM 平台、Telegram 等）的服务条款，所有密钥由你自行管理。
+- **📚 Educational Purpose Only**: This project is provided for technical learning and research
+  purposes only. It is not gambling advice, investment guidance, or a betting recommendation of any kind.
+- **⚖️ Compliant Use**: Use this project only in compliance with the laws and regulations of your
+  country or region. Any unlawful use is strictly prohibited.
+- **🧾 Disclaimer**: The authors assume no liability for any financial loss, account bans, service
+  interruptions, data loss, or any other direct or indirect damages resulting from the use of this project.
+- **🔑 Third-Party Services**: You are responsible for obtaining and complying with the terms of any
+  third-party APIs (API-Football, LLM providers, Telegram, etc.) you configure. All API keys are yours to manage.
 
 ---
 
-## 架构
+## Architecture
 
 ```
 bot/
-├── config.py       # 联赛清单、关注庄家、轮询间隔、节点定义——改这里即可增删联赛
-├── api_client.py   # API-Football 请求层：key 轮换 + 429/401 重试
-├── db.py           # SQLite：建表 / 批量插入 / WAL / 去重
-├── parser.py       # JSON→行解析 + 凯利计算（含完整 1/4 亚盘）
-├── scheduler.py    # 定时任务调度
-├── llm_client.py   # LLM 端点故障转移 + 熔断器
-├── tgbot.py        # Telegram bot 命令与内联面板
-└── daemon.py       # 入口：初始化→拉赛程→启动调度器
-probe*.py           # 阶段0 探针：实测 API 真实 JSON（开发用，部署不需要）
+├── config.py       # Leagues, watched bookmakers, polling intervals, node definitions — edit here to add/remove leagues
+├── api_client.py   # API-Football request layer: key rotation + 429/401 retry
+├── db.py           # SQLite: schema / bulk insert / WAL / dedup
+├── parser.py       # JSON→rows + Kelly index calc (full quarter-ball Asian handicap)
+├── scheduler.py    # Scheduled polling tasks
+├── llm_client.py   # LLM endpoint failover + circuit breaker
+├── tgbot.py        # Telegram bot commands & inline panels
+└── daemon.py       # Entry point: init → fetch fixtures → start scheduler
+probe*.py           # Stage-0 probes: inspect real API JSON (dev only, not needed in production)
 ```
 
-### 数据库两张表
+### Two database tables
 
-- `fixtures`：赛程基本面（对阵、开球时间、联赛、状态）
-- `odds_history`：带时间戳的盘口快照（欧赔 + 亚盘 + 大小球 + 凯利），用于重建 SOP 10 节点
+- `fixtures`: fixture metadata (teams, kickoff time, league, status)
+- `odds_history`: timestamped odds snapshots (European + Asian handicap + over/under + Kelly),
+  used to reconstruct the SOP 10-node timeline
 
-### 定时任务
+### Scheduled tasks
 
-| 任务 | 频率 | 动作 |
-|------|------|------|
-| A | 每日定时 | 拉关注联赛未来赛程 → `fixtures` |
-| B | 每 1 小时 | 抓未来数天比赛最新赔率 → `odds_history` |
-| C | 每 15 分钟 | 仅抓临场比赛（开球前 2h 内高频）|
-| D | 每 5 分钟 | 开球前冲刺窗口，采封盘前异动 |
+| Task | Frequency | Action |
+|------|-----------|--------|
+| A | Daily | Fetch upcoming fixtures for watched leagues → `fixtures` |
+| B | Every 1 hour | Scrape latest odds for fixtures in the next few days → `odds_history` |
+| C | Every 15 min | High-frequency scrape for near-kickoff fixtures (within 2h) |
+| D | Every 5 min | Pre-kickoff sprint window, capturing pre-close movements |
 
-> 关注的联赛/庄家存在数据库表中，由 Telegram bot 实时开关，点完即时生效，无需重启。
+> Watched leagues/bookmakers live in the database and are toggled in real time via the Telegram bot —
+> changes take effect immediately, no restart needed.
 
-### Telegram bot（可选）
+### Telegram bot (optional)
 
-配置了 `TELEGRAM_BOT_TOKEN` 时，守护进程会同时跑一个 TG bot，用内联按钮实时操控：
+When `TELEGRAM_BOT_TOKEN` is set, the daemon also runs a TG bot with inline-button controls:
 
-| 命令 | 作用 |
-|------|------|
-| `/leagues` `/bookmakers` | 联赛 / 庄家开关面板 |
-| `/add` `/remove` | 新增 / 删除关注联赛 |
-| `/status` `/fixtures` | 当前配置 / 赛程列表 |
-| `/coverage` `/export` | 某场数据采集进度 / 导出盘口 CSV |
-| `/analyze` | 赛前精算：先看基本面+盘口走势，再选预设或自定义侧重跑 SOP |
-| `/review` | 赛后复盘：拉最终比分 + 盘口走势 → LLM 事后归因 |
+| Command | Purpose |
+|---------|---------|
+| `/leagues` `/bookmakers` | League / bookmaker toggle panels |
+| `/add` `/remove` | Add / remove watched leagues |
+| `/status` `/fixtures` | Current config / fixture list |
+| `/coverage` `/export` | Data collection progress / export odds CSV |
+| `/analyze` | Pre-match projection: preview fundamentals + odds movement, then run SOP (preset or custom focus) |
+| `/review` | Post-match review: fetch final score + odds movement → LLM attribution |
 
-**两级权限**：bot 只响应白名单里的 chat_id。`TELEGRAM_ALLOWED_CHAT_IDS` 为可查询/分析的全体，
-`TELEGRAM_ADMIN_CHAT_IDS` 为可改配置的管理员；不配 ADMIN 时 ALLOWED 全员视为管理员。
+**Two-tier permissions**: the bot only responds to whitelisted chat IDs. `TELEGRAM_ALLOWED_CHAT_IDS`
+are users who can query/analyze; `TELEGRAM_ADMIN_CHAT_IDS` are admins who can change config. If ADMIN
+is unset, all ALLOWED users are treated as admins.
 
 ---
 
-## 部署
+## Deployment
 
 ```bash
 git clone <your-repo-url>
@@ -90,43 +98,50 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-配置密钥（`.env` 不在 git 里，需手动建）：
+Configure secrets (`.env` is not in git — create it manually):
 
 ```bash
 cat > .env <<'EOF'
-APIFOOTBALL_KEY=你的API-Football密钥
-# 可选：Telegram bot
-TELEGRAM_BOT_TOKEN=从@BotFather获取的token
-TELEGRAM_ALLOWED_CHAT_IDS=你的chat_id,访客的chat_id
-TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
-# 可选：LLM 精算（任意 OpenAI 兼容平台）
+APIFOOTBALL_KEY=your-api-football-key
+# Optional: Telegram bot
+TELEGRAM_BOT_TOKEN=token-from-@BotFather
+TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id,guest_chat_id
+TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
+# Optional: LLM analysis (any OpenAI-compatible platform)
 LLM_BASE_URL=https://<your-openai-compatible-endpoint>/v1
-LLM_API_KEY=你的LLM密钥
+LLM_API_KEY=your-llm-key
 EOF
 ```
 
-> 只填 `APIFOOTBALL_KEY` 时，守护进程自动退化为纯调度器模式。`odds.db` 首次运行自动创建。
-> 多端点故障转移、熔断参数等进阶配置见代码注释与 `deploy/` 目录。
+> With only `APIFOOTBALL_KEY` set, the daemon runs as a pure scheduler. `odds.db` is created
+> automatically on first run. See code comments and the `deploy/` directory for advanced options
+> (multi-endpoint failover, circuit-breaker tuning, systemd units, backups).
 
-启动（tmux 保活或 systemd 自启，systemd 单元样例见 `deploy/`）：
+Start (tmux for keep-alive, or systemd for auto-start — sample unit in `deploy/`):
 
 ```bash
 tmux new -s bot
 source venv/bin/activate
 python -m bot.daemon
-# Ctrl+b 然后 d 挂起
+# Ctrl+b then d to detach
 ```
 
 ---
 
-## 增删联赛
+## Managing leagues
 
-改 `bot/config.py` 的 `WATCH_LEAGUES`（key=league_id，value=(中文名, season)）。
-需要新联赛 ID 时跑 `python probe.py leagues` 查出。
+Edit `WATCH_LEAGUES` in `bot/config.py` (key=league_id, value=(name, season)).
+Run `python probe.py leagues` to look up a new league's ID.
 
-## 查数据
+## Querying data
 
 ```bash
 sqlite3 odds.db "SELECT count(*) FROM odds_history;"
 sqlite3 odds.db "SELECT home_team, away_team, commence_utc FROM fixtures ORDER BY commence_utc LIMIT 10;"
 ```
+
+---
+
+## License
+
+Released under the MIT License. See `LICENSE` for details.
