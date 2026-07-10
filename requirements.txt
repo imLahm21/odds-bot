@@ -7,5 +7,5 @@ python-dotenv==1.2.2
 apscheduler==3.11.2
 
 # ── Ghost 博客发布（/publish 命令）──
-PyJWT==2.10.1
+PyJWT==2.13.0
 markdown==3.7
