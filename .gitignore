@@ -24,6 +24,10 @@ report/
 *.sqlite3
 *.xlsx
 *.log
+*.log.*
+daemon.log*
+# 服务器上一个指向自身目录的自引用软链接（意外产生，非项目文件）
+/odds_bot
 *.db-wal
 *.db-shm
 *.bak
