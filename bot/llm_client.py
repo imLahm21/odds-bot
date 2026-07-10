@@ -94,22 +94,34 @@ def clean_header_value(raw: str) -> str:
 
 # ─── 端点池（.env 解析，进程启动一次）───────────────────────────────────────
 def _parse_model_map(spec: str) -> dict:
-    """解析端点第 4 段「重模型:轻模型」→ {"heavy": ..., "light": ...}。
-      - 空/缺省 → {}（该端点不映射，两档都用全局默认）
-      - "gpt-5.5:gpt-5-codex" → 重档映射 gpt-5.5、轻档映射 gpt-5-codex
-      - "gpt-5.5"（无冒号）→ 只映射重档，轻档不变（{"heavy": "gpt-5.5"}）
-      - ":gpt-5-codex"（重档留空）→ 只映射轻档
+    """解析端点第 4 段模型映射 → {"heavy":..., "balanced":..., "light":...}（缺项不含）。
+    兼容 2 段（旧）与 3 段（新）：
+      - 空/缺省 → {}（该端点不映射，各档用运行时选定模型）
+      - 2 段「重:轻」（旧格式）→ {"heavy":重, "light":轻}（平衡档回退运行时选定，不破坏老配置）
+        例 "gpt-5.5:gpt-5-codex"
+      - 3 段「重:平衡:轻」（新格式）→ {"heavy":重, "balanced":平衡, "light":轻}
+        例 "gpt-5.5:gpt-5.6-terra:gpt-5-codex"
+      - 空段跳过：如 "gpt-5.5::gpt-5-codex"=只映射重和轻；"gpt-5.5"=只映射重
     """
     spec = (spec or "").strip()
     if not spec:
         return {}
-    heavy, _, light = spec.partition(":")
+    parts = [p.strip() for p in spec.split(":")]
     m: dict = {}
-    heavy, light = heavy.strip(), light.strip()
-    if heavy:
-        m["heavy"] = heavy
-    if light:
-        m["light"] = light
+    if len(parts) >= 3:
+        # 3 段：重:平衡:轻
+        if parts[0]:
+            m["heavy"] = parts[0]
+        if parts[1]:
+            m["balanced"] = parts[1]
+        if parts[2]:
+            m["light"] = parts[2]
+    else:
+        # 2 段（或 1 段）：重[:轻]，向后兼容旧配置
+        if parts[0]:
+            m["heavy"] = parts[0]
+        if len(parts) > 1 and parts[1]:
+            m["light"] = parts[1]
     return m
 
 
@@ -163,27 +175,115 @@ def _sig(ep: dict) -> str:
     return f"{ep['label']}|{ep['base_url']}"
 
 
-# 轻档逻辑模型名集合（走地/基本面/SEO 都用同名 gpt-5.4-mini，用 set 兼容将来分化）
-_LIGHT_MODELS = {config.LLM_LIVE_MODEL, config.FUND_ANALYZE_MODEL}
+# ─── 三档模型运行时选定（DB 懒加载，TG 改后 reload_runtime_models 失效）─────────
+# 按【档位 tier】路由，不再靠模型名判定——模型运行时可切（重档可能 sol 也可能 5.5），
+# 名字比较会失效。tier ∈ heavy/balanced/light。
+_runtime_models: dict[str, str] | None = None
+_runtime_lock = threading.Lock()
 
 
-def _resolve_model(logical: str, ep: dict) -> str:
-    """把调用方传的【逻辑模型名】按该端点的映射翻译成【真实模型名】。
-      - 端点无映射（无第 4 段）→ 原样返回 logical。
-      - logical == config.LLM_MODEL（重档）→ 用映射 heavy（无则原样）。
-      - logical ∈ 轻档集合 → 用映射 light（无则原样）。
-      - 其它（调用方显式传了别的模型）→ 原样返回，稳妥兜底。
-    例：Anyrouter 映射 {heavy:gpt-5.5, light:gpt-5-codex}，
-        _resolve_model("gpt-5.4-mini", anyrouter) == "gpt-5-codex"。
+def _rt_key(tier: str, visitor: bool) -> str:
+    """runtime-state 键：管理员 model_<tier>，访客 model_<tier>_visitor。"""
+    return f"model_{tier}_visitor" if visitor else f"model_{tier}"
+
+
+def _load_runtime_models() -> dict[str, str]:
+    """从 db.llm_runtime_state 读六档选定模型 {model_<tier>[_visitor]: 模型名}；
+    DB 异常回退 config 默认（管理员+访客各自）。"""
+    defaults: dict[str, str] = {}
+    for t in config.LLM_TIER_MODELS:
+        defaults[f"model_{t}"] = config.llm_tier_default(t, False)
+        defaults[f"model_{t}_visitor"] = config.llm_tier_default(t, True)
+    try:
+        conn = db.get_conn()
+        try:
+            raw = db.get_llm_runtime_state(conn)
+        finally:
+            conn.close()
+        return {k: raw.get(k, defaults[k]) for k in defaults}
+    except Exception as e:
+        log.warning("读 llm_runtime_state 失败，回退 config 默认: %s", e)
+        return defaults
+
+
+def get_tier_model(tier: str, visitor: bool = False) -> str:
+    """取某档某角色当前选定模型（进程内缓存，懒加载）。
+    visitor=True 取访客那份，否则取管理员那份。未知档回退该角色默认。"""
+    global _runtime_models
+    if _runtime_models is None:
+        with _runtime_lock:
+            if _runtime_models is None:
+                _runtime_models = _load_runtime_models()
+    return _runtime_models.get(_rt_key(tier, visitor),
+                               config.llm_tier_default(tier, visitor)
+                               or config.LLM_MODEL)
+
+
+def reload_runtime_models() -> None:
+    """令模型缓存失效（TG /llm 切换/回退后调用），下次 get_tier_model 重读 DB。"""
+    global _runtime_models
+    with _runtime_lock:
+        _runtime_models = None
+
+
+def set_tier_model(tier: str, model: str, visitor: bool = False) -> bool:
+    """切换某档某角色选定模型并落库、刷新缓存。校验 model ∈ 该档该角色 choices；非法返回 False。"""
+    if tier not in config.LLM_TIER_MODELS:
+        return False
+    try:
+        conn = db.get_conn()
+        try:
+            ok = db.set_llm_runtime_state(conn, _rt_key(tier, visitor), model)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("写 llm_runtime_state 失败 tier=%s visitor=%s: %s", tier, visitor, e)
+        return False
+    if ok:
+        reload_runtime_models()
+    return ok
+
+
+def apply_legacy_models() -> None:
+    """一键回退旧模型：六档（管理员+访客）一次性写成 config.LLM_LEGACY_TIER_MODELS
+    （重=gpt-5.5、平衡/轻=gpt-5.4-mini），免重启。回退值豁免 choices 校验（allow_any）。"""
+    try:
+        conn = db.get_conn()
+        try:
+            for tier, model in config.LLM_LEGACY_TIER_MODELS.items():
+                db.set_llm_runtime_state(conn, f"model_{tier}", model, allow_any=True)
+                db.set_llm_runtime_state(conn, f"model_{tier}_visitor", model,
+                                         allow_any=True)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("一键回退旧模型失败: %s", e)
+    reload_runtime_models()
+
+
+def reset_runtime_models() -> None:
+    """恢复六档为新模型默认（管理员 sol/terra/luna + 访客 terra/terra/luna），免重启。"""
+    try:
+        conn = db.get_conn()
+        try:
+            db.reset_llm_runtime_state(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("恢复默认失败: %s", e)
+    reload_runtime_models()
+
+
+def _resolve_model(tier: str, ep: dict, visitor: bool = False) -> str:
+    """按【档位×角色】解析该端点该用的真实模型名：
+      - 端点有该档映射（.env 第4段）→ 用映射值（端点级覆盖最高，不分角色）。
+      - 否则用该档该角色运行时选定模型（/llm 面板可切、DB 持久化）。
+    彻底不再靠模型名猜档位，模型随便换都不影响路由。
     """
     mm = ep.get("model_map") or {}
-    if not mm:
-        return logical
-    if logical == config.LLM_MODEL:
-        return mm.get("heavy", logical)
-    if logical in _LIGHT_MODELS:
-        return mm.get("light", logical)
-    return logical
+    if tier in mm:
+        return mm[tier]
+    return get_tier_model(tier, visitor)
 
 
 def available() -> bool:
@@ -549,11 +649,13 @@ def _endpoints_by_priority() -> list[tuple[int, dict]]:
         _breakers[t[0]].state, 1))
 
 
-def chat(system: str, user: str, effort: str = "",
-         model: str = "", timeout: int = 0, max_tokens: int = 0) -> str:
+def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
+         timeout: int = 0, max_tokens: int = 0, visitor: bool = False) -> str:
     """阻塞式调用，按选路优先级故障转移（正常端点先、降级端点后）。
     失败返回错误说明串（不抛异常）。
-    timeout/model/max_tokens 非默认时覆盖 config（走地/基本面/SEO 各传自己的短超时）；
+    visitor=True 时该档用访客那份选定模型（访客触发的 /analyze /review）。
+    tier ∈ heavy/balanced/light：决定用哪档运行时选定模型（每端点再按映射翻译）。
+    timeout/max_tokens 非默认时覆盖 config（走地/基本面/SEO 各传自己的短超时）；
     未显式传 timeout 时用 DB 的 non_stream_timeout。
     """
     if not available():
@@ -561,7 +663,6 @@ def chat(system: str, user: str, effort: str = "",
     st = get_settings()
     read_to = int(timeout or st["non_stream_timeout"])
     max_retries = int(st["max_retries"])
-    logical = model or config.LLM_MODEL        # 逻辑模型名，选到端点后按映射翻译
     tok = max_tokens or config.LLM_MAX_TOKENS
 
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
@@ -573,8 +674,8 @@ def chat(system: str, user: str, effort: str = "",
             labeled.append(f"{ep['label']}熔断跳过")
             all_timeout = False
             continue
-        # 每端点按映射翻译模型名再构造 payload（Anyrouter 轻档→gpt-5-codex 等）
-        payload = _payload(_resolve_model(logical, ep), system, user,
+        # 每端点按档位解析真实模型名（运行时选定 + 端点映射；Anyrouter 轻档→gpt-5-codex 等）
+        payload = _payload(_resolve_model(tier, ep, visitor), system, user,
                            tok, effort, False)
         content, ok, err, was_to = _do_chat(ep, payload, read_to, max_retries)
         br.record(ok)
@@ -701,12 +802,13 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int):
     yield ("done", acc.strip())
 
 
-def stream_chat(system: str, user: str, effort: str = "",
-                model: str = "", max_tokens: int = 0):
+def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
+                max_tokens: int = 0, visitor: bool = False):
     """流式调用，只在【首字节前】跨端点故障转移。yield 与旧 _stream_llm 完全一致：
     ('delta', 累积全文) / ('done', 全文) / ('error', 串)。
-    model/max_tokens 非默认时覆盖（基本面预处理传轻档 gpt-5.4-mini + 较小预算，
-    使其也能流式跑、令停止按钮低延迟生效）；未传则原样用重档 gpt-5.5 + 全局预算。
+    visitor=True 时该档用访客那份选定模型。
+    tier ∈ heavy/balanced/light：决定用哪档运行时选定模型（主 SOP=heavy、基本面=balanced）。
+    max_tokens 非默认时覆盖（基本面预处理传较小预算，使其也能流式跑、停止按钮低延迟生效）。
     """
     if not available():
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
@@ -714,7 +816,6 @@ def stream_chat(system: str, user: str, effort: str = "",
     st = get_settings()
     first_byte_to = int(st["stream_first_byte_timeout"])
     idle_to = int(st["stream_idle_timeout"])
-    logical = model or config.LLM_MODEL        # 逻辑模型名，选到端点后按映射翻译
     tok = max_tokens or config.LLM_MAX_TOKENS
 
     last_err = None
@@ -723,8 +824,8 @@ def stream_chat(system: str, user: str, effort: str = "",
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
             continue
-        # 主 SOP 走重档、基本面走轻档；每端点按映射翻译（Anyrouter 兜底翻译真实模型名）
-        payload = _payload(_resolve_model(logical, ep), system, user,
+        # 按档位×角色解析真实模型名（运行时选定 + 端点映射）
+        payload = _payload(_resolve_model(tier, ep, visitor), system, user,
                            tok, effort, True)
         produced = False        # 是否已向用户吐过正文 delta
         failed_pre = False      # 首字节前失败 → 可切下一端点
@@ -777,9 +878,8 @@ def _save_probe(idx: int, res: dict) -> dict:
 
 def probe(idx: int, which: str = "heavy") -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
-    which='heavy' 测重档逻辑模型（config.LLM_MODEL，如 gpt-5.5），'light' 测轻档
-    （config.LLM_LIVE_MODEL，如 gpt-5.4-mini）；都经该端点映射翻译成真实模型名
-    （Anyrouter 测重→gpt-5.5、测轻→gpt-5-codex）。
+    which ∈ heavy/balanced/light：测哪档——按该档运行时选定模型 + 端点映射解析真实模型名
+    （Anyrouter 测重→gpt-5.5、测平衡/轻→其映射值）。
     返回 {ok, http_status, latency_ms, model, req_model, which, error, breaker_state}。
     max_tokens 用 16（而非 1）：部分推理模型对过小预算会 400，16 既够连通判定又极廉价。
     纯诊断——不喂 Breaker，避免健康检查污染故障转移的错误率。
@@ -788,13 +888,14 @@ def probe(idx: int, which: str = "heavy") -> dict:
     有效结构）才判 ✅。200 但无 choices（如网关回错误体/无该模型权限/base_url 缺 /v1）
     → ok=False，标「200 但无补全内容」，让 Anyrouter 那种 53ms 假通当场露馅。
     """
+    if which not in config.LLM_TIER_MODELS:
+        which = "heavy"
     if not (0 <= idx < len(_ENDPOINTS)):
         return {"ok": False, "http_status": None, "latency_ms": 0,
                 "model": "", "req_model": "", "which": which,
                 "error": "端点序号越界", "breaker_state": "-"}
     ep = _ENDPOINTS[idx]
-    logical = config.LLM_LIVE_MODEL if which == "light" else config.LLM_MODEL
-    req_model = _resolve_model(logical, ep)
+    req_model = _resolve_model(which, ep)   # which 即档位
     st = get_settings()
     probe_to = min(30, int(st["non_stream_timeout"]))   # 探针用短超时，不等满
     payload = {"model": req_model,

@@ -86,23 +86,29 @@ def available() -> bool:
 
 
 def _call_llm(system: str, user: str, effort: str = "",
-              model: str = "", timeout: int = 0, max_tokens: int = 0) -> str:
-    """薄委托 llm_client.chat（端点池 + 故障转移 + 熔断）。签名与语义不变：
-    effort 非空附带 reasoning_effort；model/timeout/max_tokens 非默认时覆盖 config
-    （走地/基本面/SEO 各传自己的短超时，优先于 DB 的 non_stream_timeout）。
+              tier: str = "heavy", timeout: int = 0, max_tokens: int = 0,
+              visitor: bool = False) -> str:
+    """薄委托 llm_client.chat（端点池 + 故障转移 + 熔断）。
+    effort 非空附带 reasoning_effort；tier 决定用哪档运行时选定模型（heavy/balanced/light）；
+    visitor=True 用该档访客那份模型（访客触发的任务）；
+    timeout/max_tokens 非默认时覆盖 config（走地/基本面/SEO 各传自己的短超时）。
     失败返回错误说明串（不抛异常），前缀沿用旧格式（见 _LLM_ERR_PREFIXES）。
     """
-    return llm_client.chat(system, user, effort=effort, model=model,
-                           timeout=timeout, max_tokens=max_tokens)
+    return llm_client.chat(system, user, effort=effort, tier=tier,
+                           timeout=timeout, max_tokens=max_tokens, visitor=visitor)
 
 
-def _stream_llm(system: str, user: str, effort: str = ""):
+def _stream_llm(system: str, user: str, effort: str = "",
+                tier: str = "heavy", max_tokens: int = 0, visitor: bool = False):
     """薄委托 llm_client.stream_chat。yield 事件契约不变：
     ('delta', 累积全文) / ('done', 全文) / ('error', 错误串)。
+    tier 决定用哪档运行时选定模型（主 SOP=heavy、基本面=balanced）；
+    visitor=True 用该档访客那份模型。
     流式超时用 DB 的 stream_first_byte_timeout + stream_idle_timeout；
     仅在首字节前跨端点故障转移（见 llm_client.stream_chat）。
     """
-    yield from llm_client.stream_chat(system, user, effort=effort)
+    yield from llm_client.stream_chat(system, user, effort=effort, tier=tier,
+                                      max_tokens=max_tokens, visitor=visitor)
 
 
 def _analyze_prompts(csv_text: str, fundamentals: str,
@@ -141,13 +147,14 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
 
 def analyze(csv_text: str, fundamentals: str,
             home: str, away: str, league: str,
-            extra_instruction: str = "", effort: str = "") -> str:
-    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。"""
+            extra_instruction: str = "", effort: str = "",
+            visitor: bool = False) -> str:
+    """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
-    return _call_llm(system, user, effort)
+    return _call_llm(system, user, effort, tier="heavy", visitor=visitor)
 
 
 def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
@@ -173,7 +180,7 @@ def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
     )
     return _call_llm(system, user,
                      effort=config.LLM_LIVE_EFFORT,
-                     model=config.LLM_LIVE_MODEL,
+                     tier="light",
                      timeout=config.LLM_LIVE_TIMEOUT,
                      max_tokens=config.LLM_LIVE_MAX_TOKENS)
 
@@ -213,12 +220,13 @@ def _fund_prompts(raw_funds: str, home: str, away: str,
 
 
 def analyze_fundamentals(raw_funds: str, home: str, away: str,
-                         league: str) -> tuple[str, bool]:
-    """两阶段预处理：用轻量模型把原始基本面数据分析成一份「基本面研判」。
+                         league: str, visitor: bool = False) -> tuple[str, bool]:
+    """两阶段预处理：用平衡档模型把原始基本面数据分析成一份「基本面研判」。
 
     返回 (文本, ok)：
-      ok=True  → 文本为 mini 产出的研判，供主 SOP 精算用；
+      ok=True  → 文本为平衡档产出的研判，供主 SOP 精算用；
       ok=False → 文本回退为原始 raw_funds（未配置/失败/超时/空），调用方据此标注。
+    visitor: 访客触发时用平衡档访客那份模型。
     失败绝不抛异常、不阻断精算（沿用 _call_llm 的错误串返回约定）。
     """
     if not available():
@@ -226,7 +234,7 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
     system, user = _fund_prompts(raw_funds, home, away, league)
     out = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
-                    model=config.FUND_ANALYZE_MODEL,
+                    tier="balanced", visitor=visitor,
                     timeout=config.FUND_ANALYZE_TIMEOUT,
                     max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
     if not out or out.startswith(_LLM_ERR_PREFIXES):
@@ -236,12 +244,13 @@ def analyze_fundamentals(raw_funds: str, home: str, away: str,
 
 
 def analyze_fundamentals_stream(raw_funds: str, home: str, away: str,
-                                league: str):
+                                league: str, visitor: bool = False):
     """基本面预处理（流式版）。yield 事件供 bot 高频检查中断（停止按钮低延迟）：
       ('progress',)      —— 每收到一块数据，供消费方检查 cancel
-      ('done', 研判全文)  —— 轻量模型成功产出
+      ('done', 研判全文)  —— 平衡档成功产出
       ('error', 错误串)   —— 失败（调用方据此回退展示原始数据）
-    走轻档 gpt-5.4-mini + FUND_ANALYZE_MAX_TOKENS 预算流式跑，故每块间隔即可被停止。
+    走平衡档 + FUND_ANALYZE_MAX_TOKENS 预算流式跑，故每块间隔即可被停止。
+    visitor: 访客触发时用平衡档访客那份模型。
     """
     if not available():
         yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY")
@@ -250,7 +259,7 @@ def analyze_fundamentals_stream(raw_funds: str, home: str, away: str,
     for kind, payload in llm_client.stream_chat(
             system, user,
             effort=config.FUND_ANALYZE_EFFORT,
-            model=config.FUND_ANALYZE_MODEL,
+            tier="balanced", visitor=visitor,
             max_tokens=config.FUND_ANALYZE_MAX_TOKENS):
         if kind == "delta":
             yield ("progress",)
@@ -296,7 +305,7 @@ def distill_lesson(review_report: str, home: str, away: str,
     )
     out = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
-                    model=config.FUND_ANALYZE_MODEL,
+                    tier="balanced",
                     timeout=config.FUND_ANALYZE_TIMEOUT,
                     max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
     if not out or out.startswith(_LLM_ERR_PREFIXES):
@@ -388,7 +397,7 @@ def route_lesson(review_report: str, home: str, away: str,
     )
     raw = _call_llm(system, user,
                     effort=config.LLM_EFFORT_DEFAULT,
-                    model=config.LLM_MODEL,
+                    tier="heavy",
                     timeout=config.LLM_TIMEOUT,
                     max_tokens=4000)
     m = _re.search(r"\{.*\}", raw or "", _re.S)
@@ -470,7 +479,7 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
     )
     raw = _call_llm(system, user,
                     effort=config.LLM_EFFORT_DEFAULT,
-                    model=config.LLM_MODEL,
+                    tier="heavy",
                     timeout=config.LLM_TIMEOUT,
                     max_tokens=8000)
     m = _re.search(r"\{.*\}", raw or "", _re.S)
@@ -534,7 +543,7 @@ def fan_fundamentals_brief(free_md: str, home: str, away: str,
     )
     out = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
-                    model=config.FUND_ANALYZE_MODEL,
+                    tier="balanced",
                     timeout=config.FUND_ANALYZE_TIMEOUT,
                     max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
     if not out or out.startswith(_LLM_ERR_PREFIXES):
@@ -579,7 +588,7 @@ def seo_summarize(free_body: str, home: str, away: str, league: str,
     )
     raw = _call_llm(system, user,
                     effort=config.LLM_LIVE_EFFORT,
-                    model=config.LLM_LIVE_MODEL,
+                    tier="balanced",
                     timeout=config.LLM_LIVE_TIMEOUT,
                     max_tokens=config.LLM_LIVE_MAX_TOKENS)
     # _call_llm 失败时返回错误说明串（非 JSON），下面解析失败即回退并带回原因
@@ -617,14 +626,16 @@ _TOTAL_STAGES = 7
 
 def analyze_stream(csv_text: str, fundamentals: str,
                    home: str, away: str, league: str,
-                   extra_instruction: str = "", effort: str = ""):
+                   extra_instruction: str = "", effort: str = "",
+                   visitor: bool = False):
     """流式精算。yield 进度/结果事件，供 bot 实时播报：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
       ('done', 完整报告)
       ('error', 错误串)
     阶段识别：检测累积全文里新出现的 `### N.` 主段标题。
     extra_instruction: 用户自定义侧重，透传给 _analyze_prompts。
-    effort: 推理强度（low/medium/high/xhigh），透传给 _stream_llm。
+    effort: 推理强度，透传给 _stream_llm。
+    visitor: True=访客触发，用重档访客那份模型（管理员触发则用管理员那份）。
     """
     import re
     if not available():
@@ -635,7 +646,8 @@ def analyze_stream(csv_text: str, fundamentals: str,
     # 匹配行首的 "### 3." / "###3." 等主段标题，捕获段号
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
-    for kind, payload in _stream_llm(system, user, effort):
+    for kind, payload in _stream_llm(system, user, effort, tier="heavy",
+                                     visitor=visitor):
         if kind == "delta":
             # 每收到一块就透传一个轻量事件，供 bot 循环高频检查中断（消费方忽略未知事件）
             yield ("progress",)
@@ -651,16 +663,16 @@ def analyze_stream(csv_text: str, fundamentals: str,
 
 
 def review_blind_stream(csv_text: str, home: str, away: str, league: str,
-                        effort: str = ""):
+                        effort: str = "", visitor: bool = False):
     """复盘第一遍【盲推】：只喂盘口 CSV，不给比分、不给基本面，
     让模型从上到下正向跑 SOP 步骤 1~7 得出赛前预判（它此时并不知道结果）。
     直接复用 analyze_stream（基本面置空），阶段名沿用精算 7 段。
-    effort: 推理强度，透传给 analyze_stream。
+    effort: 推理强度，透传给 analyze_stream。visitor: 透传角色。
     """
     blind_note = ("（赛后复盘·第一遍盲推：本次不提供基本面与比赛结果，"
                   "请仅依据盘口走势正向执行 SOP 步骤1~7，给出赛前预判结论。）")
     yield from analyze_stream(csv_text, blind_note, home, away, league,
-                              effort=effort)
+                              effort=effort, visitor=visitor)
 
 
 def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
@@ -733,13 +745,13 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
 
 def review(csv_text: str, forecast_text: str, result_text: str,
            home: str, away: str, league: str, effort: str = "",
-           fund_brief: str = "") -> str:
-    """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。"""
+           fund_brief: str = "", visitor: bool = False) -> str:
+    """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
     system, user = _review_prompts(csv_text, forecast_text, result_text,
                                    home, away, league, fund_brief)
-    return _call_llm(system, user, effort)
+    return _call_llm(system, user, effort, tier="heavy", visitor=visitor)
 
 
 # 复盘报告 ### N. 段标题 → 进度阶段名（对照复盘第二遍）
@@ -756,14 +768,14 @@ _REVIEW_TOTAL_STAGES = 6
 
 def review_stream(csv_text: str, forecast_text: str, result_text: str,
                   home: str, away: str, league: str, effort: str = "",
-                  fund_brief: str = ""):
+                  fund_brief: str = "", visitor: bool = False):
     """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
       ('error', 错误串)
     forecast_text 为第一遍盲推产出的预判全文。
     fund_brief 非空则结合基本面研判做归因（盲推的盲区）。
-    effort: 推理强度，透传给 _stream_llm。
+    effort: 推理强度，透传给 _stream_llm。visitor: 透传角色（重档访客/管理员那份模型）。
     """
     import re
     if not available():
@@ -773,7 +785,8 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
                                    home, away, league, fund_brief)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
-    for kind, payload in _stream_llm(system, user, effort):
+    for kind, payload in _stream_llm(system, user, effort, tier="heavy",
+                                     visitor=visitor):
         if kind == "delta":
             for m in head_re.finditer(payload):
                 n = int(m.group(1))

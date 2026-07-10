@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS llm_endpoint_state (
     updated_at TEXT
 );
 
+-- 三档模型运行时选定：key=model_heavy/model_balanced/model_light，value=模型名（字符串）。
+-- 数值型 llm_settings 存不了模型名，故独立建表。默认由 config.LLM_TIER_MODELS 各档 default 灌。
+-- /llm 面板切换、一键回退旧模型都写这里；缺行时 getter 回退 config 默认。
+CREATE TABLE IF NOT EXISTS llm_runtime_state (
+    key        TEXT PRIMARY KEY,             -- model_heavy / model_balanced / model_light
+    value      TEXT NOT NULL,                -- 选定的模型名
+    updated_at TEXT
+);
+
 -- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
 -- 避免污染赛前 SOP 的 CSV。只存 main:true 主盘口线(走地只看主盘)。
 CREATE TABLE IF NOT EXISTS live_odds_history (
@@ -203,6 +212,17 @@ def seed_config(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO llm_settings (key, value, updated_at) "
         "VALUES (?,?,?)", llm_rows)
+
+    # 三档模型运行时选定默认值（INSERT OR IGNORE：/llm 切过的不覆盖）。
+    # 每档两份：model_<tier>（管理员）+ model_<tier>_visitor（访客），初值各取 default/visitor_default。
+    tier_rows = []
+    for tier in config.LLM_TIER_MODELS:
+        tier_rows.append((f"model_{tier}", config.llm_tier_default(tier, False), now))
+        tier_rows.append((f"model_{tier}_visitor",
+                          config.llm_tier_default(tier, True), now))
+    conn.executemany(
+        "INSERT OR IGNORE INTO llm_runtime_state (key, value, updated_at) "
+        "VALUES (?,?,?)", tier_rows)
     conn.commit()
 
 
@@ -358,6 +378,67 @@ def reset_llm_settings(conn: sqlite3.Connection) -> None:
             for k, spec in config.LLM_SETTING_SPECS.items()]
     conn.executemany(
         "INSERT INTO llm_settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at", rows)
+    conn.commit()
+
+
+# ─── 三档模型运行时选定（TG /llm 面板读写，llm_client 按档位×角色读取）──────────
+# 每档两份：model_<tier>（管理员）+ model_<tier>_visitor（访客）。共 6 个键。
+def _parse_runtime_key(key: str) -> tuple[str, bool] | None:
+    """解析 runtime-state key → (tier, visitor)。非法返回 None。
+    model_heavy → ("heavy", False)；model_heavy_visitor → ("heavy", True)。"""
+    if not key.startswith("model_"):
+        return None
+    rest = key[len("model_"):]
+    visitor = rest.endswith("_visitor")
+    tier = rest[:-len("_visitor")] if visitor else rest
+    return (tier, visitor) if tier in config.LLM_TIER_MODELS else None
+
+
+def get_llm_runtime_state(conn: sqlite3.Connection) -> dict[str, str]:
+    """读六档选定模型 {model_<tier>[_visitor]: 模型名}。
+    以 config.LLM_TIER_MODELS 为准补齐缺失键（旧库首次加表未 seed 到的），回退各自 default，
+    确保调用方永远拿得到 6 个键。"""
+    rows = dict(conn.execute("SELECT key, value FROM llm_runtime_state").fetchall())
+    out: dict[str, str] = {}
+    for tier in config.LLM_TIER_MODELS:
+        out[f"model_{tier}"] = str(
+            rows.get(f"model_{tier}", config.llm_tier_default(tier, False)))
+        out[f"model_{tier}_visitor"] = str(
+            rows.get(f"model_{tier}_visitor", config.llm_tier_default(tier, True)))
+    return out
+
+
+def set_llm_runtime_state(conn: sqlite3.Connection, key: str, value: str,
+                          allow_any: bool = False) -> bool:
+    """写单档单角色选定模型（UPSERT）。key ∈ model_<tier>[_visitor] 白名单；
+    默认校验 value ∈ 该档该角色 choices，allow_any=True 时豁免（一键回退旧模型用）。非法返回 False。"""
+    parsed = _parse_runtime_key(key)
+    if parsed is None:
+        return False
+    tier, visitor = parsed
+    if not allow_any and value not in config.llm_tier_choices(tier, visitor):
+        return False
+    conn.execute(
+        "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (key, str(value), _now_utc_iso()))
+    conn.commit()
+    return True
+
+
+def reset_llm_runtime_state(conn: sqlite3.Connection) -> None:
+    """把六档模型恢复为 config 的 default/visitor_default（新模型默认）。"""
+    now = _now_utc_iso()
+    rows = []
+    for tier in config.LLM_TIER_MODELS:
+        rows.append((f"model_{tier}", config.llm_tier_default(tier, False), now))
+        rows.append((f"model_{tier}_visitor",
+                     config.llm_tier_default(tier, True), now))
+    conn.executemany(
+        "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
         "updated_at=excluded.updated_at", rows)
     conn.commit()

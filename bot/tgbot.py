@@ -1841,17 +1841,23 @@ def _broadcast_do(chat_id: int, message_id: int, token: str) -> None:
 
 
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
-    """构造推理强度选择键盘。mode='p'(预设)/'c'(自定义)。
-    管理员显示全部 4 档；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/中）。
+    """构造推理强度选择键盘（2行×3档）。mode='p'(预设)/'c'(自定义)。
+    管理员显示全部 6 档（低/普通/高 | 极高/最高/超高）；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/普通/高）。
     回调格式 ae:<mode>:<fid>:<effort>。
     """
     admin = _is_admin(chat_id)
-    row = []
+    row1, row2 = [], []
     for eff, label in config.LLM_EFFORT_LABELS.items():
         if not admin and eff not in config.LLM_EFFORT_VISITOR_ALLOWED:
             continue
-        row.append({"text": label, "callback_data": f"ae:{mode}:{fid}:{eff}"})
-    return {"inline_keyboard": [row]}
+        btn = {"text": label, "callback_data": f"ae:{mode}:{fid}:{eff}"}
+        # 低/普通/高 → 第1行；极高/最高/超高 → 第2行
+        if eff in ("low", "medium", "high"):
+            row1.append(btn)
+        else:
+            row2.append(btn)
+    # 访客只有 3 档(row1)，管理员有 6 档(row1+row2)
+    return {"inline_keyboard": [row1] + ([row2] if row2 else [])}
 
 
 def _cmd_analyze(chat_id: int, args: list[str]) -> None:
@@ -1952,7 +1958,9 @@ def _run_fundamentals(chat_id: int, fid: int,
         edit_text(chat_id, msg_id, "🧠 正在分析基本面（轻量模型预处理，可停止）…",
                   stop_kb)
     brief = None
-    for ev in analyzer.analyze_fundamentals_stream(funds, home, away, league):
+    _visitor = not _is_admin(chat_id)
+    for ev in analyzer.analyze_fundamentals_stream(funds, home, away, league,
+                                                   visitor=_visitor):
         if cancel is not None and cancel.is_set():
             if msg_id:
                 edit_text(chat_id, msg_id, "🛑 已停止基本面预分析。", _NO_KB)
@@ -2045,9 +2053,11 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
 
     msg_id = send(chat_id, progress_text(1, "数据提取"), stop_kb)
     report = None
+    _visitor = not _is_admin(chat_id)
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
                                       meta["away"], meta["league"],
-                                      extra_instruction, effort):
+                                      extra_instruction, effort,
+                                      visitor=_visitor):
         # 每块数据都检查中断：用户点了停止按钮就立即收尾（不再等 LLM 跑完）
         if cancel is not None and cancel.is_set():
             if msg_id:
@@ -2123,6 +2133,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     if not analyzer.available():
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
         return
+    _visitor = not _is_admin(chat_id)   # 访客复盘用访客那份模型
     csv_str, meta = _build_csv(fid)
     if not csv_str:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
@@ -2174,7 +2185,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         msg_a = send(chat_id, blind_progress(1, analyzer._STAGE_NAMES[1]), stop_kb)
         for ev in analyzer.review_blind_stream(csv_str, meta["home"],
                                                meta["away"], meta["league"],
-                                               effort):
+                                               effort, visitor=_visitor):
             if cancel is not None and cancel.is_set():
                 if msg_a:
                     edit_text(chat_id, msg_a,
@@ -2226,7 +2237,8 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     if raw_funds and not raw_funds.startswith("（基本面"):
         send(chat_id, "🧠 正在分析基本面（供对照归因）…")
         brief, ok = analyzer.analyze_fundamentals(
-            raw_funds, meta["home"], meta["away"], meta["league"])
+            raw_funds, meta["home"], meta["away"], meta["league"],
+            visitor=_visitor)
         # 成功用研判；失败回退原始数据（仍可供归因，只是未经方法论提炼）
         fund_brief = brief if ok else raw_funds
 
@@ -2257,7 +2269,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     report = None
     for ev in analyzer.review_stream(csv_str, forecast, result_text,
                                      meta["home"], meta["away"], meta["league"],
-                                     effort, fund_brief):
+                                     effort, fund_brief, visitor=_visitor):
         if cancel is not None and cancel.is_set():
             if msg_id:
                 edit_text(chat_id, msg_id,
@@ -2371,23 +2383,33 @@ def _llm_panel_text() -> str:
             extra = "，选路已降优先"
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
-        # 模型映射（第4段）：有则显示「重→X 轻→Y」，无则标「默认模型」
+        # 模型映射（第4段）：有则显示各档，无则标「默认（随档位）」
         mm = ep.get("model_map") or {}
         if mm:
             parts = []
             if mm.get("heavy"):
                 parts.append(f"重→{mm['heavy']}")
+            if mm.get("balanced"):
+                parts.append(f"平→{mm['balanced']}")
             if mm.get("light"):
                 parts.append(f"轻→{mm['light']}")
             mm_line = "　映射：" + " ".join(parts)
         else:
-            mm_line = "　映射：默认（重 gpt-5.5 / 轻 gpt-5.4-mini）"
+            mm_line = "　映射：默认（跟随各档运行时选定模型）"
         lines.append(
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
             f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
             f"  {mm_line}\n"
             f"{_fmt_last_probe(i)}")
+
+    # 模型档位段：每档两份（管理员/访客），当前选定模型
+    lines.append("\n<b>🎚️ 模型档位</b>（管理员/访客分开；点按钮轮换，即时生效免重启）")
+    for tier, spec in config.LLM_TIER_MODELS.items():
+        cur_a = llm_client.get_tier_model(tier, visitor=False)
+        cur_v = llm_client.get_tier_model(tier, visitor=True)
+        lines.append(f"· {spec['label']}\n"
+                     f"　管理员：<b>{cur_a}</b>　访客：<b>{cur_v}</b>")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():
@@ -2404,11 +2426,11 @@ def _llm_panel_keyboard() -> dict:
     stats = llm_client.breaker_stats()
     rows: list[list[dict]] = []
 
-    # 测试区：全部测试分重/轻/两者三档（lt:all:<which>）+ 逐端点一行（测试重档 / 开关 / 熔断时重置）
+    # 测试区：全部测试分重/平衡/轻三档（lt:all:<tier>）+ 逐端点一行（测试重档 / 开关 / 熔断时重置）
     rows.append([
-        {"text": "🧪 测全部·重", "callback_data": "lt:all:heavy"},
-        {"text": "🧪 测全部·轻", "callback_data": "lt:all:light"},
-        {"text": "🧪 两者", "callback_data": "lt:all:both"},
+        {"text": "🧪 测·重", "callback_data": "lt:all:heavy"},
+        {"text": "🧪 测·平衡", "callback_data": "lt:all:balanced"},
+        {"text": "🧪 测·轻", "callback_data": "lt:all:light"},
     ])
     for i, st in enumerate(stats):
         on = llm_client.is_enabled(i)
@@ -2438,8 +2460,29 @@ def _llm_panel_keyboard() -> dict:
     if param_row:
         rows.append(param_row)
 
+    # 模型档位切换区：每档一行两个按钮——管理员那份(lmt:<tier>:<idx>) + 访客那份(lmt:<tier>:<idx>:v)。
+    # 各自在自己角色的候选里轮换到下一个（访客候选可能与管理员不同，如重档访客只有 terra/mini）。
+    # 当前值不在候选里（如已回退旧模型）时点一下切到首个候选。
+    for tier in config.LLM_TIER_MODELS:
+        row = []
+        for vis in (False, True):
+            cur = llm_client.get_tier_model(tier, visitor=vis)
+            choices = config.llm_tier_choices(tier, vis)
+            try:
+                nxt = (choices.index(cur) + 1) % len(choices)
+            except ValueError:
+                nxt = 0
+            role = "访客" if vis else "管理"
+            suffix = ":v" if vis else ""
+            row.append({"text": f"🎚️{role} {cur} ⇄",
+                        "callback_data": f"lmt:{tier}:{nxt}{suffix}"})
+        rows.append(row)
+
     rows.append([{"text": "🔄 刷新", "callback_data": "lm:"},
                  {"text": "↩️ 参数恢复默认", "callback_data": "lx:reset"}])
+    # 模型档位专用：回退旧模型 / 恢复新模型默认
+    rows.append([{"text": "🛟 回退旧模型(5.5+mini)", "callback_data": "lmt:legacy"},
+                 {"text": "✨ 恢复新模型默认", "callback_data": "lmt:reset"}])
     return {"inline_keyboard": rows}
 
 
@@ -2453,7 +2496,49 @@ def _llm_refresh(chat_id: int, message_id: int) -> None:
     edit_text(chat_id, message_id, _llm_panel_text(), _llm_panel_keyboard())
 
 
-_WHICH_ZH = {"heavy": "重", "light": "轻"}
+_WHICH_ZH = {"heavy": "重", "balanced": "平衡", "light": "轻"}
+
+
+def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
+                               message_id: int) -> None:
+    """处理模型档位回调：
+      lmt:<tier>:<idx>     切某档【管理员】那份到该角色候选[idx]
+      lmt:<tier>:<idx>:v   切某档【访客】那份
+      lmt:legacy           一键回退旧模型（管理员+访客都设：重=5.5、平衡/轻=mini）
+      lmt:reset            恢复新模型默认（管理员 sol/terra/luna + 访客 terra/terra/luna）
+    """
+    if data == "lmt:legacy":
+        llm_client.apply_legacy_models()
+        answer_callback(cb_id, "已回退旧模型：重=gpt-5.5，平衡/轻=gpt-5.4-mini（管理员+访客）")
+        _llm_refresh(chat_id, message_id)
+        return
+    if data == "lmt:reset":
+        llm_client.reset_runtime_models()
+        answer_callback(cb_id, "已恢复新模型默认")
+        _llm_refresh(chat_id, message_id)
+        return
+    # lmt:<tier>:<idx>[:v]
+    parts = data.split(":")
+    visitor = len(parts) >= 4 and parts[3] == "v"
+    try:
+        tier = parts[1]
+        idx = int(parts[2])
+    except (IndexError, ValueError):
+        answer_callback(cb_id, "参数错误")
+        return
+    if tier not in config.LLM_TIER_MODELS:
+        answer_callback(cb_id, "档位无效")
+        return
+    choices = config.llm_tier_choices(tier, visitor)
+    if not (0 <= idx < len(choices)):
+        answer_callback(cb_id, "候选无效")
+        return
+    model = choices[idx]
+    ok = llm_client.set_tier_model(tier, model, visitor=visitor)
+    role = "访客" if visitor else "管理员"
+    label = config.LLM_TIER_MODELS[tier]["label"]
+    answer_callback(cb_id, f"{label}·{role} → {model}" if ok else "切换失败")
+    _llm_refresh(chat_id, message_id)
 
 
 def _fmt_probe_line(r: dict) -> str:
@@ -2975,19 +3060,23 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
-    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / le:开关端点 / ls:改参数 / lm:刷新 / lx:重置参数，仅管理员）──
-    if data.startswith(("lt:", "lr:", "le:", "ls:", "lm:", "lx:")):
+    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / le:开关端点 / ls:改参数 / lm:刷新 /
+    #    lx:重置参数 / lmt:模型档位切换，仅管理员）──
+    if data.startswith(("lt:", "lr:", "le:", "ls:", "lm:", "lx:", "lmt:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可操作")
             return
+        if data.startswith("lmt:"):
+            _handle_llm_model_callback(cb_id, data, chat_id, message_id)
+            return
         if data.startswith("lt:"):
-            # lt:<target>:<which>，target=all 或端点序号，which=heavy/light/both。
+            # lt:<target>:<which>，target=all 或端点序号，which=heavy/balanced/light/both。
             # 缺 which 段兼容旧格式（默认 heavy）。连通性测试可能数秒 → 丢该 chat
             # 专属线程池，不阻塞轮询（both 会发 2N 个请求，更该异步）。
             rest = data[3:].split(":")
             target = rest[0]
             which = rest[1] if len(rest) > 1 and rest[1] in (
-                "heavy", "light", "both") else "heavy"
+                "heavy", "balanced", "light", "both") else "heavy"
             answer_callback(cb_id, "测试中…")
             # 丢通用后台池而非 per-chat 池：连通性测试数秒，不占死该 chat 的
             # 唯一工作线程，测试期间命令/停止键仍即时响应。

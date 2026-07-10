@@ -106,7 +106,7 @@ def probe_full():
 
 def probe_pool(which: str = "heavy"):
     """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 9 参数。
-    which='heavy' 测重档(gpt-5.5)，'light' 测轻档(gpt-5.4-mini/映射)。
+    which ∈ heavy/balanced/light：测哪档（按该档运行时选定模型 + 端点映射解析真实模型名）。
     需先 init_db（读 llm_settings）；未 init 时 llm_client 回退 config 默认。"""
     from bot import llm_client, db
     try:
@@ -127,7 +127,7 @@ def probe_pool(which: str = "heavy"):
     for k, v in llm_client.get_settings().items():
         print(f"  {k:<28} = {v}")
 
-    tier = "轻档" if which == "light" else "重档"
+    tier = {"heavy": "重档", "balanced": "平衡档", "light": "轻档"}.get(which, "重档")
     print(f"\n逐端点连通性探针（{tier}，最小 chat 请求）：")
     print("=" * 60)
     for r in llm_client.probe_all(which):
@@ -154,8 +154,9 @@ if __name__ == "__main__":
     elif arg == "effort":
         probe_effort()
     elif arg == "pool":
-        # python probe_llm.py pool [heavy|light]，默认 heavy(测 gpt-5.5)
-        w = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] in ("heavy", "light") else "heavy"
+        # python probe_llm.py pool [heavy|balanced|light]，默认 heavy
+        w = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] in (
+            "heavy", "balanced", "light") else "heavy"
         probe_pool(w)
     else:
         probe_minimal()
