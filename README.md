@@ -4,11 +4,11 @@
 
 **Automated Football Odds Polling & Handicap Analysis Backend**
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)
-![API-Football](https://img.shields.io/badge/API--Football-v3-00A859)
-![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white)
-![LLM](https://img.shields.io/badge/LLM-OpenAI--compatible-412991)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![API-Football](https://img.shields.io/badge/API--Football-v3-00A859)](https://www.api-football.com/)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
+[![LLM](https://img.shields.io/badge/LLM-OpenAI--compatible-412991)](https://platform.openai.com/docs/api-reference)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](https://opensource.org/license/MIT)
 
 [English](README.md) | [中文](README.zh.md)
