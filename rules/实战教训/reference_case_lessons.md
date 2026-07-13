@@ -70,6 +70,7 @@
 | 25 | 天津津门虎 1-0 大连英博 | 2026-05-31 | 中超 | 主队赢球赢盘 | csl E（kelly F 的例外） | [20260531_case_04_tianjin_vs_dalian.md](20260531_case_04_tianjin_vs_dalian.md) |
 | 26 | Brazil 1-2 Norway | 2026-07-06 | 世界杯 | 客胜，受让方 +0.5 赢盘 | strong_team_deep C | [20260706_case_06_brazil_vs_norway.md](20260706_case_06_brazil_vs_norway.md) |
 
+| 27 | KA阿克雷里 3-2 IA阿克拉内斯 | 2026-07-13 | 冰岛超 | 主队3-2取胜；亚盘方向命中，平局首选错误 | kelly_signals H | [20260713_case_11_KA_Akureyri_vs_IA_Akranes.md](20260713_case_11_KA_Akureyri_vs_IA_Akranes.md) |
 > 表中主题缩写对应文件：sync_pricing=[feedback_sync_pricing.md](feedback_sync_pricing.md)、lure_variants=[feedback_lure_variants.md](feedback_lure_variants.md)、late_stage=[feedback_late_stage_shift.md](feedback_late_stage_shift.md)、kelly=[feedback_kelly_signals.md](feedback_kelly_signals.md)、csl=[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md)、h2h=[feedback_h2h_weight.md](feedback_h2h_weight.md)、home_away=[feedback_home_away_quality.md](feedback_home_away_quality.md)、fundamentals=[feedback_fundamentals_weight.md](feedback_fundamentals_weight.md)、heat_direction=[feedback_heat_direction.md](feedback_heat_direction.md)、strong_team_deep=[feedback_strong_team_deep.md](feedback_strong_team_deep.md)
 
 ## 新教训的归档规则
