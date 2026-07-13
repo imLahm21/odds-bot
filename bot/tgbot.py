@@ -1427,14 +1427,15 @@ def _lesson_topic_keyboard(token: str, route: dict) -> dict:
 
 
 def _lesson_step_route(chat_id: int, message_id: int, token: str) -> None:
-    """第1步：跑 route_lesson（gpt-5.5），列候选主题让管理员选。"""
+    """第1步：跑 route_lesson（重档模型），列候选主题让管理员选。"""
     with _lesson_lock:
         info = _lesson_pending.get(token)
     if not info:
         edit_text(chat_id, message_id, "⏳ 会话已过期，请重新发起归档。")
         return
     meta, report = info["meta"], info["report"]
-    edit_text(chat_id, message_id, "🧭 正在判断归入哪个教训主题（gpt-5.5）…")
+    edit_text(chat_id, message_id,
+              f"🧭 正在判断归入哪个教训主题（{_tier_model_label(chat_id)}）…")
     route, err = analyzer.route_lesson(report, meta["home"], meta["away"],
                                        meta.get("league", ""))
     if not route:
@@ -1455,7 +1456,7 @@ def _lesson_step_route(chat_id: int, message_id: int, token: str) -> None:
 
 def _lesson_step_compose(chat_id: int, message_id: int, token: str,
                          slug_choice: str) -> None:
-    """第2步：管理员选定主题 → compose_archive_plan（gpt-5.5）+ 采番 → 发预览。"""
+    """第2步：管理员选定主题 → compose_archive_plan（重档模型）+ 采番 → 发预览。"""
     import os
     with _lesson_lock:
         info = _lesson_pending.get(token)
@@ -1484,7 +1485,8 @@ def _lesson_step_compose(chat_id: int, message_id: int, token: str,
             return
         letter = lesson_archive.next_section_letter(topic_text)
     edit_text(chat_id, message_id,
-              f"🧠 正在为主题 <b>{slug}</b> 生成 {letter} 节归档方案（gpt-5.5）…")
+              f"🧠 正在为主题 <b>{slug}</b> 生成 {letter} 节归档方案"
+              f"（{_tier_model_label(chat_id)}）…")
     plan, err = analyzer.compose_archive_plan(
         report, meta, slug, topic_text,
         section_letter=letter, is_new_topic=is_new)
