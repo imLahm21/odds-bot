@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # 全局备份 → 打包 → 上传到【多个】云盘（rclone）→ 清理超期备份
 #
-# 备份内容（只备 git 里没有、丢了不可恢复的）：
+# 备份内容（丢了不可恢复 / 或虽在 git 但要双保险的）：
 #   .env       所有 API 密钥/LLM 端点/Ghost 凭证（gitignore，最关键）
 #   odds.db    历史盘口快照 + 关注配置 + 端点开关 + 访客额度
 #   report/    归档的精算/复盘报告
 #   data/      抓取的 CSV 快照（可选，能重抓，但一并备省事）
+#   rules/     实战教训库（bot /lesson 归档写入；虽已进 git，但若某次 push 失败/
+#              未及时提交，云盘备份是最后一道保险，不丢教训数据）
 #
 # 用法：
 #   bash deploy/backup.sh              # 手动跑一次
@@ -44,7 +46,7 @@ fi
 
 # 只打包存在的目标（data/ 可能不存在也不报错）
 TARGETS=()
-for p in .env odds.db report data; do
+for p in .env odds.db report data rules; do
     [ -e "$p" ] && TARGETS+=("$p")
 done
 if [ ${#TARGETS[@]} -eq 0 ]; then

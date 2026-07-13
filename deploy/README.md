@@ -11,8 +11,9 @@
 | 文件 | 作用 |
 |---|---|
 | `odds-bot.service` | 主守护进程（TG bot + 调度器）systemd 单元 |
-| `backup.sh` | odds 备份：打包 .env/odds.db/report/data → 传多云盘 → 清超期 |
+| `backup.sh` | odds 备份：打包 .env/odds.db/report/data/rules → 传多云盘 → 清超期 |
 | `odds-backup.service` / `.timer` | odds 每日备份（北京 04:00） |
+| `commit-lessons.sh` | 服务器一键提交实战教训：bot /lesson 归档后，把 rules/实战教训/ 改动 add+commit+push（安全顺序：先 fetch，落后则先 stash→pull→pop 再提交，防分叉） |
 | `restore.sh` | odds 恢复：从云盘拉最新备份并解开（带覆盖护栏） |
 | `ghost-backup.sh` | Ghost 备份：mysqldump + content volume + 配置 → 传多云盘 |
 | `ghost-backup.service` / `.timer` | Ghost 每日备份（北京 04:30） |
@@ -29,9 +30,15 @@ cd ~/odds-bot && git pull origin main
 dos2unix deploy/*.sh 2>/dev/null || sed -i 's/\r$//' deploy/*.sh && chmod +x deploy/*.sh
 
 # 手动跑各备份
-bash deploy/backup.sh          # odds → gdrive + pikpak
+bash deploy/backup.sh          # odds → gdrive + pikpak（含 rules 实战教训）
 bash deploy/ghost-backup.sh    # ghost → gdrive + pikpak
 bash deploy/verify-backup.sh   # 抽查完整性
+
+# bot 跑 /lesson 归档后，一键把实战教训提交推送到 GitHub（先配一次 git 身份）
+git config user.name "imLahm21"
+git config user.email "imLahm21@users.noreply.github.com"
+bash deploy/commit-lessons.sh              # 自动生成提交信息 + push
+# 之后本地 git pull 即可同步这些教训
 
 # 装全部定时器
 for u in odds-backup ghost-backup verify-backup; do
