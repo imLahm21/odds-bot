@@ -1840,6 +1840,13 @@ def _broadcast_do(chat_id: int, message_id: int, token: str) -> None:
     edit_text(chat_id, message_id, summary or "未发送。")
 
 
+def _tier_model_label(chat_id: int, tier: str = "heavy") -> str:
+    """该 chat 身份下某档【当前选定模型名】，供进度提示显示（不再写死 gpt-5.5）。
+    显示的是档位选定模型（主力端点跟随面板即用它）；若某次故障转移落到端点映射钉死的
+    兜底端点，实际模型可能不同，但对跟随面板的主力端点这就是准确值。"""
+    return llm_client.get_tier_model(tier, visitor=not _is_admin(chat_id))
+
+
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
     """构造推理强度选择键盘（2行×3档）。mode='p'(预设)/'c'(自定义)。
     管理员显示全部 6 档（低/普通/高 | 极高/最高/超高）；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/普通/高）。
@@ -2031,7 +2038,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     if eff_label:
         tag += f"·{eff_label}"
     title = (f"⏳ 正在精算 {meta['home']} vs {meta['away']}"
-             f"（{tag}，gpt-5.5，约 1~3 分钟）")
+             f"（{tag}，{_tier_model_label(chat_id)}，约 1~3 分钟）")
     if extra_instruction.strip():
         title += f"\n侧重：{extra_instruction.strip()[:80]}"
     total = analyzer._TOTAL_STAGES
@@ -2166,7 +2173,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     # ── 第一遍：盲推（只喂盘口，不给比分），正向跑 SOP 7 步 ──（compare 跳过）
     if sub_mode in ("all", "blind"):
         send(chat_id, f"🔬 第一步【盲推】：不看比分，仅凭盘口正向跑 SOP "
-                      f"得赛前预判（gpt-5.5，约 1~3 分钟）…")
+                      f"得赛前预判（{_tier_model_label(chat_id)}，约 1~3 分钟）…")
         blind_title = f"⏳ 第一步·盲推 {meta['home']} vs {meta['away']}（不看结果）"
         total_a = analyzer._TOTAL_STAGES
 
@@ -2250,7 +2257,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     # ── 第二遍：揭晓比分，对照归因（6 步）──
     send(chat_id, "🎬 第二步【对照】：揭晓真实比分，对照盲推预判做归因复盘…")
     title = (f"⏳ 第二步·对照复盘 {meta['home']} vs {meta['away']}\n"
-             f"{result_text.splitlines()[0]}\n（gpt-5.5，约 1~3 分钟）")
+             f"{result_text.splitlines()[0]}\n（{_tier_model_label(chat_id)}，约 1~3 分钟）")
     total = analyzer._REVIEW_TOTAL_STAGES
 
     def progress_text(cur_n: int | None) -> str:
@@ -2578,7 +2585,7 @@ def _llm_run_probe(chat_id: int, message_id: int, target: str,
         send(chat_id, "端点序号错误。")
         return
 
-    title = {"heavy": "重档 gpt-5.5", "light": "轻档",
+    title = {"heavy": "重档", "balanced": "平衡档", "light": "轻档",
              "both": "重档+轻档"}.get(which, which)
     lines = [f"<b>🧪 连通性测试结果（{title}）</b>"]
     lines += [_fmt_probe_line(r) for r in results]

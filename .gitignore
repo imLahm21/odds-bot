@@ -48,6 +48,8 @@ env/
 probe_samples/
 catalog_leagues.txt
 catalog_bookmakers.txt
+# 本地部署便签（cd/pull/restart 三行速查，非项目文件）
+刷新命令.txt
 
 # ===== 编辑器 / 系统 =====
 .vscode/
