@@ -422,6 +422,7 @@ ANALYZE_RULE_FILES = [
     "rules/方法论/reference_national_team.md",
     "rules/方法论/reference_competition_context.md",
     "rules/风控验证/reference_kelly_index.md",
+    "rules/风控验证/reference_staking_kelly.md",
     "rules/实战教训/reference_case_lessons.md",
     "rules/实战教训/reference_cases.md",
 ]

@@ -620,8 +620,9 @@ _STAGE_NAMES = {
     5: "风控验证",
     6: "缺失节点预测",
     7: "最终精算结论",
+    8: "投注决策",
 }
-_TOTAL_STAGES = 7
+_TOTAL_STAGES = 8
 
 
 def analyze_stream(csv_text: str, fundamentals: str,
