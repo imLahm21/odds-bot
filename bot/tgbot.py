@@ -360,6 +360,7 @@ def setup_commands() -> None:
         {"command": "fixtures", "description": "过去3天~未来3天赛程（含 fixture_id）"},
         {"command": "coverage", "description": "看某场数据采集进度（10节点缺漏）"},
         {"command": "analyze", "description": "对某场跑 SOP 精算预测"},
+        {"command": "parlay", "description": "3串1串关分析（Beta，实验中）：/parlay id1 id2 id3"},
         {"command": "review", "description": "对已结束的比赛做盘口复盘"},
         {"command": "export", "description": "导出某场全部盘口为 CSV"},
         {"command": "live", "description": "订阅某场走地实时播报：/live fixture_id"},
@@ -493,6 +494,8 @@ _HELP_VISITOR = (
     "/live &lt;fixture_id&gt; — 订阅走地实时播报（进行中有异动自动推送）\n"
     "/unlive &lt;fixture_id&gt; — 退订走地播报；/lives — 看我的订阅\n"
     "/analyze &lt;fixture_id&gt; — 先看基本面+盘口走势，再按钮选预设/自定义侧重跑SOP预测\n"
+    "/parlay &lt;id1&gt; &lt;id2&gt; &lt;id3&gt; — 3串1串关分析（Beta）：现场跑3场精算再串；"
+    "实验功能、判定仅供参考，后续完善\n"
     "/review &lt;fixture_id&gt; — 对已结束的比赛做盘口复盘（盘口走势+实际比分）\n"
     "/status — 当前启用项\n"
 )
@@ -2100,6 +2103,196 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         send(chat_id, f"📁 报告已归档：{path}")
 
 
+# ─── /parlay 3串1串关（Beta）─────────────────────────────────────────────────
+def _parlay_quota_left(chat_id: int) -> int:
+    """该 chat 今日剩余串关次数。管理员/未设限返回大数。"""
+    limit = config.VISITOR_PARLAY_DAILY_LIMIT
+    if _is_admin(chat_id) or limit <= 0:
+        return 1 << 30
+    conn = db.get_conn()
+    try:
+        used = db.get_parlay_used(conn, chat_id, _today_cst())
+    finally:
+        conn.close()
+    return max(0, limit - used)
+
+
+def _parlay_consume(chat_id: int) -> None:
+    """记一次串关使用：串关专属 +1，且共享 analyze 桶 +PARLAY_LEGS（每腿 1）。
+    管理员/未设限时不计。"""
+    if _is_admin(chat_id):
+        return
+    conn = db.get_conn()
+    try:
+        day = _today_cst()
+        if config.VISITOR_PARLAY_DAILY_LIMIT > 0:
+            db.incr_parlay_used(conn, chat_id, day)
+        if config.VISITOR_ANALYZE_DAILY_LIMIT > 0:
+            db.incr_analyze_used(conn, chat_id, day, config.PARLAY_LEGS)
+    finally:
+        conn.close()
+
+
+def _analyze_leg(chat_id: int, fid: int, effort: str,
+                 progress_cb, cancel) -> tuple[str | None, dict | None]:
+    """跑单腿精算（复用单场链路，但不碰配额——配额由串关统一记）。
+    progress_cb(stage_n, stage_name) 用于串关统一进度显示。
+    返回 (report, meta)；失败返回 (None, meta_or_None)。可被 cancel 中断。"""
+    from . import fundamentals
+    csv_str, meta = _build_csv(fid)
+    if not csv_str:
+        return None, None
+    try:
+        conn = db.get_conn()
+        try:
+            funds = fundamentals.build_fundamentals(conn, fid)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("串关腿 %s 基本面拉取失败: %s", fid, e)
+        funds = "（基本面拉取失败）"
+
+    _visitor = not _is_admin(chat_id)
+    report = None
+    for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
+                                      meta["away"], meta["league"],
+                                      "", effort, visitor=_visitor):
+        if cancel is not None and cancel.is_set():
+            return None, meta
+        if ev[0] == "stage":
+            progress_cb(ev[1], ev[2])
+        elif ev[0] == "done":
+            report = ev[1]
+        elif ev[0] == "error":
+            log.warning("串关腿 %s 精算出错: %s", fid, ev[1])
+            return None, meta
+    return report, meta
+
+
+def _cmd_parlay(chat_id: int, args: list[str]) -> None:
+    """/parlay <id1> <id2> <id3> —— 现场跑 3 场单场精算再做 3串1 裁判（Beta）。"""
+    from . import parlay
+    n = config.PARLAY_LEGS
+    ids = [a for a in args if a.isdigit()]
+    if len(args) != n or len(ids) != n:
+        send(chat_id, f"用法：/parlay &lt;id1&gt; &lt;id2&gt; &lt;id3&gt;"
+                      f"（{n} 个场次号，空格分隔，id 见 /fixtures）\n"
+                      f"{config.PARLAY_BETA_NOTICE}")
+        return
+    fids = [int(x) for x in ids]
+    if len(set(fids)) != n:
+        send(chat_id, "⚠️ 三腿必须是不同比赛（同场腿属相关性套利，须另算）。")
+        return
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法串关。")
+        return
+
+    # 配额预检（消费前）：串关专属 ≥1 且共享 analyze 桶 ≥ 腿数
+    if _parlay_quota_left(chat_id) <= 0:
+        send(chat_id, f"⛔ 你今日的串关次数已用完（每日上限 "
+                      f"{config.VISITOR_PARLAY_DAILY_LIMIT} 次），请明天再试。")
+        return
+    if _analyze_quota_left(chat_id) < n:
+        send(chat_id, f"⛔ 串关需 {n} 次精算额度，你今日剩余不足"
+                      f"（剩 {_analyze_quota_left(chat_id)} 次）。串关与单场共享每日额度。")
+        return
+
+    # 确认三腿都有盘口数据（无数据不消费配额）
+    missing = [str(f) for f in fids if not _build_csv(f)[0]]
+    if missing:
+        send(chat_id, f"以下场次暂无盘口数据，无法串关：{', '.join(missing)}")
+        return
+
+    task_id = _submit_analysis(chat_id, "parlay", _run_parlay, chat_id, fids, "")
+    if task_id is None:
+        send(chat_id, f"⚠️ 你并行的分析任务已达上限"
+                      f"（{_ANALYSIS_MAX_PER_CHAT} 个），请先停止一个或等待。")
+
+
+def _run_parlay(chat_id: int, fids: list[int], effort: str = "",
+                task_id: str = "", cancel: "threading.Event | None" = None) -> None:
+    """串关执行：顺序跑 3 腿 + 抽取决策 + 确定性裁判。配额在此统一消费。"""
+    from . import parlay
+    effort = effort or config.LLM_EFFORT_DEFAULT
+    n = config.PARLAY_LEGS
+
+    # 消费前二次校验（提交到真正开跑之间可能已被其它任务扣额）
+    if _parlay_quota_left(chat_id) <= 0 or _analyze_quota_left(chat_id) < n:
+        send(chat_id, "⛔ 串关额度不足（可能刚被其它任务占用），请稍后再试。")
+        return
+    _parlay_consume(chat_id)
+    if not _is_admin(chat_id):
+        send(chat_id, f"（本次串关已计入：串关剩 {_parlay_quota_left(chat_id)} 次、"
+                      f"精算额度剩 {_analyze_quota_left(chat_id)} 次）")
+
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止串关", "callback_data": f"stopan:{task_id}"}]]}
+    title = f"⏳ 3串1 串关精算（{_tier_model_label(chat_id)}，约 3~9 分钟）"
+    msg_id = send(chat_id, f"{config.PARLAY_BETA_NOTICE}\n\n{title}\n\n"
+                           f"准备跑 {n} 场单场精算…", stop_kb)
+
+    legs: list[dict] = []
+    for i, fid in enumerate(fids):
+        if cancel is not None and cancel.is_set():
+            if msg_id:
+                edit_text(chat_id, msg_id, title + "\n\n🛑 已停止串关。", _NO_KB)
+            return
+        state = {"n": 1, "name": "数据提取"}
+
+        def progress_cb(sn, name, _i=i, _fid=fid, _st=state):
+            _st["n"], _st["name"] = sn, name
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          f"{title}\n\n腿 {_i+1}/{n}（fixture {_fid}）："
+                          f"第 {sn}/{analyzer._TOTAL_STAGES} 步 · {name} …",
+                          stop_kb)
+
+        report, meta = _analyze_leg(chat_id, fid, effort, progress_cb, cancel)
+        if cancel is not None and cancel.is_set():
+            if msg_id:
+                edit_text(chat_id, msg_id, title + "\n\n🛑 已停止串关。", _NO_KB)
+            return
+        if not report or not meta:
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          f"❌ 腿 {i+1}（fixture {fid}）精算失败，串关中止。"
+                          f"\n（配额已消费）", _NO_KB)
+            else:
+                send(chat_id, f"❌ 腿 {i+1}（fixture {fid}）精算失败，串关中止。")
+            return
+        # 单腿报告照常发 + 归档（访客也拿到 3 份单场报告）
+        _send_long(chat_id, _md_to_tg(report))
+        path = _archive_report(meta, report, chat_id=chat_id)
+        if path:
+            send(chat_id, f"📁 腿 {i+1} 报告已归档：{path}")
+
+        dec = analyzer.extract_decision(report, meta["home"], meta["away"])
+        if dec is None:
+            if msg_id:
+                edit_text(chat_id, msg_id,
+                          f"❌ 腿 {i+1} 决策抽取失败，串关判定不可用。"
+                          f"\n（配额已消费；单场报告见上）", _NO_KB)
+            else:
+                send(chat_id, f"❌ 腿 {i+1} 决策抽取失败，串关判定不可用。")
+            return
+        dec.update({"fid": fid, "home": meta["home"], "away": meta["away"]})
+        legs.append(dec)
+
+    # 三腿齐 → 确定性裁判
+    verdict = parlay.evaluate(legs)
+    report_md = parlay.render_report(verdict)
+    if msg_id:
+        edit_text(chat_id, msg_id, title + "\n\n✅ 三腿精算完成，串关裁判如下：", _NO_KB)
+    _send_long(chat_id, _md_to_tg(report_md))
+
+    # 合并结论归档
+    p_meta = {"home": f"parlay_{fids[0]}", "away": f"{fids[1]}_{fids[2]}",
+              "league": "3串1", "kick_cst": _today_cst()}
+    path = _archive_report(p_meta, report_md, suffix="parlay", chat_id=chat_id)
+    if path:
+        send(chat_id, f"📁 串关结论已归档：{path}")
+
+
 def _cmd_review(chat_id: int, args: list[str]) -> None:
     """复盘第一步：校验 + 弹模式选择键盘（只盲推/只对照/两步全跑）。
     选完模式再弹强度键盘（ae:r<mode>:<fid>:<effort>），选完强度才开跑（见 _run_review）。"""
@@ -2428,8 +2621,9 @@ def _llm_panel_text() -> str:
     return "\n".join(lines)
 
 
-def _llm_panel_keyboard() -> dict:
-    """面板内联键盘：测试按钮 + 每端点重置 + 9 参数改值 + 刷新/重置全部。"""
+def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
+    """面板内联键盘：测试按钮 + 每端点重置 + 9 参数改值 + 刷新/重置全部。
+    expand_test=i 时，第 i 条端点的「测试」行展开为 重/平衡/轻 子按钮(仅测该端点)。"""
     if not llm_client.available():
         return {"inline_keyboard": []}
     stats = llm_client.breaker_stats()
@@ -2443,18 +2637,27 @@ def _llm_panel_keyboard() -> dict:
     ])
     for i, st in enumerate(stats):
         on = llm_client.is_enabled(i)
-        # 开关按钮沿用 /leagues、/bookmakers 的约定：✅/⬜ 显示【当前状态】，
-        # 点击即翻转（le:<idx>:<目标状态 1开/0关>）。不用「启用/停用」动词，
-        # 避免与状态文字里的「🟢启用/⚪停用」语义打架（那是状态，这是动作）。
-        # 逐端点「测试」默认测重档 gpt-5.5（测轻/两者用上面的「测全部」系列）。
         mark = "✅" if on else "⬜"
-        ep_row: list[dict] = [
-            {"text": f"🔌 测试 {i}", "callback_data": f"lt:{i}:heavy"},
-            {"text": f"{mark} 端点{i}", "callback_data": f"le:{i}:{0 if on else 1}"},
-        ]
-        if st["state"] in ("OPEN", "HALF_OPEN"):
-            ep_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
-        rows.append(ep_row)
+        if expand_test == i:
+            # 该端点「测试」已展开：原地换成 重/平衡/轻 三个子按钮(仅测这一条)+收起。
+            # TG 内联按钮无长按，只能点击展开——点「测试 N」置 expand=N 重绘成这行。
+            rows.append([
+                {"text": f"🔬{i}·重", "callback_data": f"lt:{i}:heavy"},
+                {"text": f"🔬{i}·平衡", "callback_data": f"lt:{i}:balanced"},
+                {"text": f"🔬{i}·轻", "callback_data": f"lt:{i}:light"},
+                {"text": "↩︎", "callback_data": "lte:x"},
+            ])
+        else:
+            # 开关按钮沿用 /leagues、/bookmakers 的约定：✅/⬜ 显示【当前状态】，
+            # 点击即翻转（le:<idx>:<目标状态 1开/0关>）。
+            # 「测试 N」点击不再直接测，而是展开该端点的重/平衡/轻子按钮(lte:<i>)。
+            ep_row: list[dict] = [
+                {"text": f"🔌 测试 {i}", "callback_data": f"lte:{i}"},
+                {"text": f"{mark} 端点{i}", "callback_data": f"le:{i}:{0 if on else 1}"},
+            ]
+            if st["state"] in ("OPEN", "HALF_OPEN"):
+                ep_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
+            rows.append(ep_row)
 
     # 参数区：每行两个参数按钮（文案带当前值）
     settings = llm_client.get_settings()
@@ -2500,9 +2703,11 @@ def _cmd_llm(chat_id: int) -> None:
     send(chat_id, _llm_panel_text(), _llm_panel_keyboard())
 
 
-def _llm_refresh(chat_id: int, message_id: int) -> None:
-    """原地重绘面板（测试/改值/重置后调用）。"""
-    edit_text(chat_id, message_id, _llm_panel_text(), _llm_panel_keyboard())
+def _llm_refresh(chat_id: int, message_id: int,
+                 expand_test: int | None = None) -> None:
+    """原地重绘面板（测试/改值/重置后调用）。expand_test 透传给键盘展开某端点测试行。"""
+    edit_text(chat_id, message_id, _llm_panel_text(),
+              _llm_panel_keyboard(expand_test))
 
 
 _WHICH_ZH = {"heavy": "重", "balanced": "平衡", "light": "轻"}
@@ -2756,6 +2961,8 @@ def handle_message(msg: dict) -> None:
         _cmd_lives(chat_id)
     elif cmd == "analyze":
         _cmd_analyze(chat_id, args)
+    elif cmd == "parlay":
+        _cmd_parlay(chat_id, args)
     elif cmd == "review":
         _cmd_review(chat_id, args)
     elif cmd == "publish":
@@ -3071,12 +3278,19 @@ def handle_callback(cb: dict) -> None:
 
     # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / le:开关端点 / ls:改参数 / lm:刷新 /
     #    lx:重置参数 / lmt:模型档位切换，仅管理员）──
-    if data.startswith(("lt:", "lr:", "le:", "ls:", "lm:", "lx:", "lmt:")):
+    if data.startswith(("lt:", "lte:", "lr:", "le:", "ls:", "lm:", "lx:", "lmt:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可操作")
             return
         if data.startswith("lmt:"):
             _handle_llm_model_callback(cb_id, data, chat_id, message_id)
+            return
+        if data.startswith("lte:"):
+            # lte:<i> 展开该端点测试行为 重/平衡/轻；lte:x 收起。仅重绘键盘，不测。
+            arg = data[4:]
+            answer_callback(cb_id)
+            idx = int(arg) if arg.isdigit() else None
+            _llm_refresh(chat_id, message_id, expand_test=idx)
             return
         if data.startswith("lt:"):
             # lt:<target>:<which>，target=all 或端点序号，which=heavy/balanced/light/both。

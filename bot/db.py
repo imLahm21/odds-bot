@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS analyze_usage (
     PRIMARY KEY (chat_id, day)
 );
 
+-- 访客每日 /parlay(3串1) 用量：与 analyze_usage 同构，但独立计次。
+-- 串关「共享双扣」：跑一次串关既扣 3 次 analyze_usage（每腿 1 次），
+-- 又扣 1 次本表（串关专属日上限）。见 config.VISITOR_PARLAY_DAILY_LIMIT。
+CREATE TABLE IF NOT EXISTS parlay_usage (
+    chat_id  INTEGER NOT NULL,
+    day      TEXT NOT NULL,            -- 北京时间 YYYY-MM-DD
+    used     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, day)
+);
+
 -- LLM 故障转移/熔断可调参数：由 TG /llm 面板实时改，llm_client 读取（免重启）。
 -- 只存 9 个数值参数（非 secret）；端点密钥仍在 .env、不落库。key 白名单见
 -- config.LLM_SETTING_SPECS，seed_config 灌默认值。
@@ -336,14 +346,34 @@ def get_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
     return row[0] if row else 0
 
 
-def incr_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
-    """该 chat 当日用量 +1，返回自增后的值。UPSERT，跨天自然分行。"""
+def incr_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str,
+                      n: int = 1) -> int:
+    """该 chat 当日用量 +n（默认 1），返回自增后的值。UPSERT，跨天自然分行。
+    串关一次扣 3（每腿 1）时传 n=3。"""
     conn.execute(
-        "INSERT INTO analyze_usage (chat_id, day, used) VALUES (?,?,1) "
+        "INSERT INTO analyze_usage (chat_id, day, used) VALUES (?,?,?) "
+        "ON CONFLICT(chat_id, day) DO UPDATE SET used = used + ?",
+        (chat_id, day, n, n))
+    conn.commit()
+    return get_analyze_used(conn, chat_id, day)
+
+
+def get_parlay_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
+    """取某 chat 在某北京日期已用的 /parlay 次数（无记录返回 0）。"""
+    row = conn.execute(
+        "SELECT used FROM parlay_usage WHERE chat_id=? AND day=?",
+        (chat_id, day)).fetchone()
+    return row[0] if row else 0
+
+
+def incr_parlay_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
+    """该 chat 当日串关用量 +1，返回自增后的值。UPSERT，跨天自然分行。"""
+    conn.execute(
+        "INSERT INTO parlay_usage (chat_id, day, used) VALUES (?,?,1) "
         "ON CONFLICT(chat_id, day) DO UPDATE SET used = used + 1",
         (chat_id, day))
     conn.commit()
-    return get_analyze_used(conn, chat_id, day)
+    return get_parlay_used(conn, chat_id, day)
 
 
 # ─── LLM 熔断/故障转移参数（TG /llm 面板读写，llm_client 读取）──────────────

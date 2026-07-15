@@ -798,3 +798,73 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
             yield ("done", payload)
         elif kind == "error":
             yield ("error", payload)
+
+
+# ─── 串关(/parlay)用：从单场精算报告抽出结构化投注决策 ──────────────────────
+def extract_decision(report: str, home: str = "", away: str = "") -> dict | None:
+    """从一份单场精算报告（含第 8 节投注决策）抽出结构化决策，供串关裁判用。
+
+    用轻量【平衡档】+ JSON emission 范式（同 compose_archive_plan），比正则解析
+    散文表格稳。返回 dict 或 None（LLM 未配置/返回非 JSON/缺关键字段）：
+      {"play": 选中玩法, "odds": 十进制赔率, "edge": 小数(如 0.08),
+       "p_final": 小数, "evidence": strong/medium/weak/none, "stake": 数或null,
+       "pass": bool（该场是否整场 pass）}
+    """
+    import json
+    import re as _re
+    if not available():
+        return None
+    if not (report or "").strip():
+        return None
+    system = (
+        "你是数据抽取器。用户给你一份足球单场精算报告，其中『### 8. 投注决策』段"
+        "含各候选玩法的 edge 对比表与选中项。请只抽取【最终选中下注的那一项】，"
+        "输出一个 JSON 对象，不要 markdown 代码块、不要多余文字。字段：\n"
+        '  "pass": 布尔。若报告结论是整场 pass/空仓（无正 edge 玩法）为 true；否则 false；\n'
+        '  "play": 选中玩法的简短中文（如 "让球主-1"/"大2.5"/"主胜"）；pass 时给 ""；\n'
+        '  "odds": 该玩法的十进制赔率（数字，如 1.95）；pass 时给 0；\n'
+        '  "edge": 该玩法的 edge，写成【小数】（如 +8.3% → 0.083，−1.9% → -0.019）；pass 时给 0；\n'
+        '  "p_final": 该玩法的 p_最终，写成【小数】（如 57% → 0.57）；pass 时给 0；\n'
+        '  "evidence": 证据强度，取 "strong"/"medium"/"weak"/"none" 之一'
+        "（对应报告里凯利分数 强1/2→strong、中1/4→medium、弱1/8→weak、无→none；"
+        "若报告只给了置信度可据此估：≥75 strong、60~74 medium、40~59 weak、<40 none）；\n"
+        '  "stake": 报告建议注额数字（美元，无则 null）。\n'
+        "硬规则：① 只依据报告已有内容，不自行重算、不编造；② 数字用阿拉伯数字、"
+        "百分数一律转小数；③ 只输出一个 JSON 对象。"
+    )
+    user = (f"## 比赛：{home} vs {away}\n\n" if (home or away) else "") + \
+           f"### 精算报告\n{report}\n"
+    raw = _call_llm(system, user,
+                    effort=config.FUND_ANALYZE_EFFORT,
+                    tier="balanced",
+                    timeout=config.FUND_ANALYZE_TIMEOUT,
+                    max_tokens=800)
+    if not raw or raw.startswith(_LLM_ERR_PREFIXES):
+        log.warning("extract_decision LLM 失败：%s", (raw or "")[:120])
+        return None
+    m = _re.search(r"\{.*\}", raw, _re.S)
+    if not m:
+        log.warning("extract_decision 未返回 JSON：%s", raw[:120])
+        return None
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        log.warning("extract_decision 非合法 JSON：%s", raw[:120])
+        return None
+
+    def _num(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    out = {
+        "pass": bool(d.get("pass")),
+        "play": str(d.get("play", "")).strip(),
+        "odds": _num(d.get("odds")),
+        "edge": _num(d.get("edge")),
+        "p_final": _num(d.get("p_final")),
+        "evidence": str(d.get("evidence", "none")).strip().lower(),
+        "stake": None if d.get("stake") in (None, "") else _num(d.get("stake")),
+    }
+    return out
