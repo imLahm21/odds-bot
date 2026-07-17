@@ -12,6 +12,7 @@ API-Football 请求层
 import os
 import time
 import logging
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -34,8 +35,28 @@ if not _API_KEYS:
 
 _current = 0
 
+# api-football 的每日请求计数按 UTC 0 点重置。记录上次重置对应的 UTC 日期，
+# 一旦跨 UTC 日就把所有 key 的 exhausted 清回 False 并切回主 key——
+# 否则主 key 当天撞限后会永久切到备用(免费)key，跨日额度恢复也回不来。
+_exhausted_utc_date: str | None = None
+
 # 最近一次响应头里的当日剩余额度（供走地额度护栏读取）
 _last_remaining: int | None = None
+
+
+def _reset_keys_if_new_utc_day() -> None:
+    """UTC 跨日时重置所有 key 的耗尽标记并切回主 key（0 号）。"""
+    global _exhausted_utc_date, _current
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _exhausted_utc_date == today:
+        return
+    _exhausted_utc_date = today
+    was_switched = _current != 0 or any(k["exhausted"] for k in _API_KEYS)
+    for k in _API_KEYS:
+        k["exhausted"] = False
+    _current = 0
+    if was_switched:
+        log.warning("UTC 跨日(%s)，已重置所有 key 耗尽标记并切回主 Key", today)
 
 
 def last_remaining() -> int | None:
@@ -70,6 +91,7 @@ def api_get(endpoint: str, params: dict | None = None,
     """
     url = f"{config.BASE_URL}{endpoint}"
     attempt = 0
+    _reset_keys_if_new_utc_day()
     while True:
         headers = {config.AUTH_HEADER: _cur_key()}
         try:
