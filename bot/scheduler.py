@@ -261,7 +261,8 @@ def _fmt_final_score(result: dict) -> str:
 def _maybe_autounsub(conn, fid: int) -> None:
     """订阅的比赛不在进行中列表里 → 查 fixture 状态，已结束/异常终止则自动退订并通知。"""
     meta = db.get_fixture_meta(conn, fid)
-    home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
+    home = config.team_label(meta[6], meta[4]) if meta else "主队"
+    away = config.team_label(meta[7], meta[5]) if meta else "客队"
     result = api_client.fetch_fixture_result(fid)
     short = (result or {}).get("fixture", {}).get("status", {}).get("short", "")
     if short in config.LIVE_STATUS_FINISHED:        # 正常结束（FT/AET/PEN）

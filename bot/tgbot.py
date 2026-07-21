@@ -693,7 +693,8 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
         # 直接查，多带一列 league_name（不动 db.get_fixtures_between 的 4 列结构，
         # 那个被调度器解包复用）
         fixtures = conn.execute(
-            "SELECT fixture_id, commence_utc, home_team, away_team, league_name, league_id, status "
+            "SELECT fixture_id, commence_utc, home_team, away_team, league_name, "
+            "league_id, status, home_team_id, away_team_id "
             "FROM fixtures WHERE commence_utc BETWEEN ? AND ? "
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
@@ -706,7 +707,8 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
         if fresh:
             # 用最新状态覆盖本次查询结果的 status 列（元组不可变，重建行）
             fixtures = [(f if f[0] not in fresh
-                         else (f[0], f[1], f[2], f[3], f[4], f[5], fresh[f[0]]))
+                         else (f[0], f[1], f[2], f[3], f[4], f[5], fresh[f[0]],
+                               f[7], f[8]))
                         for f in fixtures]
 
     tz_cst = timezone(timedelta(hours=8))
@@ -786,11 +788,14 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
         s = s or "?"
         return s if len(s) <= n else s[:n - 1] + "…"
 
-    for fid, commence, home, away, league, league_id, status in rows:
+    for fid, commence, home, away, league, league_id, status, home_id, away_id in rows:
         kicked = has_kicked(commence, status)
         mark = "✅" if kicked else "🔵"
         label = config.league_label(league_id, league)
         lg = f"（{label}）" if label else ""
+        # 队名统一中文（中超/足协杯按 team_id 映射；非中国队回退英文）
+        home = config.team_label(home_id, home)
+        away = config.team_label(away_id, away)
         # 推迟/取消/中断：开球时间已过却没真踢，会留在未来档，标注让用户知道原因
         tag = {"PST": " ⚠️推迟", "CANC": " ⚠️取消", "SUSP": " ⚠️中断",
                "INT": " ⚠️中断", "ABD": " ⚠️放弃", "AWD": " ⚠️判负",
@@ -835,7 +840,8 @@ def _cmd_coverage(chat_id: int, args: list[str]) -> None:
     conn = db.get_conn()
     try:
         fx = conn.execute(
-            "SELECT home_team, away_team, league_name, commence_utc "
+            "SELECT home_team, away_team, league_name, commence_utc, "
+            "home_team_id, away_team_id "
             "FROM fixtures WHERE fixture_id=?", (fid,)).fetchone()
         # 各节点：快照次数、去重庄家数、最近一次抓取时间
         rows = conn.execute(
@@ -849,7 +855,9 @@ def _cmd_coverage(chat_id: int, args: list[str]) -> None:
         send(chat_id, f"未找到 fixture {fid}（先 /fixtures 看可用 id）")
         return
 
-    home, away, league, commence = fx[0], fx[1], fx[2], fx[3]
+    home = config.team_label(fx[4], fx[0])
+    away = config.team_label(fx[5], fx[1])
+    league, commence = fx[2], fx[3]
     now = datetime.now(timezone.utc)
     tz_cst = timezone(timedelta(hours=8))
 
@@ -914,7 +922,8 @@ def _build_csv(fid: int):
     conn = db.get_conn()
     try:
         fx = conn.execute(
-            "SELECT home_team, away_team, league_name, commence_utc FROM fixtures "
+            "SELECT home_team, away_team, league_name, commence_utc, "
+            "home_team_id, away_team_id FROM fixtures "
             "WHERE fixture_id=?", (fid,)).fetchone()
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker, market, "
@@ -943,8 +952,10 @@ def _build_csv(fid: int):
         except (ValueError, AttributeError):
             return iso_str
 
-    home = fx[0] if fx else ""
-    away = fx[1] if fx else ""
+    # 队名统一取中文（中超/足协杯改名，按 team_id 映射；非中国队回退英文）。
+    # 在此源头替换，中文名即随 meta 流入 CSV → LLM prompt → 精算/复盘报告，全局一致。
+    home = config.team_label(fx[4] if fx else None, fx[0] if fx else "")
+    away = config.team_label(fx[5] if fx else None, fx[1] if fx else "")
     league = fx[2] if fx else ""
     kick_cst = to_cst(fx[3]) if fx else ""
     market_zh = {"h2h": "欧指", "ah": "亚盘", "ou": "大小球"}
@@ -1015,7 +1026,8 @@ def _cmd_live(chat_id: int, args: list[str]) -> None:
             send(chat_id, f"⚠️ 最多同时订阅 {config.LIVE_MAX_SUBS_PER_CHAT} 场走地，"
                           f"请先 /unlive 退订一些。")
             return
-        home, away = meta[4], meta[5]
+        home = config.team_label(meta[6], meta[4])
+        away = config.team_label(meta[7], meta[5])
         db.add_live_sub(conn, chat_id, fid)
     finally:
         conn.close()
@@ -1095,7 +1107,8 @@ def push_live_update(chat_id: int, fid: int, entry: dict,
         meta = db.get_fixture_meta(conn, fid)
     finally:
         conn.close()
-    home, away = (meta[4], meta[5]) if meta else ("主队", "客队")
+    home = config.team_label(meta[6], meta[4]) if meta else "主队"
+    away = config.team_label(meta[7], meta[5]) if meta else "客队"
     score = f"{hg}-{ag}"
 
     # 阶段标注：加时/点球阶段明确写出，不再只有「第 N′」（点球阶段 elapsed 常为空）
@@ -1152,7 +1165,8 @@ def _odds_digest(fid: int) -> tuple[str, dict] | tuple[None, None]:
     conn = db.get_conn()
     try:
         fx = conn.execute(
-            "SELECT home_team, away_team, league_name, commence_utc FROM fixtures "
+            "SELECT home_team, away_team, league_name, commence_utc, "
+            "home_team_id, away_team_id FROM fixtures "
             "WHERE fixture_id=?", (fid,)).fetchone()
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker_id, market, "
@@ -1176,8 +1190,8 @@ def _odds_digest(fid: int) -> tuple[str, dict] | tuple[None, None]:
         except (ValueError, AttributeError):
             return iso_str
 
-    home = fx[0] if fx else ""
-    away = fx[1] if fx else ""
+    home = config.team_label(fx[4] if fx else None, fx[0] if fx else "")
+    away = config.team_label(fx[5] if fx else None, fx[1] if fx else "")
     league = fx[2] if fx else ""
     kick_cst = to_cst(fx[3]) if fx else ""
 
@@ -1957,8 +1971,8 @@ def _run_fundamentals(chat_id: int, fid: int,
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
         meta = None
-    home = meta[4] if meta else "主队"
-    away = meta[5] if meta else "客队"
+    home = config.team_label(meta[6], meta[4]) if meta else "主队"
+    away = config.team_label(meta[7], meta[5]) if meta else "客队"
     league = meta[2] if meta else ""
 
     if cancel is not None and cancel.is_set():

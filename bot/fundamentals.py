@@ -240,6 +240,9 @@ def build_fundamentals(conn, fixture_id: int) -> str:
         return "（无此比赛的基本面）"
     (_fid, league_id, league_name, season, home, away,
      home_id, away_id, _commence) = meta
+    # 队名统一中文（中超/足协杯按 team_id 映射；非中国队回退英文），与其它流程一致
+    home = config.team_label(home_id, home)
+    away = config.team_label(away_id, away)
 
     parts = [f"=== 基本面：{home} vs {away}（{league_name}）==="]
     if _is_national_team_event(league_id, league_name):
