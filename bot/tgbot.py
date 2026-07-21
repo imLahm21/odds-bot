@@ -622,17 +622,13 @@ _REFRESH_CAP = 15
 
 
 def _refresh_stale_statuses(fixtures, now, aggressive: bool = False) -> dict:
-    """对「开球时间已过、但库里状态还没到终局」的可疑场次，实时查一次真实状态并写回库。
-    返回 {fixture_id: 最新status}，供本次渲染即时用上（不必等下次任务A）。
+    """自动模式轻量状态校正：对「开球时间已过、但库里状态仍是 NS/TBD/空」的可疑场，
+    实时按 id 查一次真实状态并写回库。返回 {fixture_id: 最新status}，供本次渲染即时用。
 
     根因：赛程状态由任务A一天两次(2/14点)刷新，两次之间开球并结束的比赛，库里
-    status 滞留旧值(常为 NS)，被昨天的 has_kicked 规则判为「未踢」→ 错留在未来精算档。
-
-    aggressive=False（自动，/fixtures 渲染时用）：只查最省的一小撮——开球已过且状态仍
-      是 NS/TBD/空（“该踢了却还标未开”）。正常比赛状态会随任务A自然变对，无需每次都查。
-    aggressive=True（手动，点🔄刷新时用）：开球已过且状态非终局(FT/AET/PEN)的都重查，
-      连推迟后又补赛、中断后恢复等也一并校正。
-    上限 _REFRESH_CAP 场，避免一次点按打爆额度/拖慢响应。"""
+    status 滞留旧值(常为 NS)，被 has_kicked 规则判为「未踢」→ 错留在未来精算档。
+    这里只修 status（不改开球时间——时间校正靠手动🔄重拉赛程）。
+    aggressive 参数保留以兼容签名，当前仅按 NS/TBD/空 筛。上限 _REFRESH_CAP 场护栏。"""
     from datetime import datetime
     finished = config.LIVE_STATUS_FINISHED
     suspects = []
@@ -647,7 +643,7 @@ def _refresh_stale_statuses(fixtures, now, aggressive: bool = False) -> dict:
             continue
         if status in finished:
             continue                       # 已是终局，无需再查
-        if aggressive or status in ("NS", "TBD", ""):
+        if status in ("NS", "TBD", ""):
             suspects.append(f[0])
     if not suspects:
         return {}
@@ -676,9 +672,19 @@ def _refresh_stale_statuses(fixtures, now, aggressive: bool = False) -> dict:
 def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False):
     """生成 /fixtures 的文本 + 内联键盘。view='future' 看未来可精算的比赛，
     view='past' 看已开赛可复盘的比赛。已开赛降序、未来升序，超过 PAGE 分页。
-    refresh=True（点🔄刷新）对更大范围的可疑场次实时重查状态。返回 (text, keyboard)。"""
+    refresh=True（点🔄刷新）重拉全部启用联赛赛程，权威覆盖开球时间+状态。返回 (text, keyboard)。"""
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
+    # 手动🔄：即时重跑一次任务A（按启用联赛重抓赛程），把 commence_utc 与 status
+    # 一并刷成 API 最新值——这是唯一能修正「开球时间被占位/后改」的路径（状态级
+    # 校正修不了时间）。是刻意的重操作，仅手动触发，自动渲染不走这里。
+    if refresh:
+        try:
+            from . import scheduler
+            n = scheduler.task_a_update_fixtures()
+            log.info("【/fixtures】手动刷新重拉赛程，upsert %s 场", n)
+        except Exception:
+            log.exception("手动刷新重拉赛程失败")
     # 过去 3 天 ~ 未来 3 天：过去的可 /review 复盘，未来的可 /analyze 精算
     start = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -693,14 +699,15 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
     finally:
         conn.close()
 
-    # 实时校正滞留状态：把已结束却仍标 NS 的比赛拉回真实状态（详见 _refresh_stale_statuses）。
-    # 自动模式（refresh=False）只查最少的可疑场；手动🔄（refresh=True）查更大范围。
-    fresh = _refresh_stale_statuses(fixtures, now, aggressive=refresh)
-    if fresh:
-        # 用最新状态覆盖本次查询结果的 status 列（元组不可变，重建行）
-        fixtures = [(f if f[0] not in fresh
-                     else (f[0], f[1], f[2], f[3], f[4], f[5], fresh[f[0]]))
-                    for f in fixtures]
+    # 自动模式（refresh=False）：只对已过开球却仍标 NS 的可疑场做轻量状态校正
+    # （不重拉赛程，省额度）。手动🔄 上面已重拉全部赛程、status 已是最新，跳过此步。
+    if not refresh:
+        fresh = _refresh_stale_statuses(fixtures, now, aggressive=False)
+        if fresh:
+            # 用最新状态覆盖本次查询结果的 status 列（元组不可变，重建行）
+            fixtures = [(f if f[0] not in fresh
+                         else (f[0], f[1], f[2], f[3], f[4], f[5], fresh[f[0]]))
+                        for f in fixtures]
 
     tz_cst = timezone(timedelta(hours=8))
 
@@ -769,7 +776,8 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
         header += f"（第 {page + 1}/{pages} 页）"
 
     lines = [header, "✅=已开赛可 /review 复盘　🔵=未来可 /analyze 精算",
-             "👇 点下方按钮直接复盘/精算该场，无需输号"]
+             "👇 点下方按钮直接复盘/精算该场，无需输号"
+             "（时间/状态不对？点 🔄 刷新重拉赛程）"]
     keyboard = [toggle_row]
     if not rows:
         lines.append("（本视图暂无比赛，点下方按钮切换）")
@@ -3376,7 +3384,10 @@ def handle_callback(cb: dict) -> None:
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         refresh = len(parts) > 3 and parts[3] == "r"
         if refresh:
-            answer_callback(cb_id, "正在刷新比赛状态…")
+            # 手动刷新会重拉全部启用联赛赛程（十几~几十个请求 + 节流），可能耗时数十秒。
+            # 先给即时反馈并把消息改成"刷新中"，避免用户以为卡住重复点。
+            answer_callback(cb_id, "正在重拉赛程（约数十秒）…")
+            edit_text(chat_id, message_id, "🔄 正在重拉全部联赛赛程、校正开球时间与状态，请稍候…")
         text, kb = _render_fixtures(view, page, refresh=refresh)
         answer_callback(cb_id)
         edit_text(chat_id, message_id, text, kb)
