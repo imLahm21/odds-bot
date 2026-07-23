@@ -327,7 +327,7 @@ def _build_article_html(title: str, subtitle: str, lead: str, body: str,
 # ─── 存草稿 ──────────────────────────────────────────────────────────────────
 def add_draft(title: str, content_html: str, *,
               thumb_media_id: str | None = None,
-              author: str = "", digest: str = "") -> str:
+              author: str = "Lahm", digest: str = "") -> str:
     """调 draft/add 存草稿，返回草稿 media_id。
     thumb_media_id 不传则用默认封面（永久素材）兜底。digest 摘要≤120字。
     正文 UTF-8 编码见下方 ensure_ascii=False 处理。"""
