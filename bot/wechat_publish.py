@@ -213,24 +213,29 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     if not result:
         raise WechatError("合规文章生成失败（LLM 未配置或返回空），未存草稿。")
     title = result.get("title", "").strip()
-    body = result.get("body", "").strip()
-    if not title or not body:
+    sections = result.get("sections") or []
+    if not title or not sections:
         raise WechatError("合规文章生成结果缺标题或正文，未存草稿。")
 
     subtitle = result.get("subtitle", "").strip()
     lead = result.get("lead", "").strip()
+    compare = result.get("compare") or []
     highlights = result.get("highlights") or []
     prediction = result.get("prediction") or {}
 
-    # 合规双闸：正则黑名单扫描所有 LLM 产出文本（标题/副标题/导语/正文/看点/预测）
-    scan_texts = [title, subtitle, lead, body,
+    # 合规双闸：正则黑名单扫描所有 LLM 产出文本
+    scan_texts = [title, subtitle, lead,
                   prediction.get("score", ""), prediction.get("note", "")]
+    for sec in sections:
+        scan_texts += [sec.get("heading", ""), sec.get("text", "")]
+    for row in compare:
+        scan_texts += [row.get("item", ""), row.get("home", ""), row.get("away", "")]
     for h in highlights:
         scan_texts += [h.get("label", ""), h.get("value", "")]
     _compliance_scan(*scan_texts)
 
     wx_html = _build_article_html(
-        title, subtitle, lead, body, highlights, prediction,
+        title, subtitle, lead, sections, compare, highlights, prediction,
         home or "主队", away or "客队", league or "足球", kick)
     return title[:64], wx_html
 
@@ -239,11 +244,12 @@ def report_to_wx_article(report_md: str, home: str, away: str,
 _BRAND = "Lahm的精选日记"   # 品牌栏文字（公众号名），可按需改
 
 
-def _build_article_html(title: str, subtitle: str, lead: str, body: str,
-                        highlights: list, prediction: dict,
+def _build_article_html(title: str, subtitle: str, lead: str, sections: list,
+                        compare: list, highlights: list, prediction: dict,
                         home: str, away: str, league: str, kick: str) -> str:
-    """把结构化内容拼成杂志感图文 HTML（红顶线/品牌栏/大标题/场次条/红字加粗/
-    定性看点色块/比分预测框/免责声明）。全内联 style，不用 <style>/class。"""
+    """把结构化内容拼成杂志感图文 HTML（红顶线/品牌栏/大标题/场次条/两队数据对比表/
+    带小标题的分节正文/红字加粗/定性看点色块/比分预测框/免责声明）。
+    全内联 style，不用 <style>/class。"""
     parts = []
     # 顶部红线 + 品牌栏
     parts.append('<section style="border-top:3px solid #d0342c;padding-top:14px">')
@@ -281,8 +287,41 @@ def _build_article_html(title: str, subtitle: str, lead: str, body: str,
             '<p style="margin:0 0 22px;font-size:17px;line-height:1.9;'
             f'color:#1a1a1a;font-weight:500">{_bold_to_red(lead)}</p>')
 
-    # 正文
-    parts.append(_md_to_wx_html(body))
+    # 两队数据对比表（放在导语后、正文前，先给读者一个数据全景，打破文字墙）
+    if compare:
+        rows = [
+            '<tr style="background:#d0342c;color:#fff">'
+            '<th style="padding:9px 8px;font-size:13px;text-align:left;'
+            'font-weight:600">对比项</th>'
+            f'<th style="padding:9px 8px;font-size:13px;font-weight:600">{home}</th>'
+            f'<th style="padding:9px 8px;font-size:13px;font-weight:600">{away}</th></tr>']
+        for i, row in enumerate(compare):
+            bg = "#ffffff" if i % 2 == 0 else "#faf7f7"
+            rows.append(
+                f'<tr style="background:{bg}">'
+                f'<td style="padding:9px 8px;font-size:14px;color:#666;'
+                f'border-bottom:1px solid #f0f0f0">{row.get("item","")}</td>'
+                f'<td style="padding:9px 8px;font-size:14px;color:#1a1a1a;'
+                f'text-align:center;font-weight:600;border-bottom:1px solid #f0f0f0">'
+                f'{_bold_to_red(row.get("home",""))}</td>'
+                f'<td style="padding:9px 8px;font-size:14px;color:#1a1a1a;'
+                f'text-align:center;font-weight:600;border-bottom:1px solid #f0f0f0">'
+                f'{_bold_to_red(row.get("away",""))}</td></tr>')
+        parts.append(
+            '<table style="width:100%;border-collapse:collapse;margin:0 0 24px;'
+            'border:1px solid #f0f0f0">' + "".join(rows) + '</table>')
+
+    # 分节正文（每节：红色小标题 + 正文，制造视觉断点）
+    for sec in sections:
+        head = sec.get("heading", "").strip()
+        txt = sec.get("text", "").strip()
+        if head:
+            parts.append(
+                '<h2 style="margin:26px 0 12px;font-size:19px;font-weight:700;'
+                'color:#1a1a1a;padding-left:11px;border-left:4px solid #d0342c;'
+                f'line-height:1.4">{_bold_to_red(head)}</h2>')
+        if txt:
+            parts.append(_md_to_wx_html(txt))
 
     # 定性看点色块（横排三块）
     if highlights:

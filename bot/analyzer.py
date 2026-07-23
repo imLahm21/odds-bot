@@ -576,14 +576,16 @@ def wx_compliant_article(free_md: str, home: str, away: str,
         '  "title": 大标题，≤20字，有张力（可含两队名或点出看点）；\n'
         '  "subtitle": 副标题，≤30字，补充背景或悬念；\n'
         '  "lead": 开篇导语，3~4句，叙事化点题、勾起兴趣（像「没有黑马，没有童话」那种笔调）；\n'
-        '  "body": 正文主体，【1200~1800字】，分 6~9 段（段落之间用两个换行\\n\\n分隔），'
-        "篇幅要充实、有厚度。建议依次展开：①赛事/轮次情境与看点铺陈；②主队近况与状态"
-        "（战绩、进失球、主客场表现、关键球员）；③客队近况与状态；④两队历史交锋恩怨与"
-        "近几次交手走势；⑤赛程/积分榜情境（排名、积分差、争冠保级动机、赛程密度）；"
-        "⑥临场看点收束（阵容/主场氛围/心理层面）。每段展开充分、避免一句话带过；"
-        "融入历史对比与情境张力，读起来像一篇有分量的赛前长文。把【关键客观数据/事实】用"
-        " **双星号加粗**（如 **近10次交手主队赢了7次**、**30分排名第2**），每段 1~2 处，"
-        "用于渲染红色重点；\n"
+        '  "body": 正文主体，【分段小节数组】，5~7 个小节，每项 {"heading":"小标题(≤12字)",'
+        '"text":"该节正文(200~350字，可含多段，段落间用\\n\\n分隔)"}。总字数 1200~1800，'
+        "篇幅充实有厚度。建议小节依次为：赛事情境铺陈 / 主队近况与状态 / 客队近况与状态 / "
+        "历史交锋恩怨 / 赛程积分情境 / 临场看点收束（可按实际素材增减合并）。每节展开充分、"
+        "避免一句话带过；融入历史对比与情境张力。把【关键客观数据/事实】用 **双星号加粗**"
+        "（如 **近10次交手主队赢了7次**、**30分排名第2**），每节 1~2 处，用于渲染红色重点；\n"
+        '  "compare": 两队核心数据【对比表】，数组 5~7 行，每行 {"item":"指标名(≤8字)",'
+        '"home":"主队值(≤12字)","away":"客队值(≤12字)}，指标从报告里【真实有】的选，如'
+        '联赛排名、积分、近10场战绩、场均进球、场均失球、主/客场战绩、近期状态等。'
+        "只填报告里确有的数据，缺的行直接不列；绝不编造、绝不放概率/赔率；\n"
         '  "highlights": 3个【定性看点】色块，数组，每项 {"label":"看点名(≤6字)",'
         '"value":"一句定性判断(≤14字)"}，如 {"label":"主场优势","value":"近5个主场4胜"}、'
         '{"label":"交锋压制","value":"近10次占据上风"}、{"label":"状态","value":"两连胜势头正盛"}。'
@@ -628,12 +630,31 @@ def wx_compliant_article(free_md: str, home: str, away: str,
             log.warning("微信合规文章 JSON 二次解析失败: %s", s[:120])
             return None
     title = str(obj.get("title", "")).strip()
-    body = str(obj.get("body", "")).strip()
-    if not title or not body:
+    # body 现为分节数组 [{"heading","text"}]；兼容旧的纯字符串。
+    sections = []
+    raw_body = obj.get("body")
+    if isinstance(raw_body, list):
+        for sec in raw_body:
+            if isinstance(sec, dict):
+                head = str(sec.get("heading", "")).strip()
+                txt = str(sec.get("text", "")).strip()
+                if txt:
+                    sections.append({"heading": head, "text": txt})
+    elif isinstance(raw_body, str) and raw_body.strip():
+        sections.append({"heading": "", "text": raw_body.strip()})
+    if not title or not sections:
         return None
     # 结构化字段容错：缺字段给默认，类型不符则丢弃，保证渲染不炸。
     subtitle = str(obj.get("subtitle", "")).strip()
     lead = str(obj.get("lead", "")).strip()
+    compare = []
+    for row in (obj.get("compare") or [])[:8]:
+        if isinstance(row, dict):
+            it = str(row.get("item", "")).strip()
+            hv = str(row.get("home", "")).strip()
+            av = str(row.get("away", "")).strip()
+            if it and (hv or av):
+                compare.append({"item": it, "home": hv, "away": av})
     highlights = []
     for h in (obj.get("highlights") or [])[:3]:
         if isinstance(h, dict):
@@ -647,7 +668,8 @@ def wx_compliant_article(free_md: str, home: str, away: str,
         prediction = {"score": str(p.get("score", "")).strip(),
                       "note": str(p.get("note", "")).strip()}
     return {"title": title, "subtitle": subtitle, "lead": lead,
-            "body": body, "highlights": highlights, "prediction": prediction}
+            "sections": sections, "compare": compare,
+            "highlights": highlights, "prediction": prediction}
 
 
 def seo_summarize(free_body: str, home: str, away: str, league: str,
