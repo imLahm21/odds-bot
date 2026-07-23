@@ -554,33 +554,43 @@ def fan_fundamentals_brief(free_md: str, home: str, away: str,
 
 def wx_compliant_article(free_md: str, home: str, away: str,
                          league: str) -> dict | None:
-    """微信公众号发布：把报告免费正文改写成【合规基本面文章】。
+    """微信公众号发布：把报告免费正文改写成【合规叙事文章】（花式排版数据源）。
 
-    产出 {"title": 标题, "body": 正文}。面向大陆法规，纯基本面 + 结尾白话猜测：
-      - 只讲两队近况/交锋/赛程等客观事实，结尾 1~2 句球迷视角的倾向性看法；
-      - 【绝不】出现让球/亚盘/欧赔/凯利/大小球/盘口/水位/下注/庄家名等博彩术语，
-        也不给出「比分预测/上下盘/胜平负」这类结论式判断（结尾猜测只能是
-        「个人更期待主队踢出气势」这种模糊球迷观点，不带任何盘口含义）。
+    产出结构化 dict，供 wechat_publish 渲染成杂志感排版：
+      {"title","subtitle","lead","body",
+       "highlights":[{"label","value"}×3], "prediction":{"score","note"}}
+    面向大陆法规（中档：允许比分预测，禁赔率/概率/盘口）：
+      - 叙事性写作，有历史纵深；关键客观数据用 **加粗** 标出（后续渲染成红字）；
+      - highlights 是【定性看点】色块（如「主场优势/交锋压制/状态占优」），
+        绝不放 XX% 胜负概率；
+      - prediction 给一个具体比分预测 + 一句理由（球评常见，允许）；
+      - 【硬红线】不得出现赔率/盘口/亚盘/凯利/让球/大小球/水位/下注/庄家名/胜负概率百分比。
     失败/未配置返回 None（调用方据此不存草稿，报错）。
     """
     if not available() or not free_md.strip():
         return None
     system = (
-        "你是一位足球公众号编辑，也是一名足球裁判员，用【纯基本面 + 球迷视角】写赛前"
-        "导读文章。下面是一篇赛前分析报告的正文（含近况/交锋/赛程等）。据此写一篇"
-        "面向普通球迷的公众号文章：\n"
-        "- 输出 JSON，只含两个字段：\"title\"（吸引人的标题，≤30字，含两队名）、"
-        "\"body\"（正文，500~900字，可分 3~5 个自然段）；\n"
-        "- 正文只讲两队近期状态、战绩、历史交锋、赛程/伤停等基本面，像给球迷做赛前"
-        "背景导读，客观可读；结尾用 1~2 句【模糊的球迷观点】收尾（如「个人更期待主队"
-        "在主场踢出气势」），不要给具体比分、不要说谁一定赢；\n"
-        "- 【硬红线，违反则整篇作废】：绝对不能出现任何博彩/操盘词汇——包括但不限于"
-        "让球、受让、亚盘、欧赔、盘口、水位、凯利、大小球、上盘、下盘、诱盘、下注、"
-        "投注、串关、庄家、赔率、返还率，以及任何庄家名（如 365、Pinnacle、威廉、SBO 等）；"
-        "不得出现具体赔率数字或盘口线；不得引导任何形式的投注；\n"
-        "- 只讲报告里【实际有】的信息，报告没提供的（伤停/后续赛程等）直接略过，"
-        "不要写「报告未提供」这类话，也不要编造数据；\n"
-        "- 全中文，直接输出 JSON，不要 markdown 代码块、不要多余文字。"
+        "你是一位资深足球公众号主笔，也是一名足球裁判员，文风叙事、有历史纵深、专业克制"
+        "（参考体育大刊的赛前推演长文）。下面是一篇赛前分析报告的正文（含近况/交锋/赛程/"
+        "积分榜等）。据此写一篇面向球迷的赛前推演文章，输出 JSON，字段：\n"
+        '  "title": 大标题，≤20字，有张力（可含两队名或点出看点）；\n'
+        '  "subtitle": 副标题，≤30字，补充背景或悬念；\n'
+        '  "lead": 开篇导语，2~3句，叙事化点题、勾起兴趣（像"没有黑马，没有童话"那种笔调）；\n'
+        '  "body": 正文主体，600~1000字，分 3~5 段（段落之间用两个换行\\n\\n分隔）。'
+        "叙事展开两队近况、战绩、历史交锋、赛程情境、关键球员/阵容看点，融入历史对比与"
+        "情境张力；把【关键客观数据/事实】用 **双星号加粗**（如 **近10次交手主队赢了7次**、"
+        "**30分排名第2**），每段 1~2 处即可，用于渲染红色重点；\n"
+        '  "highlights": 3个【定性看点】色块，数组，每项 {"label":"看点名(≤6字)",'
+        '"value":"一句定性判断(≤14字)"}，如 {"label":"主场优势","value":"近5个主场4胜"}、'
+        '{"label":"交锋压制","value":"近10次占据上风"}、{"label":"状态","value":"两连胜势头正盛"}。'
+        "【绝不】写 XX% 概率；\n"
+        '  "prediction": {"score":"具体比分如 2-1","note":"一句预测理由(≤30字)"}，'
+        "站在球迷视角给个人预判，可以给比分；\n"
+        "【硬红线，违反整篇作废】：绝对不能出现任何博彩/操盘词汇——赔率、盘口、亚盘、欧赔、"
+        "水位、凯利、让球、受让、大小球、上盘、下盘、诱盘、下注、投注、串关、庄家、返还率、"
+        "以及任何庄家名（365/Pinnacle/威廉/SBO 等）、任何「胜负概率百分比」（如「法国方向52%」）；\n"
+        "只讲报告里【实际有】的信息，缺的直接略过、不要写「报告未提供」、不要编造；\n"
+        "全中文，直接输出 JSON，不要 markdown 代码块、不要多余文字。"
     )
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
@@ -616,7 +626,23 @@ def wx_compliant_article(free_md: str, home: str, away: str,
     body = str(obj.get("body", "")).strip()
     if not title or not body:
         return None
-    return {"title": title, "body": body}
+    # 结构化字段容错：缺字段给默认，类型不符则丢弃，保证渲染不炸。
+    subtitle = str(obj.get("subtitle", "")).strip()
+    lead = str(obj.get("lead", "")).strip()
+    highlights = []
+    for h in (obj.get("highlights") or [])[:3]:
+        if isinstance(h, dict):
+            lab = str(h.get("label", "")).strip()
+            val = str(h.get("value", "")).strip()
+            if lab and val:
+                highlights.append({"label": lab, "value": val})
+    prediction = {}
+    p = obj.get("prediction")
+    if isinstance(p, dict):
+        prediction = {"score": str(p.get("score", "")).strip(),
+                      "note": str(p.get("note", "")).strip()}
+    return {"title": title, "subtitle": subtitle, "lead": lead,
+            "body": body, "highlights": highlights, "prediction": prediction}
 
 
 def seo_summarize(free_body: str, home: str, away: str, league: str,

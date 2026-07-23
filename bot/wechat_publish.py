@@ -160,18 +160,26 @@ def _compliance_scan(*texts: str) -> None:
             f"{' 等' if len(uniq) > 12 else ''}。已阻止存草稿，请检查报告或重试。")
 
 
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _bold_to_red(s: str) -> str:
+    """把 **加粗** 转成红色加粗内联 span（杂志感重点标注）。"""
+    return _BOLD_RE.sub(
+        r'<strong style="color:#d0342c">\1</strong>', s)
+
+
 def _md_to_wx_html(md_text: str) -> str:
-    """把合规正文（LLM 产出，纯段落、可能带简单换行）转成微信内联样式 HTML。
-    微信图文正文只认内联 style，不吃 <style>/class；这里做最小排版：
-    段落 <p> + 行距/字号，段间留白。不引入图片/外链。"""
+    """把合规正文（LLM 产出，段落 + **加粗**）转成微信内联样式 HTML。
+    微信图文正文只认内联 style，不吃 <style>/class；段落 <p> + 行距/字号，
+    **加粗** 渲染成红字重点。不引入图片/外链。"""
     paras = [p.strip() for p in re.split(r"\n{2,}", md_text.strip()) if p.strip()]
     out = []
     for p in paras:
-        # 段内单换行转 <br/>，其余按普通段落
-        inner = p.replace("\n", "<br/>")
+        inner = _bold_to_red(p.replace("\n", "<br/>"))
         out.append(
-            '<p style="margin:0 0 18px;font-size:16px;line-height:1.75;'
-            f'color:#2c3e50">{inner}</p>')
+            '<p style="margin:0 0 20px;font-size:16px;line-height:1.85;'
+            f'color:#3a3a3a;letter-spacing:0.3px">{inner}</p>')
     return "\n".join(out)
 
 
@@ -193,6 +201,13 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     pm = re.search(r"(?m)^\#{3}\s*7\s*[\.、]?\s*最终精算结论", text)
     free_md = text[:pm.start()] if pm else text
 
+    # 开球时间（供场次条显示）：从「## 赛事：… 开球时间：2026-07-15 03:00」提取
+    kick = ""
+    km = re.search(r"开球时间[：:]\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s*[0-9]{1,2}:[0-9]{2})",
+                   report_md)
+    if km:
+        kick = km.group(1).strip()
+
     result = analyzer.wx_compliant_article(free_md, home or "主队",
                                            away or "客队", league or "足球")
     if not result:
@@ -202,12 +217,111 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     if not title or not body:
         raise WechatError("合规文章生成结果缺标题或正文，未存草稿。")
 
-    # 合规双闸：正则黑名单扫描标题+正文
-    _compliance_scan(title, body)
+    subtitle = result.get("subtitle", "").strip()
+    lead = result.get("lead", "").strip()
+    highlights = result.get("highlights") or []
+    prediction = result.get("prediction") or {}
 
-    wx_html = _md_to_wx_html(body)
-    # 微信标题上限 64 字，超了截断
+    # 合规双闸：正则黑名单扫描所有 LLM 产出文本（标题/副标题/导语/正文/看点/预测）
+    scan_texts = [title, subtitle, lead, body,
+                  prediction.get("score", ""), prediction.get("note", "")]
+    for h in highlights:
+        scan_texts += [h.get("label", ""), h.get("value", "")]
+    _compliance_scan(*scan_texts)
+
+    wx_html = _build_article_html(
+        title, subtitle, lead, body, highlights, prediction,
+        home or "主队", away or "客队", league or "足球", kick)
     return title[:64], wx_html
+
+
+# ─── 花式排版组装（杂志感，全内联样式，微信兼容）─────────────────────────────
+_BRAND = "镜听智库"   # 品牌栏文字，可按需改
+
+
+def _build_article_html(title: str, subtitle: str, lead: str, body: str,
+                        highlights: list, prediction: dict,
+                        home: str, away: str, league: str, kick: str) -> str:
+    """把结构化内容拼成杂志感图文 HTML（红顶线/品牌栏/大标题/场次条/红字加粗/
+    定性看点色块/比分预测框/免责声明）。全内联 style，不用 <style>/class。"""
+    parts = []
+    # 顶部红线 + 品牌栏
+    parts.append('<section style="border-top:3px solid #d0342c;padding-top:14px">')
+    parts.append(
+        f'<p style="margin:0 0 4px;font-size:13px;color:#d0342c;'
+        f'letter-spacing:1px">{_BRAND} · 赛前推演</p>')
+    # 大标题
+    parts.append(
+        f'<h1 style="margin:8px 0 6px;font-size:26px;line-height:1.35;'
+        f'font-weight:700;color:#1a1a1a">{_bold_to_red(title)}</h1>')
+    if subtitle:
+        parts.append(
+            f'<p style="margin:0 0 10px;font-size:15px;color:#888;'
+            f'line-height:1.6">{subtitle}</p>')
+    # meta 线（联赛 + 开球时间）
+    meta = league + (f"　开球 {kick}" if kick else "")
+    parts.append(
+        f'<p style="margin:0 0 6px;font-size:12px;color:#bbb">{meta}</p>')
+    parts.append('<hr style="border:none;border-top:1px solid #eee;margin:14px 0"/>')
+
+    # 场次条（左 队 vs 队 加粗，右 开球时间 灰底条）
+    right = kick if kick else league
+    parts.append(
+        '<section style="display:flex;justify-content:space-between;'
+        'align-items:center;background:#f6f7f9;border-left:4px solid #d0342c;'
+        'padding:10px 14px;margin:0 0 20px">'
+        f'<span style="font-size:17px;font-weight:700;color:#1a1a1a">'
+        f'{home} vs {away}</span>'
+        f'<span style="font-size:13px;color:#999">{right}</span>'
+        '</section>')
+
+    # 导语
+    if lead:
+        parts.append(
+            '<p style="margin:0 0 22px;font-size:17px;line-height:1.9;'
+            f'color:#1a1a1a;font-weight:500">{_bold_to_red(lead)}</p>')
+
+    # 正文
+    parts.append(_md_to_wx_html(body))
+
+    # 定性看点色块（横排三块）
+    if highlights:
+        cells = []
+        for h in highlights[:3]:
+            cells.append(
+                '<td style="width:33%;text-align:center;padding:14px 8px;'
+                'background:#fafafa;border:1px solid #f0f0f0">'
+                f'<div style="font-size:12px;color:#999;margin-bottom:6px">'
+                f'{h.get("label","")}</div>'
+                f'<div style="font-size:15px;color:#d0342c;font-weight:700;'
+                f'line-height:1.4">{h.get("value","")}</div></td>')
+        parts.append(
+            '<table style="width:100%;border-collapse:collapse;margin:8px 0 24px">'
+            f'<tr>{"".join(cells)}</tr></table>')
+
+    # 比分预测框（浅红底）
+    if prediction.get("score"):
+        note = prediction.get("note", "")
+        parts.append(
+            '<section style="background:#fdf3f2;border:1px solid #f5d9d6;'
+            'border-radius:8px;padding:16px 18px;margin:0 0 24px">'
+            '<div style="font-size:13px;color:#d0342c;font-weight:700;'
+            'margin-bottom:6px">📝 个人预判</div>'
+            f'<div style="font-size:20px;font-weight:700;color:#1a1a1a;'
+            f'margin-bottom:6px">{home} {prediction["score"]} {away}</div>'
+            + (f'<div style="font-size:14px;color:#666;line-height:1.6">'
+               f'{_bold_to_red(note)}</div>' if note else "")
+            + '</section>')
+
+    # 免责声明页脚
+    parts.append('<hr style="border:none;border-top:1px solid #eee;margin:20px 0 12px"/>')
+    parts.append(
+        '<p style="font-size:12px;color:#bbb;line-height:1.7;text-align:center">'
+        f'{_BRAND} · 赛前推演<br/>'
+        '本文仅为球迷视角的赛前基本面导读与个人观点，不构成任何投注建议。<br/>'
+        '足球魅力在于不确定性，理性观赛，切勿沉迷。</p>')
+    parts.append('</section>')
+    return "\n".join(parts)
 
 
 # ─── 存草稿 ──────────────────────────────────────────────────────────────────
@@ -216,7 +330,7 @@ def add_draft(title: str, content_html: str, *,
               author: str = "", digest: str = "") -> str:
     """调 draft/add 存草稿，返回草稿 media_id。
     thumb_media_id 不传则用默认封面（永久素材）兜底。digest 摘要≤120字。
-    微信要求 UTF-8；requests 直接 json= 会转义中文为 \\uXXXX，微信可接受。"""
+    正文 UTF-8 编码见下方 ensure_ascii=False 处理。"""
     if not thumb_media_id:
         thumb_media_id = _upload_default_thumb()
     token = _get_token()
