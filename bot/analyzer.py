@@ -575,11 +575,15 @@ def wx_compliant_article(free_md: str, home: str, away: str,
         "积分榜等）。据此写一篇面向球迷的赛前推演文章，输出 JSON，字段：\n"
         '  "title": 大标题，≤20字，有张力（可含两队名或点出看点）；\n'
         '  "subtitle": 副标题，≤30字，补充背景或悬念；\n'
-        '  "lead": 开篇导语，2~3句，叙事化点题、勾起兴趣（像"没有黑马，没有童话"那种笔调）；\n'
-        '  "body": 正文主体，600~1000字，分 3~5 段（段落之间用两个换行\\n\\n分隔）。'
-        "叙事展开两队近况、战绩、历史交锋、赛程情境、关键球员/阵容看点，融入历史对比与"
-        "情境张力；把【关键客观数据/事实】用 **双星号加粗**（如 **近10次交手主队赢了7次**、"
-        "**30分排名第2**），每段 1~2 处即可，用于渲染红色重点；\n"
+        '  "lead": 开篇导语，3~4句，叙事化点题、勾起兴趣（像「没有黑马，没有童话」那种笔调）；\n'
+        '  "body": 正文主体，【1200~1800字】，分 6~9 段（段落之间用两个换行\\n\\n分隔），'
+        "篇幅要充实、有厚度。建议依次展开：①赛事/轮次情境与看点铺陈；②主队近况与状态"
+        "（战绩、进失球、主客场表现、关键球员）；③客队近况与状态；④两队历史交锋恩怨与"
+        "近几次交手走势；⑤赛程/积分榜情境（排名、积分差、争冠保级动机、赛程密度）；"
+        "⑥临场看点收束（阵容/主场氛围/心理层面）。每段展开充分、避免一句话带过；"
+        "融入历史对比与情境张力，读起来像一篇有分量的赛前长文。把【关键客观数据/事实】用"
+        " **双星号加粗**（如 **近10次交手主队赢了7次**、**30分排名第2**），每段 1~2 处，"
+        "用于渲染红色重点；\n"
         '  "highlights": 3个【定性看点】色块，数组，每项 {"label":"看点名(≤6字)",'
         '"value":"一句定性判断(≤14字)"}，如 {"label":"主场优势","value":"近5个主场4胜"}、'
         '{"label":"交锋压制","value":"近10次占据上风"}、{"label":"状态","value":"两连胜势头正盛"}。'
@@ -599,8 +603,9 @@ def wx_compliant_article(free_md: str, home: str, away: str,
     out = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
                     tier="balanced",
-                    timeout=config.FUND_ANALYZE_TIMEOUT,
-                    max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
+                    timeout=max(config.FUND_ANALYZE_TIMEOUT, 150),
+                    # 长文（1200~1800字）+ JSON 结构，token 预算加大避免截断致解析失败
+                    max_tokens=max(config.FUND_ANALYZE_MAX_TOKENS, 8000))
     if not out or out.startswith(_LLM_ERR_PREFIXES):
         log.warning("微信合规文章生成失败: %s", (out or "")[:120])
         return None

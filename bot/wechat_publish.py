@@ -236,7 +236,7 @@ def report_to_wx_article(report_md: str, home: str, away: str,
 
 
 # ─── 花式排版组装（杂志感，全内联样式，微信兼容）─────────────────────────────
-_BRAND = "镜听智库"   # 品牌栏文字，可按需改
+_BRAND = "Lahm的精选日记"   # 品牌栏文字（公众号名），可按需改
 
 
 def _build_article_html(title: str, subtitle: str, lead: str, body: str,
