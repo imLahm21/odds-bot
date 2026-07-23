@@ -405,6 +405,29 @@ def _is_admin(chat_id: int) -> bool:
     return chat_id in ADMIN_CHAT_IDS
 
 
+def _llm_audit(chat_id: int, action: str, tier: str, *,
+               fid=None, effort: str = "", extra: str = "") -> None:
+    """记录一次【用户触发】的 LLM 调用，供事后查用量/来源（落 daemon.log INFO，可 grep）。
+    格式：LLM调用 who=<chat_id> role=管理员/访客 action=<动作> tier=<档> model=<实际模型> [fixture= effort=]
+    action 例：analyze/review/fundamentals/parlay-leg/parlay-extract/live/lesson-route/lesson-compose。
+    纯 log.info、不抛异常、不影响主流程；查询：grep "LLM调用" daemon.log。"""
+    try:
+        visitor = not _is_admin(chat_id)
+        role = "访客" if visitor else "管理员"
+        model = llm_client.get_tier_model(tier, visitor=visitor)
+        parts = [f"LLM调用 who={chat_id}", f"role={role}", f"action={action}",
+                 f"tier={tier}", f"model={model}"]
+        if fid is not None:
+            parts.append(f"fixture={fid}")
+        if effort:
+            parts.append(f"effort={effort}")
+        if extra:
+            parts.append(extra)
+        log.info(" ".join(parts))
+    except Exception:
+        log.exception("LLM 审计日志记录失败（忽略，不影响调用）")
+
+
 # ─── 内联键盘构建 ────────────────────────────────────────────────────────────
 LEAGUES_PER_PAGE = 10          # /leagues 每页联赛数（5 行 × 2）
 
@@ -1150,6 +1173,7 @@ def _async_live_brief(chat_id: int, fid: int, live_lines: str,
                        elapsed, score: str) -> None:
     """后台线程：跑走地 LLM 研判，成功则单独追发一条 💡 消息。
     失败/未配置/超时静默跳过——盘口快报已先行送达，不影响主信息。"""
+    _llm_audit(chat_id, "live", "light", fid=fid)
     try:
         brief = analyzer.live_brief(live_lines, deltas, home, away,
                                     elapsed, score)
@@ -1469,6 +1493,7 @@ def _lesson_step_route(chat_id: int, message_id: int, token: str) -> None:
     meta, report = info["meta"], info["report"]
     edit_text(chat_id, message_id,
               f"🧭 正在判断归入哪个教训主题（{_tier_model_label(chat_id)}）…")
+    _llm_audit(chat_id, "lesson-route", "heavy")
     route, err = analyzer.route_lesson(report, meta["home"], meta["away"],
                                        meta.get("league", ""))
     if not route:
@@ -1520,6 +1545,7 @@ def _lesson_step_compose(chat_id: int, message_id: int, token: str,
     edit_text(chat_id, message_id,
               f"🧠 正在为主题 <b>{slug}</b> 生成 {letter} 节归档方案"
               f"（{_tier_model_label(chat_id)}）…")
+    _llm_audit(chat_id, "lesson-compose", "heavy", extra=f"slug={slug}")
     plan, err = analyzer.compose_archive_plan(
         report, meta, slug, topic_text,
         section_letter=letter, is_new_topic=is_new)
@@ -2148,6 +2174,7 @@ def _run_fundamentals(chat_id: int, fid: int,
                   stop_kb)
     brief = None
     _visitor = not _is_admin(chat_id)
+    _llm_audit(chat_id, "fundamentals", "balanced", fid=fid)
     for ev in analyzer.analyze_fundamentals_stream(funds, home, away, league,
                                                    visitor=_visitor):
         if cancel is not None and cancel.is_set():
@@ -2243,6 +2270,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     msg_id = send(chat_id, progress_text(1, "数据提取"), stop_kb)
     report = None
     _visitor = not _is_admin(chat_id)
+    _llm_audit(chat_id, "analyze", "heavy", fid=fid, effort=effort)
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
                                       meta["away"], meta["league"],
                                       extra_instruction, effort,
@@ -2330,6 +2358,7 @@ def _analyze_leg(chat_id: int, fid: int, effort: str,
         funds = "（基本面拉取失败）"
 
     _visitor = not _is_admin(chat_id)
+    _llm_audit(chat_id, "parlay-leg", "heavy", fid=fid, effort=effort)
     report = None
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
                                       meta["away"], meta["league"],
@@ -2443,6 +2472,9 @@ def _run_parlay(chat_id: int, fids: list[int], effort: str = "",
         if path:
             send(chat_id, f"📁 腿 {i+1} 报告已归档：{path}")
 
+        # extract_decision 内部固定 visitor=False（用管理员平衡档抽 JSON），审计如实标注
+        _llm_audit(chat_id, "parlay-extract", "balanced", fid=fid,
+                   extra="note=extract固定管理员平衡档")
         dec = analyzer.extract_decision(report, meta["home"], meta["away"])
         if dec is None:
             if msg_id:
@@ -2513,6 +2545,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
         return
     _visitor = not _is_admin(chat_id)   # 访客复盘用访客那份模型
+    _llm_audit(chat_id, f"review-{sub_mode}", "heavy", fid=fid, effort=effort)
     csv_str, meta = _build_csv(fid)
     if not csv_str:
         send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
