@@ -230,12 +230,14 @@ def add_draft(title: str, content_html: str, *,
         "only_fans_can_comment": 0,
     }
     try:
-        # ensure_ascii=True（默认）避免中文编码问题；用 data= 传原始字节。
+        # 必须 ensure_ascii=False + UTF-8 原始字节：否则中文被转成 \uXXXX 转义，
+        # 微信当纯文本存、后台显示成一堆 利勒（实测踩坑）。
         import json
-        payload = json.dumps({"articles": [article]}, ensure_ascii=True)
+        payload = json.dumps({"articles": [article]}, ensure_ascii=False)
         r = requests.post(f"{_API}/draft/add",
                           params={"access_token": token},
                           data=payload.encode("utf-8"), timeout=30)
+        r.encoding = "utf-8"
         data = r.json()
     except Exception as e:
         raise WechatError(f"存草稿网络异常：{e}")
