@@ -552,6 +552,73 @@ def fan_fundamentals_brief(free_md: str, home: str, away: str,
     return out.strip()
 
 
+def wx_compliant_article(free_md: str, home: str, away: str,
+                         league: str) -> dict | None:
+    """微信公众号发布：把报告免费正文改写成【合规基本面文章】。
+
+    产出 {"title": 标题, "body": 正文}。面向大陆法规，纯基本面 + 结尾白话猜测：
+      - 只讲两队近况/交锋/赛程等客观事实，结尾 1~2 句球迷视角的倾向性看法；
+      - 【绝不】出现让球/亚盘/欧赔/凯利/大小球/盘口/水位/下注/庄家名等博彩术语，
+        也不给出「比分预测/上下盘/胜平负」这类结论式判断（结尾猜测只能是
+        「个人更期待主队踢出气势」这种模糊球迷观点，不带任何盘口含义）。
+    失败/未配置返回 None（调用方据此不存草稿，报错）。
+    """
+    if not available() or not free_md.strip():
+        return None
+    system = (
+        "你是一位足球公众号编辑，也是一名足球裁判员，用【纯基本面 + 球迷视角】写赛前"
+        "导读文章。下面是一篇赛前分析报告的正文（含近况/交锋/赛程等）。据此写一篇"
+        "面向普通球迷的公众号文章：\n"
+        "- 输出 JSON，只含两个字段：\"title\"（吸引人的标题，≤30字，含两队名）、"
+        "\"body\"（正文，500~900字，可分 3~5 个自然段）；\n"
+        "- 正文只讲两队近期状态、战绩、历史交锋、赛程/伤停等基本面，像给球迷做赛前"
+        "背景导读，客观可读；结尾用 1~2 句【模糊的球迷观点】收尾（如「个人更期待主队"
+        "在主场踢出气势」），不要给具体比分、不要说谁一定赢；\n"
+        "- 【硬红线，违反则整篇作废】：绝对不能出现任何博彩/操盘词汇——包括但不限于"
+        "让球、受让、亚盘、欧赔、盘口、水位、凯利、大小球、上盘、下盘、诱盘、下注、"
+        "投注、串关、庄家、赔率、返还率，以及任何庄家名（如 365、Pinnacle、威廉、SBO 等）；"
+        "不得出现具体赔率数字或盘口线；不得引导任何形式的投注；\n"
+        "- 只讲报告里【实际有】的信息，报告没提供的（伤停/后续赛程等）直接略过，"
+        "不要写「报告未提供」这类话，也不要编造数据；\n"
+        "- 全中文，直接输出 JSON，不要 markdown 代码块、不要多余文字。"
+    )
+    user = (
+        f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
+        f"### 报告正文（据此提炼合规基本面文章）\n{free_md}\n"
+    )
+    out = _call_llm(system, user,
+                    effort=config.FUND_ANALYZE_EFFORT,
+                    tier="balanced",
+                    timeout=config.FUND_ANALYZE_TIMEOUT,
+                    max_tokens=config.FUND_ANALYZE_MAX_TOKENS)
+    if not out or out.startswith(_LLM_ERR_PREFIXES):
+        log.warning("微信合规文章生成失败: %s", (out or "")[:120])
+        return None
+    import json
+    import re as _re
+    s = out.strip()
+    # 剥可能的 ```json ``` 代码块围栏
+    s = _re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip(), flags=_re.MULTILINE).strip()
+    try:
+        obj = json.loads(s)
+    except Exception:
+        # 容错：尝试抓第一个 {...} 块
+        mm = _re.search(r"\{.*\}", s, _re.DOTALL)
+        if not mm:
+            log.warning("微信合规文章 JSON 解析失败: %s", s[:120])
+            return None
+        try:
+            obj = json.loads(mm.group(0))
+        except Exception:
+            log.warning("微信合规文章 JSON 二次解析失败: %s", s[:120])
+            return None
+    title = str(obj.get("title", "")).strip()
+    body = str(obj.get("body", "")).strip()
+    if not title or not body:
+        return None
+    return {"title": title, "body": body}
+
+
 def seo_summarize(free_body: str, home: str, away: str, league: str,
                   is_review: bool = False) -> tuple[dict | None, str | None]:
     """据报告【免费正文】生成 SEO 三件套，返回 (结果 dict 或 None, 错误说明 或 None)。

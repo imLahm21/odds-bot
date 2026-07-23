@@ -30,7 +30,7 @@ import requests
 from dotenv import load_dotenv
 
 from . import (config, db, api_client, analyzer, llm_client, ghost_publish,
-               lesson_archive)
+               wechat_publish, lesson_archive)
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -178,7 +178,7 @@ ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
 
 # 仅管理员可用的配置类命令（访客调用会被拒绝）
 _ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm",
-                    "lesson"}
+                    "lesson", "wxpublish"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
@@ -208,6 +208,11 @@ _publish_pending: dict[str, dict] = {}
 # 下一条文本被当作标题消费后清除。
 _pending_pub_title: dict[int, str] = {}
 _publish_lock = threading.Lock()
+
+# ─── /wxpublish 存微信公众号草稿的会话状态（仅管理员）─────────────────────────
+# 复用 /publish 的选日期→选报告流程，但回调前缀独立（wd:/wf:）避免与 Ghost 冲突。
+# 浏览态：chat_id -> {"date", "files"}；wf:<idx> 映射回文件名后直接存草稿。
+_wxpublish_browse: dict[int, dict] = {}
 
 # ─── /review 复盘后「可选归档为实战教训」的会话状态（仅管理员）──────────────────
 # 待归档态：token -> 承载「三写一改」向导的多步上下文，避免整篇报告塞进 callback_data：
@@ -372,6 +377,7 @@ def setup_commands() -> None:
         {"command": "add", "description": "加联赛：/add 关键词 搜了点 或 /add id season"},
         {"command": "remove", "description": "删除关注联赛"},
         {"command": "publish", "description": "把历史归档报告发布到 Ghost 博客（管理员）"},
+        {"command": "wxpublish", "description": "把报告改写成合规基本面文章存微信公众号草稿（管理员）"},
         {"command": "lesson", "description": "把历史复盘归档为实战教训（管理员）"},
         {"command": "llm", "description": "LLM 端点测试/故障转移/熔断参数面板（管理员）"},
     ]
@@ -507,6 +513,8 @@ _HELP_ADMIN_EXTRA = (
     "/add &lt;关键词&gt; — 搜联赛点按钮加（如 /add 瑞典）；或 /add &lt;id&gt; &lt;season&gt;\n"
     "/remove &lt;id&gt; — 删联赛\n"
     "/publish — 把 report/ 历史归档报告发布到 Ghost 博客（选日期→选报告→标题→可见性）\n"
+    "/wxpublish — 把报告改写成合规基本面文章（纯基本面+结尾猜测，不涉博彩）存微信公众号草稿"
+    "（选日期→选报告，自动生成+合规扫描+存草稿，人工后台确认后发）\n"
     "/lesson — 把 report/ 历史复盘（_review）蒸馏归档为实战教训（选日期→选报告）\n"
     "/llm — LLM 端点连通性测试 + 故障转移/熔断参数面板（测试延迟、改重试/超时/熔断阈值）\n"
 )
@@ -1757,6 +1765,153 @@ def _cmd_publish(chat_id: int, args: list[str]) -> None:
     send(chat_id, "📤 发布到博客 —— 选择报告日期：", kb)
 
 
+# ─── /wxpublish：报告 → 合规基本面文章 → 微信公众号草稿 ──────────────────────
+def _wxpublish_date_keyboard(page: int = 0) -> dict | None:
+    """扫描 report/ 下日期子目录，构造日期选择键盘（回调 wd:/wdp:，与 Ghost 独立）。
+    仿 _publish_date_keyboard，仅前缀不同以隔离两条发布流程。无报告返回 None。"""
+    import os
+    base = "report"
+    if not os.path.isdir(base):
+        return None
+    dates = []
+    for name in os.listdir(base):
+        d = os.path.join(base, name)
+        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
+            n = len([f for f in os.listdir(d) if f.endswith(".md")])
+            if n:
+                dates.append((name, n))
+    if not dates:
+        return None
+    dates.sort(reverse=True)
+    per_page = config.WXPUBLISH_DATES_PER_PAGE
+    pages = max(1, (len(dates) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    chunk = dates[page * per_page:(page + 1) * per_page]
+    rows = [[{"text": f"{date}（{n}）", "callback_data": f"wd:{date}"}]
+            for date, n in chunk]
+    if pages > 1:
+        nav = []
+        nav.append({"text": "‹ 上一页", "callback_data": f"wdp:{page - 1}"}
+                   if page > 0 else {"text": " ", "callback_data": "wdp:noop"})
+        nav.append({"text": f"{page + 1}/{pages}", "callback_data": "wdp:noop"})
+        nav.append({"text": "下一页 ›", "callback_data": f"wdp:{page + 1}"}
+                   if page < pages - 1 else {"text": " ", "callback_data": "wdp:noop"})
+        rows.append(nav)
+    return {"inline_keyboard": rows}
+
+
+def _wxpublish_report_keyboard(chat_id: int, date: str) -> dict | None:
+    """列某日期目录下所有 *.md，构造报告选择键盘（回调 wf:<idx>）。
+    文件名列表暂存 _wxpublish_browse[chat_id]。"""
+    import os
+    d = os.path.join("report", date)
+    if not os.path.isdir(d):
+        return None
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
+    if not files:
+        return None
+    with _publish_lock:
+        _wxpublish_browse[chat_id] = {"date": date, "files": files}
+    rows = []
+    for idx, fname in enumerate(files):
+        is_review = fname.endswith("_review.md")
+        stem = fname[:-len("_review.md")] if is_review else fname[:-len("_report.md")]
+        label = stem.replace("_", " ")
+        if is_review:
+            label += "（复盘）"
+        rows.append([{"text": label, "callback_data": f"wf:{idx}"}])
+    return {"inline_keyboard": rows}
+
+
+def _cmd_wxpublish(chat_id: int, args: list[str]) -> None:
+    """从 report/ 选一份报告，改写成合规基本面文章存微信公众号草稿（仅管理员）。"""
+    if not wechat_publish.available():
+        send(chat_id, "未配置微信公众号（.env 缺 WECHAT_APPID / WECHAT_APPSECRET）。"
+                      "配好后重启 bot 即可用 /wxpublish。")
+        return
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
+                      "无法生成合规文章。")
+        return
+    kb = _wxpublish_date_keyboard()
+    if kb is None:
+        send(chat_id, "report/ 下暂无归档报告。先用 /analyze 生成。")
+        return
+    send(chat_id, "📮 存公众号草稿 —— 选择报告日期：", kb)
+
+
+def _wxpublish_do(chat_id: int, message_id: int, path: str) -> None:
+    """读报告 → LLM 合规改写 → 合规扫描 → 存草稿 → 回执。全程只存草稿不直发。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            md = f.read()
+    except OSError as e:
+        edit_text(chat_id, message_id, f"❌ 读取报告失败：{e}")
+        return
+    edit_text(chat_id, message_id, "⏳ 正在生成合规文章并存入公众号草稿…")
+    try:
+        home, away, league = wechat_publish.parse_meta(md)
+        title, html = wechat_publish.report_to_wx_article(md, home, away, league)
+        digest = f"{home} vs {away} 赛前基本面导读" if home and away else ""
+        media_id = wechat_publish.add_draft(title, html, digest=digest)
+    except wechat_publish.WechatError as e:
+        edit_text(chat_id, message_id, f"❌ 存草稿失败：{e}")
+        return
+    except Exception as e:
+        log.exception("wxpublish 异常")
+        edit_text(chat_id, message_id, f"❌ 存草稿异常：{e}")
+        return
+    edit_text(chat_id, message_id,
+              f"✅ 已存入公众号草稿箱：《{title}》\n"
+              f"（草稿 id: {media_id[:16]}…）\n"
+              "去 mp.weixin.qq.com 后台「草稿箱」核对内容后手动发布。")
+
+
+def _handle_wxpublish_callback(cb_id: str, data: str, chat_id: int,
+                               message_id: int) -> None:
+    """处理 /wxpublish 系列回调：wdp:翻页 / wd:选日期 / wf:选报告并存草稿。"""
+    import os
+    answer_callback(cb_id)
+
+    if data.startswith("wdp:"):
+        arg = data[4:]
+        if arg == "noop":
+            return
+        try:
+            page = int(arg)
+        except ValueError:
+            return
+        kb = _wxpublish_date_keyboard(page)
+        if kb is not None:
+            edit_markup(chat_id, message_id, kb)
+        return
+
+    if data.startswith("wd:"):
+        date = data[3:]
+        kb = _wxpublish_report_keyboard(chat_id, date)
+        if kb is None:
+            edit_text(chat_id, message_id, f"{date} 下无报告。")
+        else:
+            edit_text(chat_id, message_id, f"📅 {date} —— 选择要发的报告：", kb)
+        return
+
+    # wf:<idx> —— 选定报告，直接后台生成合规文章 + 存草稿（无标题/可见性步骤）
+    if data.startswith("wf:"):
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            return
+        with _publish_lock:
+            browse = _wxpublish_browse.get(chat_id)
+        if not browse or idx >= len(browse["files"]):
+            edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /wxpublish。")
+            return
+        path = os.path.join("report", browse["date"], browse["files"][idx])
+        # LLM 改写 + 微信 HTTP 较慢，丢后台池，不占死该 chat 工作线程
+        _submit_bg(_wxpublish_do, chat_id, message_id, path)
+        return
+
+
 def _publish_do(chat_id: int, message_id: int, token: str, visibility: str) -> None:
     """取缓存 → 转换 → 调 Ghost 发文 → 回链接/错误。消费后清缓存。"""
     with _publish_lock:
@@ -2989,6 +3144,8 @@ def handle_message(msg: dict) -> None:
         _cmd_review(chat_id, args)
     elif cmd == "publish":
         _cmd_publish(chat_id, args)
+    elif cmd == "wxpublish":
+        _cmd_wxpublish(chat_id, args)
     elif cmd == "lesson":
         _cmd_lesson(chat_id)
     elif cmd == "llm":
@@ -3257,6 +3414,14 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "仅管理员可发布")
             return
         _handle_publish_callback(cb_id, data, chat_id, message_id)
+        return
+
+    # ── /wxpublish 存微信公众号草稿的回调（wdp:翻页/wd:选日期/wf:选报告，仅管理员）──
+    if data.startswith(("wdp:", "wd:", "wf:")):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可发布")
+            return
+        _handle_wxpublish_callback(cb_id, data, chat_id, message_id)
         return
 
     # ── 发布成功后广播到群/频道（bx:，仅管理员）──
