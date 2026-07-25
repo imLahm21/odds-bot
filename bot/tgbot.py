@@ -723,10 +723,13 @@ def _render_fixtures(view: str = "future", page: int = 0, refresh: bool = False)
     try:
         # 直接查，多带一列 league_name（不动 db.get_fixtures_between 的 4 列结构，
         # 那个被调度器解包复用）
+        # 只显示当前启用(enabled=1)联赛的比赛：停用/删除联赛后，库里存量 fixtures
+        # 仍在，不加此过滤会把已停用联赛(如拉脱超)的旧赛程也列出来。
         fixtures = conn.execute(
             "SELECT fixture_id, commence_utc, home_team, away_team, league_name, "
             "league_id, status, home_team_id, away_team_id "
             "FROM fixtures WHERE commence_utc BETWEEN ? AND ? "
+            "AND league_id IN (SELECT league_id FROM watched_leagues WHERE enabled=1) "
             "ORDER BY commence_utc", (start, end)).fetchall()
     finally:
         conn.close()
