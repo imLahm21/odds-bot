@@ -992,7 +992,9 @@ def _build_csv(fid: int):
     away = config.team_label(fx[5] if fx else None, fx[1] if fx else "")
     league = fx[2] if fx else ""
     kick_cst = to_cst(fx[3]) if fx else ""
-    market_zh = {"h2h": "欧指", "ah": "亚盘", "ou": "大小球"}
+    market_zh = {"h2h": "欧指", "ah": "亚盘", "ou": "大小球",
+                 "ou_home": "主队大小球", "ou_away": "客队大小球",
+                 "btts": "双进"}
 
     buf = io.StringIO()
     w = csv.writer(buf)

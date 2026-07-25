@@ -132,6 +132,9 @@ KELLY_POOL_IDS = set(DEFAULT_ENABLED_BOOKMAKERS)
 BET_MATCH_WINNER = 1     # 欧赔 1X2，value: Home/Draw/Away
 BET_ASIAN_HANDICAP = 4   # 亚盘，value: "Home +0.75" / "Away -1.25"（含完整 1/4 盘）
 BET_OVER_UNDER = 5       # 大小球（总进球数），value: "Over 2.5" / "Under 2.5"
+BET_BTTS = 8             # 双进（两队都进球 BTTS），value: "Yes" / "No"（无盘口线）
+BET_TOTAL_HOME = 16      # 主队大小球（主队进球总数），value: "Over 1.5" / "Under 1.5"
+BET_TOTAL_AWAY = 17      # 客队大小球（客队进球总数），value: "Over 2.5" / "Under 2.5"
 
 # ─── 走地(滚球/in-play) bet 类型 ID ─────────────────────────────────────────
 # ⚠️ /odds/live 的 bet id 体系与盘前 /odds 完全不同（已用 probe_live.py 实测）。

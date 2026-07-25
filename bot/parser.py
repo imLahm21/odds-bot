@@ -154,6 +154,28 @@ def extract_over_under(values: list[dict]) -> dict[float, dict]:
             if "over_water" in r and "under_water" in r}
 
 
+# ─── 双进(BTTS) value 文本解析 ───────────────────────────────────────────────
+def extract_btts(values: list[dict]) -> dict | None:
+    """将一家庄的双进(Both Teams Score) values 列表聚合成 Yes/No 两侧赔率。
+    返回 {"yes_odds":x, "no_odds":y}；两侧不齐则 None。
+
+    双进无盘口线（value 仅 "Yes"/"No"），故不像亚盘/大小球那样按线聚合。
+    """
+    rec: dict = {}
+    for v in values:
+        side = str(v.get("value", "")).strip().lower()
+        odd = _to_float(v.get("odd"))
+        if odd is None:
+            continue
+        if side == "yes":
+            rec["yes_odds"] = odd
+        elif side == "no":
+            rec["no_odds"] = odd
+    if "yes_odds" in rec and "no_odds" in rec:
+        return rec
+    return None
+
+
 # ─── 主解析：单场 odds → 行列表 ──────────────────────────────────────────────
 def parse_odds_response(entry: dict, snapshot_utc: str,
                         commence_utc: str,
@@ -175,10 +197,20 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
     h2h_all = {"home": [], "draw": [], "away": []}
     # 亚盘按盘口线聚合水位
     ah_all: dict[float, dict[str, list]] = {}
-    # 大小球按盘口线聚合水位
+    # 大小球按盘口线聚合水位（全场/主队/客队各一套）
     ou_all: dict[float, dict[str, list]] = {}
+    ouh_all: dict[float, dict[str, list]] = {}
+    oua_all: dict[float, dict[str, list]] = {}
+    # 双进（Yes/No，无盘口线）
+    btts_all = {"yes": [], "no": []}
 
     parsed_per_bm: dict[int, dict] = {}  # 缓存每家解析结果，避免二次解析
+
+    def _accum_ou(ou_dict, acc):
+        for ln, rec in ou_dict.items():
+            slot = acc.setdefault(ln, {"over": [], "under": []})
+            slot["over"].append(rec["over_water"])
+            slot["under"].append(rec["under_water"])
 
     for bm in bookmakers:
         bid = bm.get("id")
@@ -187,8 +219,12 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
         h2h = None
         ah = None
         ou = None
+        ou_home = None
+        ou_away = None
+        btts = None
         for bet in bm.get("bets", []):
-            if bet.get("id") == config.BET_MATCH_WINNER:
+            bet_id = bet.get("id")
+            if bet_id == config.BET_MATCH_WINNER:
                 vals = {v.get("value", "").lower(): _to_float(v.get("odd"))
                         for v in bet.get("values", [])}
                 h2h = {"home": vals.get("home"),
@@ -197,25 +233,42 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                 for k in ("home", "draw", "away"):
                     if h2h[k]:
                         h2h_all[k].append(h2h[k])
-            elif bet.get("id") == config.BET_ASIAN_HANDICAP:
+            elif bet_id == config.BET_ASIAN_HANDICAP:
                 ah = extract_asian_handicap(bet.get("values", []))
                 for hc, rec in ah.items():
                     slot = ah_all.setdefault(hc, {"home": [], "away": []})
                     slot["home"].append(rec["home_water"])
                     slot["away"].append(rec["away_water"])
-            elif bet.get("id") == config.BET_OVER_UNDER:
+            elif bet_id == config.BET_OVER_UNDER:
                 ou = extract_over_under(bet.get("values", []))
-                for ln, rec in ou.items():
-                    slot = ou_all.setdefault(ln, {"over": [], "under": []})
-                    slot["over"].append(rec["over_water"])
-                    slot["under"].append(rec["under_water"])
-        parsed_per_bm[bid] = {"h2h": h2h, "ah": ah, "ou": ou}
+                _accum_ou(ou, ou_all)
+            elif bet_id == config.BET_TOTAL_HOME:
+                ou_home = extract_over_under(bet.get("values", []))
+                _accum_ou(ou_home, ouh_all)
+            elif bet_id == config.BET_TOTAL_AWAY:
+                ou_away = extract_over_under(bet.get("values", []))
+                _accum_ou(ou_away, oua_all)
+            elif bet_id == config.BET_BTTS:
+                btts = extract_btts(bet.get("values", []))
+                if btts:
+                    btts_all["yes"].append(btts["yes_odds"])
+                    btts_all["no"].append(btts["no_odds"])
+        parsed_per_bm[bid] = {"h2h": h2h, "ah": ah, "ou": ou,
+                              "ou_home": ou_home, "ou_away": ou_away,
+                              "btts": btts}
 
     avg_h = {k: _avg(v) for k, v in h2h_all.items()}
     avg_ah = {hc: {"home": _avg(s["home"]), "away": _avg(s["away"])}
               for hc, s in ah_all.items()}
-    avg_ou = {ln: {"over": _avg(s["over"]), "under": _avg(s["under"])}
-              for ln, s in ou_all.items()}
+
+    def _avg_ou(acc):
+        return {ln: {"over": _avg(s["over"]), "under": _avg(s["under"])}
+                for ln, s in acc.items()}
+
+    avg_ou = _avg_ou(ou_all)
+    avg_ouh = _avg_ou(ouh_all)
+    avg_oua = _avg_ou(oua_all)
+    avg_btts = {"yes": _avg(btts_all["yes"]), "no": _avg(btts_all["no"])}
 
     # ── 第二轮：生成行 ──
     rows = []
@@ -262,15 +315,15 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
 
         # 大小球行（每条盘口线一行）
         # 复用通用列：handicap=盘口线(如 2.5)，home_water=大球水位，away_water=小球水位，
-        # kelly_h_water=大球凯利，kelly_a_water=小球凯利；market='ou' 区分语义。
-        ou = pdata["ou"]
-        if ou:
-            for ln, rec in ou.items():
-                mavg = avg_ou.get(ln, {})
+        # kelly_h_water=大球凯利，kelly_a_water=小球凯利；market 区分语义。
+        # 全场('ou') / 主队('ou_home') / 客队('ou_away') 三套同构，共用下面这段。
+        def _emit_ou(ou_dict, mavg_map, market_tag):
+            for ln, rec in (ou_dict or {}).items():
+                mavg = mavg_map.get(ln, {})
                 rows.append({
                     "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
                     "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
-                    "market": "ou",
+                    "market": market_tag,
                     "home_odds": None, "draw_odds": None, "away_odds": None,
                     "kelly_home": None, "kelly_draw": None, "kelly_away": None,
                     "handicap": ln,
@@ -279,6 +332,28 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                     "kelly_h_water": _kelly(rec["over_water"], mavg.get("over")),
                     "kelly_a_water": _kelly(rec["under_water"], mavg.get("under")),
                 })
+
+        _emit_ou(pdata["ou"], avg_ou, "ou")
+        _emit_ou(pdata["ou_home"], avg_ouh, "ou_home")
+        _emit_ou(pdata["ou_away"], avg_oua, "ou_away")
+
+        # 双进(BTTS)行：无盘口线，handicap=None（与 h2h 同，去重索引行为一致）。
+        # 复用通用列：home_water=Yes(双进)赔率，away_water=No(非双进)赔率，
+        # kelly_h_water=Yes凯利，kelly_a_water=No凯利；market='btts'。
+        btts = pdata["btts"]
+        if btts:
+            rows.append({
+                "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
+                "market": "btts",
+                "home_odds": None, "draw_odds": None, "away_odds": None,
+                "kelly_home": None, "kelly_draw": None, "kelly_away": None,
+                "handicap": None,
+                "home_water": btts["yes_odds"],
+                "away_water": btts["no_odds"],
+                "kelly_h_water": _kelly(btts["yes_odds"], avg_btts.get("yes")),
+                "kelly_a_water": _kelly(btts["no_odds"], avg_btts.get("no")),
+            })
 
     return rows
 

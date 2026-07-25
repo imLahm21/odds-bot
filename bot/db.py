@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS odds_history (
     node_label    TEXT,
     bookmaker_id  INTEGER NOT NULL,
     bookmaker     TEXT,
-    market        TEXT NOT NULL,            -- 'h2h'(欧赔) | 'ah'(亚盘)
+    market        TEXT NOT NULL,            -- h2h(欧赔)|ah(亚盘)|ou(大小球)|ou_home/ou_away(主客队大小球)|btts(双进)
     home_odds     REAL, draw_odds REAL, away_odds REAL,
     kelly_home    REAL, kelly_draw REAL, kelly_away REAL,
     handicap      REAL,
