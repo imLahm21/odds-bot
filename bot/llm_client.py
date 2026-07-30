@@ -579,11 +579,14 @@ _CONNECT_TIMEOUT = 10   # 连接超时（秒），与读超时分开
 
 # ─── 阻塞调用（带端点内重试 + 跨端点故障转移）────────────────────────────────
 def _do_chat(ep: dict, payload: dict, read_to: int,
-             max_retries: int) -> tuple[str | None, bool, str, bool]:
+             max_retries: int) -> tuple[str | None, bool, str, bool, bool]:
     """对单端点发一次非流式请求（含端点内重试）。
-    返回 (正文 or None, 成功?, 错误串, 是否超时类)。错误串沿用 analyzer 旧格式。
+    返回 (正文 or None, 成功?, 错误串, 是否超时类, 是否限流429)。错误串沿用 analyzer 旧格式。
     重试仅针对瞬时错误（网络/超时/429/5xx）；4xx / 空内容 / 无 choices 为确定性
     错误，不在同端点重试（重试同请求结果相同），直接判失败交由上层切下一端点。
+
+    末位 rate_limited=True 表示「被限流(429)」——限流 ≠ 端点故障，上层据此
+    【不喂熔断器】，避免把健康但暂时超 TPM 的 key 误熔断 90s（详见 chat()）。
     """
     url = f"{ep['base_url']}/chat/completions"
     headers = _headers(ep)
@@ -595,17 +598,19 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
         except requests.exceptions.Timeout:
             attempt += 1
             if attempt > max_retries:
-                return None, False, f"LLM 超时（>{read_to}s）。推理较慢，可稍后重试。", True
+                return (None, False,
+                        f"LLM 超时（>{read_to}s）。推理较慢，可稍后重试。", True, False)
             time.sleep(min(2 ** attempt, 8))
             continue
         except UnicodeEncodeError as e:
             log.error("请求头编码失败（key/url 含非 ASCII）: %s", e)
-            return None, False, ("LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能"
-                                 "复制时混入了全角符号/空格）。请检查服务器 .env 后重启。"), False
+            return (None, False,
+                    "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时混入了"
+                    "全角符号/空格）。请检查服务器 .env 后重启。", False, False)
         except requests.exceptions.RequestException as e:
             attempt += 1
             if attempt > max_retries:
-                return None, False, f"LLM 网络错误：{e}", False
+                return None, False, f"LLM 网络错误：{e}", False, False
             time.sleep(min(2 ** attempt, 8))
             continue
 
@@ -614,37 +619,64 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
             if r.status_code == 429 or 500 <= r.status_code < 600:
                 attempt += 1
                 if attempt > max_retries:
-                    return None, False, f"LLM 请求失败 HTTP {r.status_code}：{body}", False
+                    # 429 标记为限流（上层不喂熔断器）；5xx 是真故障，照旧计入
+                    is_429 = r.status_code == 429
+                    if is_429:
+                        log.warning("端点【%s】被限流 429（重试 %d 次仍限流），"
+                                    "换下一端点、不计入熔断", ep["label"], max_retries)
+                    return (None, False,
+                            f"LLM 请求失败 HTTP {r.status_code}：{body}", False, is_429)
                 time.sleep(min(2 ** attempt, 8))
                 continue
             # 4xx（400/401/403 等）确定性错误：不重试，直接切端点
-            return None, False, f"LLM 请求失败 HTTP {r.status_code}：{body}", False
+            return None, False, f"LLM 请求失败 HTTP {r.status_code}：{body}", False, False
 
         try:
             data = r.json()
         except ValueError:
-            return None, False, f"LLM 请求失败 HTTP 200：响应非 JSON：{r.text[:200]}", False
+            return (None, False,
+                    f"LLM 请求失败 HTTP 200：响应非 JSON：{r.text[:200]}", False, False)
         choices = data.get("choices", [])
         if not choices:
-            return None, False, f"LLM 返回无 choices：{str(data)[:300]}", False
+            return None, False, f"LLM 返回无 choices：{str(data)[:300]}", False, False
         content = choices[0].get("message", {}).get("content", "").strip()
         if not content:
-            return None, False, "LLM 返回空内容", False
-        return content, True, "", False
+            return None, False, "LLM 返回空内容", False, False
+        return content, True, "", False, False
 
 
 # 选路优先级：正常/半开端点优先，降级端点次之（仍用但靠后），OPEN 交由 allow() 冷却门控。
 # 手动停用端点直接排除。返回按优先级排好序的 [(idx, ep)]，调用方仍需逐个 br.allow()。
 _STATE_PRIORITY = {"CLOSED": 0, "HALF_OPEN": 0, "OPEN": 1, "DEGRADED": 2}
 
+# 轮转计数器：把并发请求的【起始端点】错开，避免全压同一个 key 撞单 key TPM 限流。
+# 背景：中转商按令牌分组限流（各 key 129K~285K TPM），单次精算下行 15~28 万 token；
+# 几秒内连点多场若都从同一端点起头，瞬时 token 叠加必撞 429（实测 429 集中在容量最小的
+# 分组）。轮转让每场落到不同 key，各自远低于自身 TPM。
+# 对所有启用端点【一律平等】——故障是随机分布在各分组的，不做任何端点偏好/权重；
+# 不可用分组由运维在 /llm 面板手动停用（停用端点在上面就被过滤，不参与轮转）。
+_rr_counter = 0
+_rr_lock = threading.Lock()
+
 
 def _endpoints_by_priority() -> list[tuple[int, dict]]:
     """未手动停用的端点按选路优先级排序：正常/半开(0) < OPEN(1) < 降级(2)。
-    稳定排序，同优先级保持 .env 原顺序（多 key 冗余的先后不被打乱）。
-    降级端点排最后——健康端点先跑，降级的只在健康端点都用不上时才轮到。"""
+    降级端点排最后——健康端点先跑，降级的只在健康端点都用不上时才轮到。
+
+    同优先级组内不再固定用 .env 原序，而是按请求【轮转起始位置】，使并发请求
+    分散到不同 key（见 _rr_counter 说明）。故障转移语义不变：仍"不行就试下一个"，
+    只是"第一个"换着来。单端点部署无影响（只有一个候选，旋转等于原序）。
+    """
+    global _rr_counter
     disabled = _get_disabled()
     cands = [(i, ep) for i, ep in enumerate(_ENDPOINTS)
              if _sig(ep) not in disabled]
+    if len(cands) > 1:
+        with _rr_lock:
+            _rr_counter = (_rr_counter + 1) % len(cands)
+            shift = _rr_counter
+        cands = cands[shift:] + cands[:shift]   # 旋转起点
+    # 稳定排序：组内保持上面旋转后的相对次序，仅按熔断状态分层
     return sorted(cands, key=lambda t: _STATE_PRIORITY.get(
         _breakers[t[0]].state, 1))
 
@@ -677,8 +709,12 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
         # 每端点按档位解析真实模型名（运行时选定 + 端点映射；Anyrouter 轻档→gpt-5-codex 等）
         payload = _payload(_resolve_model(tier, ep, visitor), system, user,
                            tok, effort, False)
-        content, ok, err, was_to = _do_chat(ep, payload, read_to, max_retries)
-        br.record(ok)
+        content, ok, err, was_to, rate_limited = _do_chat(
+            ep, payload, read_to, max_retries)
+        # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
+        # 暂时超 TPM 的 key 误熔断 90s，反而加剧其余 key 压力。5xx/超时仍照记。
+        if not rate_limited:
+            br.record(ok)
         if ok:
             return content
         raw_errs.append(err)
@@ -700,31 +736,51 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
 
 
 # ─── 流式调用（仅首字节前故障转移）──────────────────────────────────────────
-def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int):
+def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
+                max_retries: int = 0):
     """对单端点发一次流式请求。yield ('delta', 累积全文) / ('done', 全文) /
-    ('error', 串)。首字节超时用 monotonic 手动计时（socket 读超时取较大值兜底，
-    避免推理模型正常的长首字节/块间静默被过早掐断）；idle_to=0 时禁用块间超时。
+    ('error', 串) / ('ratelimit', 串)。首字节超时用 monotonic 手动计时（socket 读超时
+    取较大值兜底，避免推理模型正常的长首字节/块间静默被过早掐断）；idle_to=0 时禁用块间超时。
+
+    429/5xx 在【发起阶段】按 max_retries 退避重试（此时还没吐任何内容，重试安全）。
+    重试用尽仍 429 → yield ('ratelimit', ...)，上层据此【不喂熔断器】直接换下一端点；
+    5xx 等真故障仍走 ('error', ...) 正常计入熔断。
     """
     url = f"{ep['base_url']}/chat/completions"
     # socket 读超时：取语义上限的较大者兜底；真正的语义判定由下方 monotonic 检查负责。
     sock_read = max(first_byte_to, idle_to) if idle_to > 0 else max(first_byte_to, 300)
-    try:
-        r = requests.post(url, json=payload, headers=_headers(ep),
-                          stream=True, timeout=(_CONNECT_TIMEOUT, sock_read))
-    except requests.exceptions.Timeout:
-        yield ("error", f"LLM 超时（连接/读取 >{sock_read}s）。可稍后重试。")
-        return
-    except UnicodeEncodeError as e:
-        log.error("流式请求头编码失败（key/url 含非 ASCII）: %s", e)
-        yield ("error", "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时"
-                        "混入了全角符号/空格）。请检查服务器 .env 后重启。")
-        return
-    except requests.exceptions.RequestException as e:
-        yield ("error", f"LLM 网络错误：{e}")
-        return
+    attempt = 0
+    while True:
+        try:
+            r = requests.post(url, json=payload, headers=_headers(ep),
+                              stream=True, timeout=(_CONNECT_TIMEOUT, sock_read))
+        except requests.exceptions.Timeout:
+            yield ("error", f"LLM 超时（连接/读取 >{sock_read}s）。可稍后重试。")
+            return
+        except UnicodeEncodeError as e:
+            log.error("流式请求头编码失败（key/url 含非 ASCII）: %s", e)
+            yield ("error", "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时"
+                            "混入了全角符号/空格）。请检查服务器 .env 后重启。")
+            return
+        except requests.exceptions.RequestException as e:
+            yield ("error", f"LLM 网络错误：{e}")
+            return
 
-    if r.status_code != 200:
-        yield ("error", f"LLM 请求失败 HTTP {r.status_code}：{r.text[:300]}")
+        if r.status_code == 200:
+            break                       # 进入下方流式读取
+        # 非 200：429/5xx 可退避重试（尚未吐内容，安全）
+        body = r.text[:300]
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            attempt += 1
+            if attempt <= max_retries:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            if r.status_code == 429:
+                log.warning("端点【%s】流式被限流 429（重试 %d 次仍限流），"
+                            "换下一端点、不计入熔断", ep["label"], max_retries)
+                yield ("ratelimit", f"LLM 限流 HTTP 429：{body}")
+                return
+        yield ("error", f"LLM 请求失败 HTTP {r.status_code}：{body}")
         return
 
     # 强制 UTF-8：部分网关流式响应头不声明 charset，默认 latin-1 会中文乱码。
@@ -829,7 +885,8 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                            tok, effort, True)
         produced = False        # 是否已向用户吐过正文 delta
         failed_pre = False      # 首字节前失败 → 可切下一端点
-        for ev in _stream_one(ep, payload, first_byte_to, idle_to):
+        for ev in _stream_one(ep, payload, first_byte_to, idle_to,
+                              int(st["max_retries"])):
             if ev[0] == "delta":
                 produced = True
                 yield ev
@@ -837,6 +894,12 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                 br.record(True)
                 yield ev
                 return
+            elif ev[0] == "ratelimit":
+                # 限流(429)：不喂熔断器（健康 key 只是暂时超 TPM，误熔断会加剧其余 key
+                # 压力），直接换下一端点。ratelimit 只在首字节前产生，故不会重复输出。
+                last_err = ev[1]
+                failed_pre = True
+                break
             elif ev[0] == "error":
                 br.record(False)
                 if produced:
@@ -847,7 +910,7 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                 failed_pre = True
                 break
         if failed_pre:
-            continue   # 首字节前失败，尝试下一端点
+            continue   # 首字节前失败/限流，尝试下一端点
     if last_err is None and enabled_count() == 0:
         yield ("error", "LLM 全部端点均被手动停用（请用 /llm 面板开启至少一个端点）")
         return

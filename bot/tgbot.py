@@ -112,6 +112,12 @@ def _submit_bg(fn, *args) -> None:
 # 真正的天花板是【LLM 网关并发限流】，故不宜再往上堆（过高只会 429/排队甚至触发熔断）。
 _ANALYSIS_MAX_CONCURRENT = 10     # 全局同时在跑的分析上限（超出则排队）
 _ANALYSIS_MAX_PER_CHAT = 5        # 单个 chat 同时在跑的分析上限（防单人开到失控）
+# 批内错峰：同一 chat 连点多场时，第 N 场延迟 (N-1)×本值秒才发起，把各场下行 token
+# （单次 15~28 万）错开到不同 TPM 计费窗口，避免同时打满单个 key 的限流（实测 429）。
+# 配合 llm_client 的端点轮转（每场落到不同 key）双管齐下。设 0 关闭错峰。
+# 封顶存在的意义：用户在开赛前 27 分钟才开始推算、开赛前必须下注，延迟不能无限累加。
+_ANALYSIS_STAGGER_SECONDS = 30    # 每场递增的错峰间隔（秒）
+_ANALYSIS_STAGGER_MAX = 120       # 单场错峰延迟上限（秒），保护下注时间窗
 _analysis_pool = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_CONCURRENT,
                                     thread_name_prefix="analysis")
 
@@ -145,17 +151,31 @@ def _analysis_cancel(task_id: str) -> str | None:
 def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
     """把一个分析任务提交到独立分析池，并登记到中断注册表。
     fn 的末两个参数会追加为 (task_id, cancel 事件)。
-    返回新任务的 task_id；该 chat 并行数已达上限则返回 None（调用方据此提示）。"""
+    返回新任务的 task_id；该 chat 并行数已达上限则返回 None（调用方据此提示）。
+
+    批内错峰：同一 chat 几秒内连点多场时，第 N 场延迟 (N-1)×_ANALYSIS_STAGGER_SECONDS
+    才真正发起，把各场的下行 token 错开到不同的 TPM 计费窗口（中转商按令牌分组限流，
+    单次精算下行 15~28 万 token，同时发起必撞 429）。延迟用 cancel.wait 实现，
+    等待期间点「停止」立刻生效且不会发出 LLM 请求。
+    """
     with _analysis_lock:
-        if _analysis_count_for_chat(chat_id) >= _ANALYSIS_MAX_PER_CHAT:
+        running = _analysis_count_for_chat(chat_id)
+        if running >= _ANALYSIS_MAX_PER_CHAT:
             return None
         task_id = uuid.uuid4().hex[:10]
         cancel = threading.Event()
         _analysis_tasks[task_id] = {"chat_id": chat_id, "cancel": cancel,
                                     "kind": kind}
+    # 已有 N 个在跑 → 本场排第 N+1，延迟 N×间隔；封顶防把最后一场推太晚（下注窗口只有约 27 分钟）
+    delay = min(running * _ANALYSIS_STAGGER_SECONDS, _ANALYSIS_STAGGER_MAX)
 
     def _run() -> None:
         try:
+            if delay > 0:
+                # 可被停止键打断的等待：置位则直接收尾，不发起 LLM 请求
+                if cancel.wait(delay):
+                    log.info("分析任务在错峰等待期被停止 chat=%s kind=%s", chat_id, kind)
+                    return
             fn(*args, task_id, cancel)
         except Exception:
             log.exception("分析任务出错 chat=%s kind=%s", chat_id, kind)
@@ -164,6 +184,9 @@ def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
                 _analysis_tasks.pop(task_id, None)
 
     _analysis_pool.submit(_run)
+    if delay > 0:
+        send(chat_id, f"⏳ 已排队：本场约 {delay}s 后开始"
+                      f"（错峰发起，避免多场同时打满单个 key 的限流）")
     return task_id
 
 
