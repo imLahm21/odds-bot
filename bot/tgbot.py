@@ -40,7 +40,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 # 走地研判后台线程池：抓取循环(task_e)只管发盘口快报，LLM 研判丢这里异步跑，
 # 研判完成再追发一条 💡 消息。这样 1min 一轮的抓取永远不被 LLM(最坏 30s)拖慢。
 # daemon 线程，进程退出不阻塞；max_workers 限并发，避免研判堆积压垮网关。
-_live_brief_pool = ThreadPoolExecutor(max_workers=3,
+# 2核12G 下取 4：走地要秒级响应，多订阅时少排队；仍留余量不冲爆 LLM 网关并发。
+_live_brief_pool = ThreadPoolExecutor(max_workers=4,
                                       thread_name_prefix="live-brief")
 
 
@@ -83,8 +84,9 @@ def _submit_for_chat(chat_id: int, fn, *args) -> None:
 # 群广播），会占死该 chat 的唯一工作线程——分析期间用户发的命令、点的停止键全排在
 # 后面，这正是「推算时命令无响应」的根因之一。故把这些重内联活丢到本多线程池异步跑，
 # per-chat 工作线程点完即回，命令与停止/新建始终即时响应，且能与正在跑的分析并行。
-# daemon 线程随进程退出；max_workers 限并发，避免多人同时触发压垮 1C1G。
-_bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
+# daemon 线程随进程退出；max_workers 限并发，避免多人同时触发把网关/额度打满。
+# 2核12G 下取 6：归档/发布/教训路由等重内联活不再互相排队。
+_bg_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="bg")
 
 
 def _submit_bg(fn, *args) -> None:
@@ -103,10 +105,13 @@ def _submit_bg(fn, *args) -> None:
 # 若它们跑在 per-chat 执行器里，会占死该 chat 的唯一工作线程——同一用户在分析
 # 期间发的任何命令（含「停止」按钮）都排在它后面，永远轮不到，停止键反被它卡死。
 # 故把精算/复盘搬到这个独立池：per-chat 执行器只留给快命令 + 停止键，秒回；
-# 停止键点击能立即处理并去中断正在跑的分析。max_workers 限总并发，避免多人同时
-# 精算压垮 1C1G。
-_ANALYSIS_MAX_CONCURRENT = 6      # 全局同时在跑的分析上限（保护 1C1G，超出则排队）
-_ANALYSIS_MAX_PER_CHAT = 3        # 单个 chat 同时在跑的分析上限（防单人开到失控）
+# 停止键点击能立即处理并去中断正在跑的分析。max_workers 限总并发。
+# 容量依据（服务器 2核12G）：分析线程 99% 时间阻塞在等 LLM 网络响应（期间释放 GIL），
+# 本地只做流式解析，几乎不吃 CPU；规则库 system prompt 进程内缓存共享一份（_rules_cache），
+# 每线程仅额外持累积报告与请求缓冲，约 0.5~1MB → 10 路并行也仅约 10MB，内存非瓶颈。
+# 真正的天花板是【LLM 网关并发限流】，故不宜再往上堆（过高只会 429/排队甚至触发熔断）。
+_ANALYSIS_MAX_CONCURRENT = 10     # 全局同时在跑的分析上限（超出则排队）
+_ANALYSIS_MAX_PER_CHAT = 5        # 单个 chat 同时在跑的分析上限（防单人开到失控）
 _analysis_pool = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_CONCURRENT,
                                     thread_name_prefix="analysis")
 
