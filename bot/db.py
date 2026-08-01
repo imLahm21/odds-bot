@@ -325,14 +325,21 @@ def get_fixture_meta(conn: sqlite3.Connection, fixture_id: int):
 def cleanup_old(conn: sqlite3.Connection, days: int = 30) -> tuple[int, int]:
     """删除开球时间早于 days 天前的比赛及其盘口快照。返回 (删赛程数, 删快照数)。"""
     from datetime import timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     od = conn.execute(
         "DELETE FROM odds_history WHERE fixture_id IN "
         "(SELECT fixture_id FROM fixtures WHERE commence_utc < ?)", (cutoff,))
     odds_n = od.rowcount
     fx = conn.execute("DELETE FROM fixtures WHERE commence_utc < ?", (cutoff,))
     fix_n = fx.rowcount
+    # 走地快照：无 fixtures 外键，上面按 fixtures 子查询的删除碰不到它
+    # （建表注释已说明：进行中比赛未必在 fixtures 表）。按自身 snapshot_utc
+    # 独立清理，否则只增不减。走地仅服务实时播报，赛后无复盘价值，保留期更短。
+    live_cutoff = (now - timedelta(days=config.CLEANUP_LIVE_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    conn.execute("DELETE FROM live_odds_history WHERE snapshot_utc < ?",
+                 (live_cutoff,))
     conn.commit()
     return fix_n, odds_n
 

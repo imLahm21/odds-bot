@@ -284,6 +284,8 @@ TELEGRAM_BROADCAST_TARGETS = _parse_broadcast_targets(
 
 # ─── 旧数据清理 ──────────────────────────────────────────────────────────────
 CLEANUP_DAYS = 30             # 删除开球早于 N 天前的比赛及其快照
+CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。该表无 fixtures
+                              # 外键，不随 CLEANUP_DAYS 的子查询一起清，需独立保留期
 
 # ─── LLM 精算 (/analyze) ─────────────────────────────────────────────────────
 # IKuncode（OpenAI 兼容），从 .env 读：
