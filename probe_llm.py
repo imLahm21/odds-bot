@@ -33,9 +33,12 @@ def probe_minimal():
     payload = {"model": config.LLM_MODEL,
                "messages": [{"role": "user", "content": "回复两个字：通了"}],
                "max_tokens": 50}
+    # User-Agent 同 llm_client：部分分组做客户端白名单，python-requests 会被 403
+    from bot import llm_client
     r = requests.post(f"{analyzer.LLM_BASE_URL}/chat/completions",
                       json=payload,
-                      headers={"Authorization": f"Bearer {analyzer.LLM_API_KEY}"},
+                      headers={"Authorization": f"Bearer {analyzer.LLM_API_KEY}",
+                               "User-Agent": llm_client.LLM_USER_AGENT},
                       timeout=60)
     print("HTTP:", r.status_code)
     print("响应前 500 字:", r.text[:500])
@@ -51,7 +54,10 @@ def probe_effort():
     print("待测档位:", list(config.LLM_EFFORT_LABELS))
     print("=" * 50)
     url = f"{analyzer.LLM_BASE_URL}/chat/completions"
-    headers = {"Authorization": f"Bearer {analyzer.LLM_API_KEY}"}
+    # User-Agent 同 llm_client：部分分组做客户端白名单，python-requests 会被 403
+    from bot import llm_client
+    headers = {"Authorization": f"Bearer {analyzer.LLM_API_KEY}",
+               "User-Agent": llm_client.LLM_USER_AGENT}
     for eff, label in config.LLM_EFFORT_LABELS.items():
         payload = {"model": config.LLM_MODEL,
                    "messages": [{"role": "user", "content": "回复两个字：通了"}],

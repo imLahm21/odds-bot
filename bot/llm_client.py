@@ -570,8 +570,18 @@ def _payload(model: str, system: str, user: str, max_tokens: int,
     return p
 
 
+# 客户端标识：部分中转商分组做 User-Agent 白名单，只放行特定客户端
+# （如 codex / claude-code / gemini-cli / droid / crush），检测到 requests 默认的
+# "python-requests/x.y" 会直接 403 channel:client_restricted（探针与精算全被拒）。
+# 故统一声明为白名单内的标识；对不校验的端点只是多一个请求头、无副作用。
+# 可用 .env 的 LLM_USER_AGENT 覆盖（换中转商/白名单变化时无需改代码）。
+LLM_USER_AGENT = clean_header_value(os.getenv("LLM_USER_AGENT", "")) or "codex"
+
+
 def _headers(ep: dict) -> dict:
-    return {"Authorization": f"Bearer {ep['key']}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {ep['key']}",
+            "Content-Type": "application/json",
+            "User-Agent": LLM_USER_AGENT}
 
 
 _CONNECT_TIMEOUT = 10   # 连接超时（秒），与读超时分开
