@@ -16,7 +16,7 @@
 | # | 触发条件（步骤 1~5 中检测到） | 主题文件 | 核心要点 |
 |---|------------------------------|---------|---------|
 | 1 | **每场必读**：判热度/形态前 | [feedback_heat_direction.md](feedback_heat_direction.md) | 水位下降方=热门、欧赔下降方=热门，双重验证一致后才可匹配军规；Betfair 按交易所逻辑 |
-| 2 | 任一阶段出现升盘或降盘 | [feedback_sync_pricing.md](feedback_sync_pricing.md) | 早中期欧亚同步升盘=真实定价、连续降盘=修正走军规#3；临场④升盘须三重验证 |
+| 2 | 任一阶段出现升盘或降盘 | [feedback_sync_pricing.md](feedback_sync_pricing.md) | 早中期欧亚同步升盘=真实定价、连续降盘=修正走军规#3；临场④升盘须三重验证；盘口档位不变但两端价格跨节点显著反向移动时，也视为“有效变盘”，纳入本主题的定价修正路由。；淘汰赛次回合中，热门方首回合落后或被零封且必须追分时，欧亚同步强化也应触发赛制追热边界验证，并联查首回合证据与进球分盘冲突。 |
 | 3 | 全程不变盘（≥8 节点）/ 初盘开小后升盘 / 升盘后回降 / 降盘后主水反升 | [feedback_lure_variants.md](feedback_lure_variants.md) | 阻上严格判定；诱上型变体；浅盘升盘诱上五要件；临场诱下组合 |
 | 4 | 临场③④/即时出现变盘、水位/欧赔/凯利跳变 | [feedback_late_stage_shift.md](feedback_late_stage_shift.md) | 超大异动=反向定价；剧烈欧亚降盘须验凯利；分层诱导陷阱凯利红灯优先 |
 | 5 | 任一公司凯利极端值（>1.05 / <0.95）、方向反转、或初盘开小（浅盘）读凯利 | [feedback_kelly_signals.md](feedback_kelly_signals.md) | Pinnacle 双重极端强制反转；凯利反转方向>绝对值；浅盘灰色地带；平局凯利信号 |
@@ -71,6 +71,8 @@
 | 26 | Brazil 1-2 Norway | 2026-07-06 | 世界杯 | 客胜，受让方 +0.5 赢盘 | strong_team_deep C | [20260706_case_06_brazil_vs_norway.md](20260706_case_06_brazil_vs_norway.md) |
 
 | 27 | KA阿克雷里 3-2 IA阿克拉内斯 | 2026-07-13 | 冰岛超 | 主队3-2取胜；亚盘方向命中，平局首选错误 | kelly_signals H | [20260713_case_11_KA_Akureyri_vs_IA_Akranes.md](20260713_case_11_KA_Akureyri_vs_IA_Akranes.md) |
+| 28 | 法国 0-2 西班牙 | 2026-07-15 | 世界杯 | 西班牙客胜并赢下 +0.25，法国 -0.25 全输，小 2.5 打出。 | sync_pricing D | [20260715_case_12_France_vs_Spain.md](20260715_case_12_France_vs_Spain.md) |
+| 29 | Hapoel Beer Sheva 1-0 FK Crvena Zvezda | 2026-08-05 | 欧冠 | 受让+1判断命中，但客胜与大球判断失误，主队1-0直接取胜。 | sync_pricing E | [20260805_case_13_Hapoel_Beer_Sheva_vs_FK_Crvena_Zvezda.md](20260805_case_13_Hapoel_Beer_Sheva_vs_FK_Crvena_Zvezda.md) |
 > 表中主题缩写对应文件：sync_pricing=[feedback_sync_pricing.md](feedback_sync_pricing.md)、lure_variants=[feedback_lure_variants.md](feedback_lure_variants.md)、late_stage=[feedback_late_stage_shift.md](feedback_late_stage_shift.md)、kelly=[feedback_kelly_signals.md](feedback_kelly_signals.md)、csl=[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md)、h2h=[feedback_h2h_weight.md](feedback_h2h_weight.md)、home_away=[feedback_home_away_quality.md](feedback_home_away_quality.md)、fundamentals=[feedback_fundamentals_weight.md](feedback_fundamentals_weight.md)、heat_direction=[feedback_heat_direction.md](feedback_heat_direction.md)、strong_team_deep=[feedback_strong_team_deep.md](feedback_strong_team_deep.md)
 
 ## 新教训的归档规则
