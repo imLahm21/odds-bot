@@ -34,7 +34,10 @@ CREATE INDEX IF NOT EXISTS idx_fix_league   ON fixtures(league_id);
 CREATE TABLE IF NOT EXISTS odds_history (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     fixture_id    INTEGER NOT NULL,
-    snapshot_utc  TEXT NOT NULL,
+    snapshot_utc  TEXT NOT NULL,            -- 我方抓取时间（fetched_at）
+    source_updated_utc TEXT,                -- 上游报价更新时间（API entry.update）；
+                                            -- 与 snapshot_utc 是两个时点，勿混用。
+                                            -- 仅到 fixture 级，同场各庄共用；旧数据为 NULL
     node_label    TEXT,
     bookmaker_id  INTEGER NOT NULL,
     bookmaker     TEXT,
@@ -144,7 +147,8 @@ CREATE TABLE IF NOT EXISTS live_subscriptions (
 
 # odds_history 批量插入用的列顺序（与 parser 产出的行字典对齐）
 ODDS_COLS = [
-    "fixture_id", "snapshot_utc", "node_label", "bookmaker_id", "bookmaker",
+    "fixture_id", "snapshot_utc", "source_updated_utc",
+    "node_label", "bookmaker_id", "bookmaker",
     "market", "home_odds", "draw_odds", "away_odds",
     "kelly_home", "kelly_draw", "kelly_away",
     "handicap", "home_water", "away_water", "kelly_h_water", "kelly_a_water",
@@ -191,6 +195,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     live_cols = {r[1] for r in conn.execute("PRAGMA table_info(live_odds_history)")}
     if "status_short" not in live_cols:
         conn.execute("ALTER TABLE live_odds_history ADD COLUMN status_short TEXT")
+    # 盘前表补 source_updated_utc（上游报价更新时间，来自 API entry.update）。
+    # 旧行留 NULL——表示「当时未采集该字段」，不可回填成 snapshot_utc 冒充上游时间。
+    odds_cols = {r[1] for r in conn.execute("PRAGMA table_info(odds_history)")}
+    if "source_updated_utc" not in odds_cols:
+        conn.execute("ALTER TABLE odds_history ADD COLUMN source_updated_utc TEXT")
     conn.commit()
 
 

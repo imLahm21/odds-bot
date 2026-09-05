@@ -7,6 +7,7 @@ LLM 精算 —— 读全量 SOP 规则 + 调 IKuncode(OpenAI 兼容) chat/comple
 """
 
 import os
+import math
 import logging
 
 from dotenv import load_dotenv
@@ -24,61 +25,123 @@ _clean_header_value = llm_client.clean_header_value
 LLM_BASE_URL = _clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
 LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
-_rules_cache: str | None = None
 _live_rules_cache: str | None = None
+_live_rules_mtimes: dict | None = None
 _fund_rules_cache: str | None = None
+_fund_rules_mtimes: dict | None = None
+
+# 规则缓存：key = 文件列表元组 → (拼接文本, {文件: mtime})。
+# 带 mtime 是为了让磁盘上改过的规则【下一次分析即生效】，不必重启进程——
+# 归档流程会自己写 feedback_*.md，若不校验 mtime，新归档的教训对本进程无效。
+_rules_cache: dict[tuple, tuple[str, dict]] = {}
 
 
-def load_rules() -> str:
-    """读取并拼接全量规则文件，模块级缓存。"""
-    global _rules_cache
-    if _rules_cache is not None:
-        return _rules_cache
-    parts = []
-    for rel in config.ANALYZE_RULE_FILES:
+def _mtimes(rels: list[str]) -> dict:
+    """取各文件 mtime；缺失文件记 None（与「存在但未改」区分开）。"""
+    out = {}
+    for rel in rels:
+        try:
+            out[rel] = os.path.getmtime(rel)
+        except OSError:
+            out[rel] = None
+    return out
+
+
+def _read_rule_files(rels: list[str]) -> tuple[str, list[str]]:
+    """按序读取规则文件 → (拼接文本, 缺失文件列表)。"""
+    parts, missing = [], []
+    for rel in rels:
         try:
             with open(rel, encoding="utf-8") as f:
                 parts.append(f"\n\n===== {rel} =====\n{f.read()}")
         except FileNotFoundError:
+            missing.append(rel)
             log.warning("规则文件缺失，跳过: %s", rel)
-    _rules_cache = "".join(parts)
-    log.info("规则已加载，共 %d 字符", len(_rules_cache))
-    return _rules_cache
+    return "".join(parts), missing
+
+
+def _apply_budget(rels: list[str]) -> tuple[list[str], list[str]]:
+    """按 RULE_CONTEXT_BUDGET 裁剪 → (保留列表, 被丢弃列表)。
+
+    只丢 RULE_BUDGET_DROP_ORDER 里的主题层文件，核心层永不丢弃；
+    丢完仍超限则如实返回（宁可超限也不静默删必需规则）。
+    """
+    def total(items):
+        """按【字符数】统计（非字节）——UTF-8 中文 3 字节/字，
+        用 getsize 会把 9 万字的规则算成 18 万，导致每场都误报超预算。"""
+        n = 0
+        for r in items:
+            try:
+                with open(r, encoding="utf-8") as f:
+                    n += len(f.read())
+            except OSError:
+                pass
+        return n
+
+    keep, dropped = list(rels), []
+    if total(keep) <= config.RULE_CONTEXT_BUDGET:
+        return keep, dropped
+    for cand in config.RULE_BUDGET_DROP_ORDER:
+        if cand in keep:
+            keep.remove(cand)
+            dropped.append(cand)
+            if total(keep) <= config.RULE_CONTEXT_BUDGET:
+                break
+    if total(keep) > config.RULE_CONTEXT_BUDGET:
+        log.warning("规则仍超预算 %d > %d，已保留核心层不再丢弃",
+                    total(keep), config.RULE_CONTEXT_BUDGET)
+    return keep, dropped
+
+
+def load_rules(league_name: str = "", has_h2h: bool = True,
+               has_form: bool = True) -> str:
+    """读取并拼接本场需要的规则：核心层 + 命中的主题层。
+
+    league_name/has_h2h/has_form 决定加载哪些 feedback 主题文件
+    （见 config.lesson_topic_files）。缓存按「文件列表 + 各文件 mtime」双重校验，
+    磁盘改动后下次调用自动重读，无需重启进程。
+    """
+    rels = list(config.ANALYZE_RULE_FILES) + config.lesson_topic_files(
+        league_name, has_h2h, has_form)
+    rels, dropped = _apply_budget(rels)
+    key = tuple(rels)
+    cur = _mtimes(rels)
+    hit = _rules_cache.get(key)
+    if hit is not None and hit[1] == cur:
+        return hit[0]
+    text, missing = _read_rule_files(rels)
+    _rules_cache[key] = (text, cur)
+    log.info("规则已加载 %d 字符｜核心 %d + 主题 %d 个%s%s",
+             len(text), len(config.ANALYZE_RULE_FILES),
+             len(rels) - len(config.ANALYZE_RULE_FILES),
+             f"｜缺失 {len(missing)}" if missing else "",
+             f"｜超预算丢弃 {len(dropped)}" if dropped else "")
+    return text
 
 
 def load_live_rules() -> str:
-    """读取走地规则文件，独立缓存(不混进赛前 SOP 规则)。"""
-    global _live_rules_cache
-    if _live_rules_cache is not None:
+    """读取走地规则文件，独立缓存(不混进赛前 SOP 规则)。带 mtime 校验。"""
+    global _live_rules_cache, _live_rules_mtimes
+    cur = _mtimes(config.LIVE_RULE_FILES)
+    if _live_rules_cache is not None and _live_rules_mtimes == cur:
         return _live_rules_cache
-    parts = []
-    for rel in config.LIVE_RULE_FILES:
-        try:
-            with open(rel, encoding="utf-8") as f:
-                parts.append(f"\n\n===== {rel} =====\n{f.read()}")
-        except FileNotFoundError:
-            log.warning("走地规则文件缺失，跳过: %s", rel)
-    _live_rules_cache = "".join(parts)
-    log.info("走地规则已加载，共 %d 字符", len(_live_rules_cache))
-    return _live_rules_cache
+    text, _ = _read_rule_files(config.LIVE_RULE_FILES)
+    _live_rules_cache, _live_rules_mtimes = text, cur
+    log.info("走地规则已加载，共 %d 字符", len(text))
+    return text
 
 
 def load_fund_rules() -> str:
     """读取基本面分析专用规则（国家队/赛事情境/大小球），独立缓存。
-    仅供两阶段基本面预处理用，不含全套 SOP 精算规则。"""
-    global _fund_rules_cache
-    if _fund_rules_cache is not None:
+    仅供两阶段基本面预处理用，不含全套 SOP 精算规则。带 mtime 校验。"""
+    global _fund_rules_cache, _fund_rules_mtimes
+    cur = _mtimes(config.FUND_ANALYZE_RULE_FILES)
+    if _fund_rules_cache is not None and _fund_rules_mtimes == cur:
         return _fund_rules_cache
-    parts = []
-    for rel in config.FUND_ANALYZE_RULE_FILES:
-        try:
-            with open(rel, encoding="utf-8") as f:
-                parts.append(f"\n\n===== {rel} =====\n{f.read()}")
-        except FileNotFoundError:
-            log.warning("基本面规则文件缺失，跳过: %s", rel)
-    _fund_rules_cache = "".join(parts)
-    log.info("基本面规则已加载，共 %d 字符", len(_fund_rules_cache))
-    return _fund_rules_cache
+    text, _ = _read_rule_files(config.FUND_ANALYZE_RULE_FILES)
+    _fund_rules_cache, _fund_rules_mtimes = text, cur
+    log.info("基本面规则已加载，共 %d 字符", len(text))
+    return text
 
 
 def available() -> bool:
@@ -119,8 +182,13 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     extra_instruction: 用户自定义侧重，非空时追加到标准任务说明之后；
     明确要求不违背 SOP 与输出格式，以保护进度条依赖的 ### 1~7 段落结构。
     """
+    # 主题防错规则按本场条件加载：联赛决定是否要中超专项，基本面文本里
+    # 有无 H2H/近况决定是否要那两个主题（判据保守——拿不准就加载）。
+    fund = fundamentals or ""
+    has_h2h = any(k in fund for k in ("交锋", "H2H", "h2h"))
+    has_form = any(k in fund for k in ("近10场", "近 10 场", "近况", "战绩"))
     system = (
-        load_rules()
+        load_rules(league_name=league, has_h2h=has_h2h, has_form=has_form)
         + "\n\n===== 任务 =====\n"
         "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
         "步骤1~7执行分析，按文档「输出格式」章节的结构输出完整精算报告。"
@@ -321,14 +389,22 @@ def distill_lesson(review_report: str, home: str, away: str,
 
 _LESSONS_DIR = os.path.join("rules", "实战教训")
 _lesson_route_cache: str | None = None
+_lesson_route_mtimes: dict | None = None
 
 
 def load_lesson_route_context() -> str:
     """读『主题路由表』(reference_case_lessons.md) + 各 feedback_*.md 顶部触发条件，
     拼成一段供 route_lesson 判归属的上下文。模块级缓存（规则库不常变）。"""
-    global _lesson_route_cache
-    if _lesson_route_cache is not None:
+    global _lesson_route_cache, _lesson_route_mtimes
+    try:
+        cur = {n: os.path.getmtime(os.path.join(_LESSONS_DIR, n))
+               for n in sorted(os.listdir(_LESSONS_DIR))
+               if n.endswith(".md")}
+    except OSError:
+        cur = {}
+    if _lesson_route_cache is not None and _lesson_route_mtimes == cur:
         return _lesson_route_cache
+    _lesson_route_mtimes = cur
     import re
     parts = []
     overview = os.path.join(_LESSONS_DIR, "reference_case_lessons.md")
@@ -947,9 +1023,11 @@ def extract_decision(report: str, home: str = "", away: str = "") -> dict | None
         '  "odds": 该玩法的十进制赔率（数字，如 1.95）；pass 时给 0；\n'
         '  "edge": 该玩法的 edge，写成【小数】（如 +8.3% → 0.083，−1.9% → -0.019）；pass 时给 0；\n'
         '  "p_final": 该玩法的 p_最终，写成【小数】（如 57% → 0.57）；pass 时给 0；\n'
-        '  "evidence": 证据强度，取 "strong"/"medium"/"weak"/"none" 之一'
-        "（对应报告里凯利分数 强1/2→strong、中1/4→medium、弱1/8→weak、无→none；"
-        "若报告只给了置信度可据此估：≥75 strong、60~74 medium、40~59 weak、<40 none）；\n"
+        '  "evidence": 证据强度，取 "strong"/"medium"/"weak"/"none"/"unknown" 之一。'
+        "**只从报告显式写出的证据强度/凯利分数抽取**"
+        "（强1/2→strong、中1/4→medium、弱1/8→weak、无→none）；"
+        "**报告未写证据强度时一律给 \"unknown\"，严禁根据置信度反推**"
+        "（置信度衡量的是研判确定性，证据强度衡量的是信息差质量，两者不可互推）；\n"
         '  "stake": 报告建议注额数字（美元，无则 null）。\n'
         "硬规则：① 只依据报告已有内容，不自行重算、不编造；② 数字用阿拉伯数字、"
         "百分数一律转小数；③ 只输出一个 JSON 对象。"
@@ -974,19 +1052,70 @@ def extract_decision(report: str, home: str = "", away: str = "") -> dict | None
         log.warning("extract_decision 非合法 JSON：%s", raw[:120])
         return None
 
-    def _num(v, default=0.0):
+    def _num(v, default=None):
+        """转 float 并拒绝 NaN/Inf；无法解析或非有限值返回 default。"""
         try:
-            return float(v)
+            f = float(v)
         except (TypeError, ValueError):
             return default
+        return f if math.isfinite(f) else default
+
+    def _as_bool(v) -> bool:
+        """严格布尔：真布尔直接用；字符串按字面判定。
+        不可用 bool(str)——"false"/"no"/"0" 都是非空串，会被判成 True。"""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "y", "是", "pass")
+        return False
+
+    is_pass = _as_bool(d.get("pass"))
+    ev = str(d.get("evidence", "unknown")).strip().lower()
+    if ev not in ("strong", "medium", "weak", "none", "unknown"):
+        ev = "unknown"
 
     out = {
-        "pass": bool(d.get("pass")),
+        "pass": is_pass,
         "play": str(d.get("play", "")).strip(),
         "odds": _num(d.get("odds")),
         "edge": _num(d.get("edge")),
         "p_final": _num(d.get("p_final")),
-        "evidence": str(d.get("evidence", "none")).strip().lower(),
-        "stake": None if d.get("stake") in (None, "") else _num(d.get("stake")),
+        "evidence": ev,
+        "stake": _num(d.get("stake")),
+        "warnings": [],
     }
+
+    if is_pass:
+        # pass 场不参与串关，数值字段按 0 归一即可，不做区间校验
+        for k in ("odds", "edge", "p_final"):
+            if out[k] is None:
+                out[k] = 0.0
+        return out
+
+    # ── 非 pass：字段完整性 + 区间校验（任一不合法则整条作废，不输出可疑金额）──
+    problems = []
+    if out["odds"] is None or out["odds"] <= 1.0:
+        problems.append(f"赔率非法({out['odds']})，须 > 1")
+    if out["p_final"] is None or not (0.0 <= out["p_final"] <= 1.0):
+        problems.append(f"p_final 非法({out['p_final']})，须在 [0,1]")
+    if out["edge"] is None:
+        problems.append("edge 缺失或非有限值")
+    if out["stake"] is not None and out["stake"] < 0:
+        problems.append(f"注额为负({out['stake']})")
+    if problems:
+        log.warning("extract_decision 字段非法，丢弃该场：%s｜原始=%s",
+                    "；".join(problems), str(d)[:200])
+        return None
+
+    # ── edge 一致性复核：edge 应 ≈ p×O−1（二元式）。含走盘/半赢的盘口会
+    #    合理偏离，故只告警不丢弃——但偏差过大说明报告自相矛盾，标进 warnings。
+    recomputed = out["p_final"] * out["odds"] - 1
+    if abs(recomputed - out["edge"]) > 0.05:
+        msg = (f"edge 与 p×O−1 不一致：报告 {out['edge']:+.3f}、"
+               f"重算 {recomputed:+.3f}（差 {abs(recomputed - out['edge']):.3f}）"
+               "；若非走盘/半赢盘口则报告有误")
+        out["warnings"].append(msg)
+        log.warning("extract_decision %s", msg)
     return out

@@ -20,44 +20,86 @@ log = logging.getLogger("odds_bot.fundamentals")
 
 
 # 国家队赛事：基本面须切到 reference_national_team.md 口径（先分赛制/近况分层/实力锚等）。
-# 已知 league_id：1=世界杯、5=欧国联；洲际杯/世预赛/友谊赛按名称关键词兜底
-# （EXTRA 池未来可能纳入，且世预赛/友谊赛无固定 league_id）。
-_NATIONAL_LEAGUE_IDS = {1, 5}
+#
+# ⚠️ 以下 ID 均经 API-Football /leagues?type=cup 实调核对，非推测值。
+#    新增前请照同样方式实调，不要凭名称猜 ID——名称与主体归属经常不一致。
+_NATIONAL_LEAGUE_IDS = {
+    1,    # World Cup
+    4,    # Euro Championship
+    5,    # UEFA Nations League
+    6,    # Africa Cup of Nations
+    7,    # Asian Cup
+    9,    # Copa America
+    10,   # Friendlies（注意：667 = Friendlies Clubs 是俱乐部，不在此列）
+    19,   # African Nations Championship (CHAN)：国家队赛事，但只能派本土联赛
+          # 注册球员，阵容含金量远低于 AFCON——实力锚需相应下调
+    21,   # Confederations Cup
+    22,   # CONCACAF Gold Cup
+    23,   # EAFF E-1 Football Championship
+    24,   # ASEAN Championship
+    25,   # Gulf Cup of Nations
+    28,   # SAFF Championship
+    29, 30, 31, 32, 33, 34, 37,   # World Cup - Qualification 各洲 + 洲际附加赛
+    35,   # Asian Cup - Qualification
+    36,   # Africa Cup of Nations - Qualification
+    536,  # CONCACAF Nations League
+    808,  # CONCACAF Nations League - Qualification
+    858,  # CONCACAF Gold Cup - Qualification
+    860,  # Arab Cup
+    913,  # CONMEBOL - UEFA Finalissima
+    960,  # Euro Championship - Qualification
+    1008, # CAFA Nations Cup
+    1163, # African Nations Championship - Qualification（同 19，CHAN 预选）
+}
+
+# 已实调确认为【俱乐部】赛事、名称却含国家队特征词的陷阱 ID（命中即直接否决）：
+#   3=UEFA Europa League、848=Europa Conference League、15=FIFA Club World Cup、
+#   667=Friendlies Clubs、26=International Champions Cup、12=CAF Champions League、
+#   13=CONMEBOL Libertadores、1043=African Football League、
+#   1168=FIFA Intercontinental Cup
+_CLUB_LEAGUE_IDS = {3, 12, 13, 15, 26, 667, 848, 1043, 1168}
+
+# 名称兜底：仅在 league_id 既不在国家队白名单、也不在俱乐部黑名单时使用。
+# 实测（真实 API 联赛名 11 个俱乐部样本）：不加排除词时 7/11 误判。
+_CLUB_EXCLUDE_KEYWORDS = (
+    "club", "clubs", "俱乐部", "champions league", "europa", "conference",
+    "libertadores", "sudamericana", "recopa", "super cup", "leagues cup",
+    "youth", "u17", "u19", "u20", "u21", "u23", "青年",
+    "women", "femenina", "女足",      # 女足赛事不套用本读法
+    "euroleague", "de clubes", "intercontinental cup",
+)
 _NATIONAL_NAME_KEYWORDS = (
     "world cup", "世界杯", "nations league", "欧国联",
-    "euro", "欧洲杯", "copa america", "美洲杯",
+    "euro championship", "欧洲杯", "copa america", "美洲杯",
     "asian cup", "亚洲杯", "africa cup", "非洲杯", "afcon", "gold cup",
     "qualification", "qualifier", "预选赛", "世预赛",
-    "friendl", "友谊赛", "international",
+    "friendlies", "友谊赛",
 )
 
 
 def _is_national_team_event(league_id: int | None, league_name: str) -> bool:
-    """判断是否国家队赛事（世界杯/洲际杯/欧国联/世预赛/友谊赛）。"""
-    if league_id in _NATIONAL_LEAGUE_IDS:
-        return True
+    """判断是否国家队赛事（世界杯/洲际杯/欧国联/世预赛/友谊赛）。
+
+    判据优先级：俱乐部黑名单 → 国家队白名单 → 名称兜底（先排除俱乐部特征词）。
+
+    ⚠️ 名称兜底不可用裸子串（实测误判）：
+      'euro' → 命中 UEFA Europa League / Euroleague
+      'world cup' → 命中 FIFA Club World Cup
+      'friendl' → 命中 Friendlies Clubs
+      'international' → 命中 International Champions Cup
+    故关键词已收紧为 'euro championship' / 'friendlies'，并移除 'international'。
+    女足赛事不套用本读法（排除词含 women/femenina/女足）。
+    """
+    if league_id is not None:
+        if league_id in _CLUB_LEAGUE_IDS:
+            return False
+        if league_id in _NATIONAL_LEAGUE_IDS:
+            return True
     name = (league_name or "").lower()
-    return any(kw in name for kw in _NATIONAL_NAME_KEYWORDS)
-
-
-# 国家队赛事：基本面须切到 reference_national_team.md 口径（先分赛制/近况分层/实力锚等）。
-# 已知 league_id：1=世界杯、5=欧国联；洲际杯/世预赛/友谊赛按名称关键词兜底
-# （EXTRA 池未来可能纳入，且世预赛/友谊赛无固定 league_id）。
-_NATIONAL_LEAGUE_IDS = {1, 5}
-_NATIONAL_NAME_KEYWORDS = (
-    "world cup", "世界杯", "nations league", "欧国联",
-    "euro", "欧洲杯", "copa america", "美洲杯",
-    "asian cup", "亚洲杯", "africa cup", "非洲杯", "afcon", "gold cup",
-    "qualification", "qualifier", "预选赛", "世预赛",
-    "friendl", "友谊赛", "international",
-)
-
-
-def _is_national_team_event(league_id: int | None, league_name: str) -> bool:
-    """判断是否国家队赛事（世界杯/洲际杯/欧国联/世预赛/友谊赛）。"""
-    if league_id in _NATIONAL_LEAGUE_IDS:
-        return True
-    name = (league_name or "").lower()
+    if not name:
+        return False
+    if any(kw in name for kw in _CLUB_EXCLUDE_KEYWORDS):
+        return False
     return any(kw in name for kw in _NATIONAL_NAME_KEYWORDS)
 
 

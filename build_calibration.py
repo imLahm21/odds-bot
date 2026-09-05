@@ -178,16 +178,62 @@ def collect_rows(xlsx_path, sheets, months):
     return rows, seen_sheets, missing
 
 
+# ─── 结算状态分类（五态）─────────────────────────────────────────────────────
+# 「结果」列的真实取值（实测 496 笔）：黑 255、红 177、和 27、输一半 21、赢一半 15。
+# 非二元结算占 12.7% —— 必须分开计，不能一律按「净盈亏>0」二分，否则算出的
+# 既不是全赢概率、也不是方向命中率，而是「盈利笔数占比」。
+_WIN_FULL, _WIN_HALF, _PUSH, _LOSE_HALF, _LOSE_FULL = (
+    "win", "half_win", "push", "half_lose", "lose")
+
+
+def settle_state(result: str, net: float) -> str:
+    """把「结果」列文本归一到五态；文本缺失时退回按净盈亏二分。"""
+    s = (result or "").replace(" ", "")
+    if "赢一半" in s or "赢半" in s:
+        return _WIN_HALF
+    if "输一半" in s or "输半" in s:
+        return _LOSE_HALF
+    if s in ("和", "走", "走水", "走盘"):
+        return _PUSH
+    if s == "红":
+        return _WIN_FULL
+    if s == "黑":
+        return _LOSE_FULL
+    # 混合串关（如「红+黑=黑」）或无文本：按净盈亏定性，不细分半赢半输
+    if net > 1e-4:
+        return _WIN_FULL
+    if net < -1e-4:
+        return _LOSE_FULL
+    return _PUSH
+
+
 def stat(sel):
-    """给一组行算 (n, 胜率%, ROI%, 净盈亏)。胜负判定：净盈亏 > 0 记为红（含赢一半）。"""
+    """给一组行算统计量。返回
+    (n, 方向命中率%, ROI%, 净盈亏, 全赢率%, 走盘率%, 盈利笔数占比%)。
+
+    ⚠️ 三个「率」口径不同，勿混用：
+      · **方向命中率** = (全赢 + 半赢) / (总数 − 走盘)。走盘不计入分母——
+        它是「方向没错但没赚到」，把它算成未命中会低估判断力。
+        这是 p_校准 该用的口径（B1：校准「我方选中方向的正确率」）。
+      · **全赢率** = 全赢 / 总数。四分之一盘的半赢不算，偏保守。
+      · **盈利笔数占比** = 净盈亏>0 的笔数 / 总数（旧版口径，含半赢、排除走盘与半输）。
+        仅作报表参考，**不可当概率用**。
+    """
     n = len(sel)
     if n == 0:
-        return (0, None, None, 0.0)
-    win = sum(1 for x in sel if x[3] > 1e-4)
+        return (0, None, None, 0.0, None, None, None)
+    states = [settle_state(x[4], x[3]) for x in sel]
+    n_win = states.count(_WIN_FULL)
+    n_hw = states.count(_WIN_HALF)
+    n_push = states.count(_PUSH)
+    denom = n - n_push                      # 方向命中率的分母剔除走盘
+    hit = (100 * (n_win + n_hw) / denom) if denom else None
     stk = sum(x[2] for x in sel)
     net = sum(x[3] for x in sel)
     roi = (100 * net / stk) if stk else None
-    return (n, 100 * win / n, roi, net)
+    profit_cnt = sum(1 for x in sel if x[3] > 1e-4)
+    return (n, hit, roi, net,
+            100 * n_win / n, 100 * n_push / n, 100 * profit_cnt / n)
 
 
 def fmt_pct(v):
@@ -221,7 +267,7 @@ def build_fair_odds_markdown(rows):
         sel = [x for x in fair_rows if includes(x[1] / x[8] - 1)]
         if not sel:
             continue
-        n, wr, roi, net = stat(sel)
+        n, wr, roi, net, _fullw, _pushr, _profit = stat(sel)
         avg_edge = 100 * sum(x[1] / x[8] - 1 for x in sel) / n
         avg_p = 100 * sum(1 / x[8] for x in sel) / n
         gap = wr - avg_p if wr is not None else None
@@ -235,15 +281,21 @@ def build_fair_odds_markdown(rows):
 def build_markdown(rows):
     """产出可直接更新到 Kelly 文档观测层的 Markdown。"""
     out = []
-    out.append("### 置信度校准表（本人实测，Kelly 的 p 从这里取）\n")
-    out.append("| 自评置信度 | 笔数 | 实测胜率 | ROI | 净盈亏 | 判定 |")
-    out.append("|-----------|------|---------|-----|--------|------|")
+    out.append("### 置信度校准表（本人实测，Kelly 的 p_校准 从「方向命中率」列取）\n")
+    out.append("> 口径：**方向命中率** =（全赢+半赢）/（总数−走盘），"
+               "走盘不计入分母（方向没错、只是没赚到）。"
+               "**全赢率**=全赢/总数（半赢不算，偏保守）。"
+               "**盈利笔数**=净盈亏>0 的占比（旧口径，仅作参考，**不可当概率用**）。")
+    out.append("")
+    out.append("| 自评置信度 | 笔数 | 方向命中率 | 全赢率 | 走盘率 | 盈利笔数 | ROI | 净盈亏 | 判定 |")
+    out.append("|-----------|------|-----------|--------|--------|---------|-----|--------|------|")
     for (lo, hi), label in zip(CONF_BUCKETS, CONF_LABELS):
         sel = [x for x in rows if lo <= x[0] < hi]
-        n, wr, roi, net = stat(sel)
+        n, wr, roi, net, fullw, pushr, profit = stat(sel)
         verdict = "样本不足" if n < 15 else (
             "✅ 盈利" if (roi is not None and roi > 0) else "❌ 亏")
-        out.append(f"| {label} | {n} | {fmt_pct(wr)} | {fmt_roi(roi)} "
+        out.append(f"| {label} | {n} | {fmt_pct(wr)} | {fmt_pct(fullw)} "
+                   f"| {fmt_pct(pushr)} | {fmt_pct(profit)} | {fmt_roi(roi)} "
                    f"| {net:+.2f} | {verdict} |")
     out.append("")
     out.append("### 玩法分类表现\n")
@@ -251,7 +303,7 @@ def build_markdown(rows):
     out.append("|------|------|------|-----|--------|------|")
     for cat in PLAY_CATS:
         sel = [x for x in rows if classify_play(x[5]) == cat]
-        n, wr, roi, net = stat(sel)
+        n, wr, roi, net, _fullw, _pushr, _profit = stat(sel)
         if n == 0:
             use = "样本为空"
         elif cat in ("波胆", "串关"):

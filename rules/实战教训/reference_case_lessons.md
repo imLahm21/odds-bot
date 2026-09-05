@@ -4,10 +4,29 @@
 > 每条规则的完整论证都在各主题文件（`feedback_*.md`）内，本文件不重复规则细节。
 > `20260xxx_case_*.md` 为原始盘口数据存档，仅在需要复算/核对历史数据时读取。
 
-## 读取协议（步骤 7 输出前执行）
+## 读取协议（分两段执行）
+
+规则必须在**用到它的那一步开始前**就位；输出前的复核只是兜底，不能代替前置加载。
+各主题文件顶部已标注「最早使用步骤」与「命中后须重算」，按其执行。
+
+### 第一段：前置加载（分析过程中，按步骤推进随时生效）
+
+| 时点 | 须已加载的主题 |
+|------|---------------|
+| 步骤 1b~1d 读基本面前 | fundamentals_weight、home_away_quality、csl_fundamentals（中超）、h2h_weight（有 H2H） |
+| 步骤 2 盘口定性前 | strong_team_deep |
+| 步骤 3 判热度/形态前 | **heat_direction（每场必读）**、sync_pricing、lure_variants、late_stage_shift |
+| 步骤 5 风控验证前 | kelly_signals |
+
+> 机器人环境下，主题文件由 `bot/config.py` 的 `LESSON_TOPIC_RULES` 按赛事/基本面条件
+> 随核心规则一次性注入 prompt（联赛类与基本面数据类条件加载，盘型类每场加载——
+> 因其触发条件须读完 CSV 才知道，而规则必须在分析前就位）。
+> 手工分析时按上表在对应步骤前自行读取。
+
+### 第二段：输出前复核（步骤 7 输出前）
 
 1. **全场必查**：执行下方「通用防错清单」。
-2. **场景路由**：对照「主题路由表」，判断本场命中哪些触发条件，**仅加载命中的主题文件**，执行其规则与文件末尾的「本主题检查项」。
+2. **补漏重算**：若此时才发现某主题命中而前置未生效，**必须回头重算该主题「命中后须重算」列出的步骤**，不可只在「风险提示」里加一句了事。
 3. **盘型比对**：若本场盘型与「案例索引」中某场历史错误一致，必须在报告「风险提示」中写明该案例及教训。
 4. 实战教训属于**参考性较低的修正因素**，用于扣减置信度与增列备选，不单独推翻三算法主逻辑（碾压级基本面、保级死战等明确覆盖场景除外）。
 
@@ -62,7 +81,7 @@
 | 17 | AS Roma 2-0 Lazio | 2026-05-17 | 意甲（罗马德比） | 上盘赢球赢盘 | fundamentals B/C | — |
 | 18 | 浙江 4-1 山东泰山 | 2026-05-20 | 中超 | 上盘大胜 | lure_variants C；kelly C；csl B | [20260520_case_01_zhejiang_vs_shandong.md](20260520_case_01_zhejiang_vs_shandong.md) |
 | 19 | Chelsea 2-1 Tottenham | 2026-05-20 | 英超 | 上盘赢球赢盘 | lure_variants D/E；h2h B；home_away A/B；kelly C | — |
-| 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局走盘 | fundamentals D2/D3；kelly G；lure_variants D；h2h E | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
+| 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局，上盘 -0.75 全输 | fundamentals D2/D3；kelly G；lure_variants D；h2h E | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
 | 21 | England 0-0 Ghana | 2026-06-24 | 世界杯小组赛 | 深盘上盘全输，冷平 | strong_team_deep A | [England_vs_Ghana_review.md](../../report/2026-06-24/England_vs_Ghana_review.md) |
 | 22 | Ecuador 2-1 Germany | 2026-06-26 | 世界杯小组赛 | 受让方 +1 赢盘且直接主胜 | strong_team_deep B | [Ecuador_vs_Germany_review.md](../../report/2026-06-26/Ecuador_vs_Germany_review.md) |
 | 23 | 河南 0-2 浙江 | 2026-05-30 | 中超 | 下盘客队赢球赢盘 | late_stage B；kelly E；csl C；h2h B | [20260530_case_05_henan_vs_zhejiang.md](20260530_case_05_henan_vs_zhejiang.md) |
