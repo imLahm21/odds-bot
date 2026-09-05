@@ -583,6 +583,14 @@ def parse_game(game: dict, league: str, snapshot_time: str = "",
                selected_bm_keys: list | None = None) -> list:
     """将单场比赛的 JSON 解析为行列表，含凯利指数计算。
     selected_bm_keys: 只输出这些公司的行（但市场平均值基于全部公司计算）
+
+    ⚠️ 历史格式保留，非当前生产链路（当前为 bot/，数据源 API-Football）。
+    本函数数据源为 The Odds API，凯利口径与 bot/parser.py 有两处已知差异：
+      1. 亚盘均值按主/客汇总，【不按盘口线分组】——不同让球线的水位会混入同一分母；
+      2. 分母取全部返回公司，bot 则按 pool_ids 白名单筛选。
+    因两个 API 的公司集合与盘口粒度都不同，即使统一算法也得不到可比数值，
+    故保留原样、不迁移；两条路径数值不可跨入口比较，也不共用 0.96/1.03 报警线。
+    如需比对或分析，一律以 bot/ 输出为准。
     """
     home = game.get("home_team", "")
     away = game.get("away_team", "")

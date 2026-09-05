@@ -62,7 +62,7 @@
 | 17 | AS Roma 2-0 Lazio | 2026-05-17 | 意甲（罗马德比） | 上盘赢球赢盘 | fundamentals B/C | — |
 | 18 | 浙江 4-1 山东泰山 | 2026-05-20 | 中超 | 上盘大胜 | lure_variants C；kelly C；csl B | [20260520_case_01_zhejiang_vs_shandong.md](20260520_case_01_zhejiang_vs_shandong.md) |
 | 19 | Chelsea 2-1 Tottenham | 2026-05-20 | 英超 | 上盘赢球赢盘 | lure_variants D/E；h2h B；home_away A/B；kelly C | — |
-| 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局走盘 | fundamentals D2/D3；kelly G；lure_variants D；h2h E | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
+| 20 | Bournemouth 1-1 Man City | 2026-05-20 | 英超（冠军争夺战） | 平局，上盘 -0.75 全输 | fundamentals D2/D3；kelly G；lure_variants D；h2h E | [20260520_case_02_bournemouth_vs_man_city.md](20260520_case_02_bournemouth_vs_man_city.md) |
 | 21 | England 0-0 Ghana | 2026-06-24 | 世界杯小组赛 | 深盘上盘全输，冷平 | strong_team_deep A | [England_vs_Ghana_review.md](../../report/2026-06-24/England_vs_Ghana_review.md) |
 | 22 | Ecuador 2-1 Germany | 2026-06-26 | 世界杯小组赛 | 受让方 +1 赢盘且直接主胜 | strong_team_deep B | [Ecuador_vs_Germany_review.md](../../report/2026-06-26/Ecuador_vs_Germany_review.md) |
 | 23 | 河南 0-2 浙江 | 2026-05-30 | 中超 | 下盘客队赢球赢盘 | late_stage B；kelly E；csl C；h2h B | [20260530_case_05_henan_vs_zhejiang.md](20260530_case_05_henan_vs_zhejiang.md) |

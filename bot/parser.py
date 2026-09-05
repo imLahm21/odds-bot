@@ -55,17 +55,17 @@ def node_label(commence_utc: str, snapshot_utc: str) -> str:
 # ─── 亚盘 value 文本解析 ─────────────────────────────────────────────────────
 def parse_ah_value(value_str: str) -> tuple[str, float] | None:
     """
-    解析亚盘 value 文本 → (side, handicap_from_home_view)
-      "Home +0.75" → ("home", -0.75)   主队 +0.75 表示主队受让，主队视角让球 = -0.75
-      "Home -1"    → ("home", +1.0)    主队 -1 表示主队让 1，主队视角让球 = +1.0
-      "Away +1.25" → ("away", -1.25)   客队受让 1.25 → 等价主队让 1.25 → 主队视角 +1.25?
+    解析亚盘 value 文本 → (side, raw_num)，raw_num 为 API 原始带符号数值。
 
-    统一约定：handicap 字段存"主队视角让球数"，负=主队受让，正=主队让出。
-      Home ±X  : 主队视角 = -(±X)  （Home +0.75 = 主队受让 0.75 = -0.75）
-      Away ±X  : 该盘是从客队角度报的，主队视角 = +(±X 的符号反向再反向)
-                 客队 +X = 客队受让 X = 主队让出 X = 主队视角 +X
-                 但 API 对同一盘口会同时给 Home 和 Away 两条，取 Home 那条即可定盘。
-    实际只需用 Home 那条确定盘口；Away 条用于取客队水位。
+    ⚠️ 符号约定（已用 data/ 真实导出反向验证，勿凭字面直觉改）：
+      API 原始值：正 = 主队【让出】，负 = 主队【受让】
+        "Home +0.75" → ("home", +0.75)  主队让 0.75
+        "Home -1"    → ("home", -1.0)   主队受让 1
+      内部 handicap 字段（CLAUDE.md「让球」列同口径，与 API 相反）：
+        负 = 主队【让出】，正 = 主队【受让】
+      转换在 extract_asian_handicap() 内完成：handicap = -raw_num。
+
+    本函数只做文本拆分，不做符号转换。side 决定该赔率归主水还是客水。
     """
     parts = value_str.strip().split()
     if len(parts) != 2:
@@ -84,10 +84,13 @@ def extract_asian_handicap(values: list[dict]) -> dict[float, dict]:
 
     关键（已用真实数据验证）：API-Football 对同一盘口同时给两条 value，
     数字和符号相同、仅 Home/Away 前缀不同，二者是同一盘口的两侧水位：
-      "Home +0.75"(4.25) 与 "Away +0.75"(1.20) → 去水后主23%/客77%，正好互补。
-    因此二者的"主队视角让球数"相同 = -num：
-      Home/Away +0.75 → 主队受让 0.75 → handicap = -0.75
-      Home/Away -1    → 主队让 1      → handicap = +1.0
+    因此二者的内部 handicap 相同 = -num（API 正=主队让出 → 内部负=主队让出）：
+      Home/Away +0.75 → 主队让出 0.75 → handicap = -0.75
+      Home/Away -1    → 主队受让 1    → handicap = +1.0
+
+    验证依据（data/ 导出实测，两侧水位均落在 1.8~2.1 平衡区间）：
+      Beijing(主 1.67/客 4.64，主热) → handicap -0.75，主水 1.98/客水 1.85
+      Bournemouth(主 4.57/客 1.69，客热) → handicap +0.75，主水 1.84/客水 2.02
     side 仅决定这条赔率存进 home_water 还是 away_water。
     """
     by_line: dict[float, dict] = {}

@@ -4,8 +4,14 @@
 对齐 rules/风控验证/reference_staking_kelly.md 第五章 §5.2：
   - 只做 3串1（2串1 无 ×1.15 增益，默认拆单关）。
   - 准入门槛（全满足才可串）：三腿【每腿】edge>0 且证据达「中」以上。
-  - ×1.15 是乘法，只放大已有 edge 的方向：一腿 −EV，×1.15 也救不回。
+  - 「每腿 edge>0」是【保守准入政策】，非数学必然 —— 乘法增益可救回轻度负 EV 腿
+    （反例 0.99×1.02×1.02×1.15−1=+18.45%）。保留门槛的理由是估计误差连乘、
+    相关性不可控、方差放大，不是「负 EV 不可救」。
   - 同场腿属相关性套利、另算——调用方须保证三腿是不同 fixture。
+
+⚠️ 合并 EV 按【统计独立 + 二元结算】假设计算：直接连乘 p_final 与 odds。
+   两点局限：① 不同 fixture 不等于统计独立（同联赛/同轮次/关联球队仍可能相关）；
+   ② 含走盘/半赢的让球盘不是二元结算，本模块会按全中/全输近似处理。
 
 输入：三条腿的结构化决策（由 analyzer.extract_decision 从各腿精算报告抽出）。
 输出：可串/拆判定 + 合并 EV + 注额 + 逐腿明细 + 渲染好的 Markdown 结论。
@@ -95,7 +101,7 @@ def evaluate(legs: list[dict]) -> dict:
     failed = [i for i, (ok, _) in enumerate(checks) if not ok]
     if failed:
         idx = "、".join(f"腿{i+1}" for i in failed)
-        result["reason"] = f"{idx} 未过准入 → 拆单关（§5.2：任一 −EV，×1.15 也救不回）"
+        result["reason"] = f"{idx} 未过准入 → 拆单关（§5.2 保守准入：要求每腿 edge>0）"
         return result
 
     # 三腿全过闸 → 算合并 EV（BCG 3串1 ×1.15）
@@ -188,8 +194,8 @@ def render_report(verdict: dict) -> str:
             lines.append(f"- （合并 EV = {verdict['ev']:+.1%}）")
         lines += [
             "",
-            "> §5.2：3串1 的 ×1.15 增益是乘法，只放大已有 edge 的方向；"
-            "任一腿 −EV 或证据不足，串起来必沉水下。按各腿单场结论分别决策。",
+            "> §5.2 保守准入：要求三腿每腿 edge>0 且证据达「中」以上（风控政策，非数学必然——"
+            "理由是估计误差连乘、相关性不可控、方差放大）。按各腿单场结论分别决策。",
         ]
     return "\n".join(lines)
 
