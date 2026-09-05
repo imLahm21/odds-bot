@@ -26,6 +26,8 @@ from . import config
 log = logging.getLogger("odds_bot.parlay")
 
 # 证据档位规范化：把 extract_decision 可能给的中英文/别名收敛到四档 key。
+# "unknown"（报告未写证据强度）刻意不列入映射 → 落到默认 "none" → 被准入拒绝。
+# 这是有意的保守设计：抽取器不再按置信度反推证据，缺失即视为无证据。
 _EVIDENCE_ALIASES = {
     "strong": "strong", "强": "strong", "high": "strong",
     "medium": "medium", "中": "medium", "mid": "medium", "moderate": "medium",

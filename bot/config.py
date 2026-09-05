@@ -440,7 +440,14 @@ FUND_ANALYZE_RULE_FILES = [
     "rules/方法论/reference_competition_context.md",
     "rules/方法论/reference_over_under.md",
 ]
-# 全量规则文件（相对项目根），按顺序拼接成 system prompt
+# ─── 赛前精算规则加载（分层预算）────────────────────────────────────────────
+# 分三层：核心层每场必加载；主题层按本场命中的触发条件加载；两层都进同一个
+# system prompt。超上下文预算时按 RULE_BUDGET_ORDER 的倒序丢弃（详见 analyzer）。
+#
+# ⚠️ 核心层不含 rules/实战教训/feedback_*.md —— 那些是【主题层】，
+#    由 LESSON_TOPIC_RULES 按赛事/盘型条件动态挑选。旧版只加载总览
+#    (reference_case_lessons.md) 的路由摘要，主题正文从未进入 prompt，
+#    导致「加载命中的主题文件、执行其检查项」这条指令在机器人环境里无法执行。
 ANALYZE_RULE_FILES = [
     "CLAUDE.md",
     "rules/方法论/reference_asian_handicap.md",
@@ -451,7 +458,66 @@ ANALYZE_RULE_FILES = [
     "rules/风控验证/reference_kelly_index.md",
     "rules/风控验证/reference_staking_kelly.md",
     "rules/实战教训/reference_case_lessons.md",
-    "rules/实战教训/reference_cases.md",
+]
+
+# 主题防错文件（rules/实战教训/feedback_*.md）的条件加载规则。
+# 每项：slug -> (触发判据 kind, 判据参数, 说明)
+#   "always"   —— 每场必读（总览路由表标注「每场必读」的）
+#   "league"   —— 联赛名/ID 命中才读
+#   "has_h2h"  —— 用户提供了 H2H 交锋数据才读
+#   "has_form" —— 提供了近 10 场近况数据才读
+#   "always_pattern" —— 盘型类，正文含判定树，无法从元数据预判 → 每场读
+# 盘型类（sync_pricing/lure_variants/late_stage_shift/kelly_signals/strong_team_deep）
+# 的触发条件要读完 CSV 才知道（升降盘、凯利极值、深盘…），而规则必须在分析前
+# 就位，故一律加载；只有联赛类与基本面数据类可真正省掉。
+LESSON_TOPIC_RULES: dict[str, tuple[str, object, str]] = {
+    "heat_direction":      ("always", None, "判热度/形态前每场必读"),
+    "sync_pricing":        ("always_pattern", None, "任一阶段升/降盘"),
+    "lure_variants":       ("always_pattern", None, "全程不变盘/开小后升盘/升盘回降"),
+    "late_stage_shift":    ("always_pattern", None, "临场③④/即时变盘或跳变"),
+    "kelly_signals":       ("always_pattern", None, "凯利极端值/方向反转/浅盘"),
+    "strong_team_deep":    ("always_pattern", None, "深盘/热门浅让/强弱对话"),
+    "fundamentals_weight": ("always_pattern", None, "基本面与盘口矛盾/碾压/战意"),
+    "csl_fundamentals":    ("league", ("中超", "足协杯", "csl", "chinese super"),
+                            "中超及状态波动类似的次级联赛"),
+    "h2h_weight":          ("has_h2h", None, "有 H2H 交锋数据或积分接近"),
+    "home_away_quality":   ("has_form", None, "有近 10 场近况数据"),
+}
+
+
+def lesson_topic_files(league_name: str = "", has_h2h: bool = True,
+                       has_form: bool = True) -> list[str]:
+    """按本场条件挑选要加载的 feedback 主题文件（相对路径列表）。
+
+    league_name/has_h2h/has_form 取自本场元数据与基本面文本；
+    默认 has_* 为 True（宁可多加载，不可漏规则）。
+    """
+    lg = (league_name or "").lower()
+    out = []
+    for slug, (kind, param, _desc) in LESSON_TOPIC_RULES.items():
+        keep = False
+        if kind in ("always", "always_pattern"):
+            keep = True
+        elif kind == "league":
+            keep = any(str(k).lower() in lg for k in (param or ()))
+        elif kind == "has_h2h":
+            keep = bool(has_h2h)
+        elif kind == "has_form":
+            keep = bool(has_form)
+        if keep:
+            out.append(f"rules/实战教训/feedback_{slug}.md")
+    return out
+
+
+# 上下文预算：规则总量上限（字符）。超限时按本顺序【从后往前】丢弃主题层文件，
+# 核心层永不丢弃——宁可报「超限」也不静默删必需规则。
+RULE_CONTEXT_BUDGET = int(os.getenv("RULE_CONTEXT_BUDGET", "160000"))
+RULE_BUDGET_DROP_ORDER = [
+    "rules/实战教训/feedback_csl_fundamentals.md",
+    "rules/实战教训/feedback_home_away_quality.md",
+    "rules/实战教训/feedback_h2h_weight.md",
+    "rules/实战教训/feedback_fundamentals_weight.md",
+    "rules/实战教训/feedback_strong_team_deep.md",
 ]
 # 走地(滚球)研判规则：独立加载，不混进赛前 SOP 规则缓存
 LIVE_RULE_FILES = [

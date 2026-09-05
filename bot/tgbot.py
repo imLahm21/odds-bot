@@ -990,7 +990,8 @@ def _build_csv(fid: int):
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker, market, "
             "home_odds, draw_odds, away_odds, kelly_home, kelly_draw, kelly_away, "
-            "handicap, home_water, away_water, kelly_h_water, kelly_a_water "
+            "handicap, home_water, away_water, kelly_h_water, kelly_a_water, "
+            "source_updated_utc "
             "FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
             "    PARTITION BY node_label, bookmaker_id, market, handicap "
@@ -1032,9 +1033,12 @@ def _build_csv(fid: int):
                 "让球", "主队水位", "客队水位", "凯利(主)", "凯利(客)",
                 "数据更新(CST)"])
     for (snap, node, bm, market, ho, do, ao, kh, kd, ka,
-         hc, hw, aw, khw, kaw) in rows:
+         hc, hw, aw, khw, kaw, src_upd) in rows:
         snap_cst = to_cst(snap)
         snap_label = f"{snap_cst}（{node}）" if node else snap_cst
+        # 「数据更新」= 上游报价更新时间（API entry.update）；旧数据未采集该字段
+        # 时留空并标注，绝不用抓取时间冒充上游时间（两者语义不同）。
+        src_cst = to_cst(src_upd) if src_upd else "（上游未提供）"
         is_h2h = market == "h2h"
         w.writerow([
             snap_label, league, kick_cst, home, away, bm,
@@ -1043,7 +1047,7 @@ def _build_csv(fid: int):
             kh if is_h2h else "", kd if is_h2h else "", ka if is_h2h else "",
             "" if is_h2h else hc, "" if is_h2h else hw, "" if is_h2h else aw,
             "" if is_h2h else khw, "" if is_h2h else kaw,
-            snap_cst,
+            src_cst,
         ])
     meta = {"home": home, "away": away, "league": league,
             "kick_cst": kick_cst, "rows": len(rows)}

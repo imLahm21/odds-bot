@@ -36,8 +36,20 @@ def _to_float(s):
 
 
 # ─── 节点标签推算 ────────────────────────────────────────────────────────────
-def node_label(commence_utc: str, snapshot_utc: str) -> str:
-    """根据快照距开球的小时数，对齐到 SOP 的 10 节点语义。"""
+def node_label(commence_utc: str, snapshot_utc: str,
+               status_short: str | None = None) -> str:
+    """根据快照距开球的小时数，对齐到 SOP 的 10 节点语义。
+
+    ⚠️ 节点名是【区间标签】，不是精确采样时刻：轮询抓到的散点按「距开球时长」
+    归入区间，故「初盘①」= 距开球 ≥72h 的全部样本（可能是 100h 前抓的），
+    不代表恰好 -72h、也不代表庄家首次开盘。精确采样时间见 snapshot_utc 列。
+
+    开球后的标签按比赛状态区分（status_short 来自 API fixture.status.short）：
+      赛中（1H/2H/HT/ET/BT/P/LIVE）→「赛中」；已完结（FT/AET/PEN）→「赛后」；
+      异常中止（SUSP/INT/PST/CANC/ABD/AWD/WO）→「中止」；
+      未提供状态时回退「开球后」——不再一律标「赛后」，避免把进行中的比赛
+      当成已出结果（走地研判与赛果归档都依赖这个区分）。
+    """
     try:
         kick = datetime.fromisoformat(commence_utc.replace("Z", "+00:00"))
         snap = datetime.fromisoformat(snapshot_utc.replace("Z", "+00:00"))
@@ -45,7 +57,14 @@ def node_label(commence_utc: str, snapshot_utc: str) -> str:
         return ""
     hours = (kick - snap).total_seconds() / 3600
     if hours < 0:
-        return "赛后"
+        st = (status_short or "").upper()
+        if st in ("1H", "2H", "HT", "ET", "BT", "P", "LIVE"):
+            return "赛中"
+        if st in ("FT", "AET", "PEN"):
+            return "赛后"
+        if st in ("SUSP", "INT", "PST", "CANC", "ABD", "AWD", "WO"):
+            return "中止"
+        return "开球后"
     for threshold, label in config.NODE_THRESHOLDS:
         if hours >= threshold:
             return label
@@ -194,7 +213,11 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
     if not fixture_id:
         return []
     bookmakers = entry.get("bookmakers", [])
-    label = node_label(commence_utc, snapshot_utc)
+    label = node_label(commence_utc, snapshot_utc,
+                       entry.get("fixture", {}).get("status", {}).get("short"))
+    # 上游报价更新时间（API entry 顶层 'update'）。与 snapshot_utc（我方抓取时间）
+    # 是两个不同时点：抓到一条新记录 ≠ 庄家刚改价。仅到 fixture 级，同场各庄共用。
+    source_updated_utc = entry.get("update") or None
 
     # ── 第一轮：收集全市场赔率算平均（凯利池）──
     h2h_all = {"home": [], "draw": [], "away": []}
@@ -287,6 +310,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
         if h2h and h2h["home"] and h2h["away"]:
             rows.append({
                 "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                "source_updated_utc": source_updated_utc,
                 "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
                 "market": "h2h",
                 "home_odds": h2h["home"], "draw_odds": h2h["draw"],
@@ -305,6 +329,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                 mavg = avg_ah.get(hc, {})
                 rows.append({
                     "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                    "source_updated_utc": source_updated_utc,
                     "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
                     "market": "ah",
                     "home_odds": None, "draw_odds": None, "away_odds": None,
@@ -325,6 +350,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
                 mavg = mavg_map.get(ln, {})
                 rows.append({
                     "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                    "source_updated_utc": source_updated_utc,
                     "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
                     "market": market_tag,
                     "home_odds": None, "draw_odds": None, "away_odds": None,
@@ -347,6 +373,7 @@ def parse_odds_response(entry: dict, snapshot_utc: str,
         if btts:
             rows.append({
                 "fixture_id": fixture_id, "snapshot_utc": snapshot_utc,
+                "source_updated_utc": source_updated_utc,
                 "node_label": label, "bookmaker_id": bid, "bookmaker": bname,
                 "market": "btts",
                 "home_odds": None, "draw_odds": None, "away_odds": None,
