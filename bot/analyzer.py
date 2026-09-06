@@ -12,7 +12,7 @@ import logging
 
 from dotenv import load_dotenv
 
-from . import config, llm_client
+from . import config, llm_client, goals_model
 
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
@@ -208,6 +208,7 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 盘口快照（CSV）\n{csv_text}\n\n"
+        f"{goals_model.format_states_block(goals_model.states_from_csv(csv_text))}\n"
         f"### 基本面\n{fundamentals}\n"
     )
     return system, user
