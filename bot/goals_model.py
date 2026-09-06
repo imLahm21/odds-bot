@@ -162,6 +162,63 @@ def ah_states(matrix: dict, line: float) -> dict[str, float]:
     return out
 
 
+def ou_states_from_market(ou_rows: list[tuple[float, float, float]],
+                          line: float) -> dict[str, float] | None:
+    """**优先用市场报价**直接算某条大小球线的状态，不依赖模型。
+
+    原理：整数线的走盘概率可由相邻半线的市场价直接相减得到，无需泊松假设。
+      P(总进球 = 3)  = P(>2.5) − P(>3.5)
+      整数线 3.0：全赢 = P(>3.5)、走盘 = P(=3)、全输 = 1 − P(>2.5)
+      四分之一线 2.75：拆 2.5 与 3.0 各半 → 由这两条线的状态组合
+      半线 2.5：全赢 = P(>2.5)、全输 = 1 − P(>2.5)（无走盘）
+
+    所需的相邻线若市场未挂出，返回 None（交由模型插值）。
+    """
+    mkt = {}
+    for ln, over, under in ou_rows:
+        p_over, _ = _devig_two(over, under)
+        if 0.0 < p_over < 1.0:
+            mkt[round(ln, 2)] = p_over           # P(总进球 > ln)
+
+    def P(x):                                    # P(总进球 > x)
+        return mkt.get(round(x, 2))
+
+    q = abs(line * 4) % 2 == 1                   # .25 / .75 结尾
+    if q:
+        lo, hi = line - 0.25, line + 0.25
+        a = ou_states_from_market(ou_rows, lo)
+        b = ou_states_from_market(ou_rows, hi)
+        if a is None or b is None:
+            return None
+        # 两条半本金各自结算；相邻线不会一赢一输，故只有 全赢/半赢/半输/全输
+        out = {k: 0.0 for k in
+               ("win", "half_win", "push", "half_lose", "lose")}
+        out["win"] = min(a["win"], b["win"])
+        out["lose"] = min(a["lose"], b["lose"])
+        rest = 1.0 - out["win"] - out["lose"]
+        # 剩余部分：一条赢一条走 → 半赢；一条输一条走 → 半输
+        if a["win"] > b["win"]:
+            out["half_win"] = rest
+        else:
+            out["half_lose"] = rest
+        return out
+
+    is_int = abs(line - round(line)) < 1e-9
+    if is_int:
+        p_hi, p_lo = P(line + 0.5), P(line - 0.5)
+        if p_hi is None or p_lo is None:
+            return None
+        push = max(p_lo - p_hi, 0.0)             # P(总进球 == line)
+        return {"win": p_hi, "half_win": 0.0, "push": push,
+                "half_lose": 0.0, "lose": max(1.0 - p_lo, 0.0)}
+
+    p = P(line)                                  # .5 结尾，无走盘
+    if p is None:
+        return None
+    return {"win": p, "half_win": 0.0, "push": 0.0,
+            "half_lose": 0.0, "lose": 1.0 - p}
+
+
 def ou_states(matrix: dict, line: float) -> dict[str, float]:
     """大小球某条线的状态概率（**大球视角**）。整数线（2.0/3.0）有走盘。"""
     out = {k: 0.0 for k in
@@ -237,33 +294,52 @@ def _devig_two(a: float, b: float) -> tuple[float, float]:
     return ia / s, ib / s
 
 
-def implied_total_goals(ou_rows: list[tuple[float, float, float]]) -> float | None:
+def implied_total_goals(ou_rows: list[tuple[float, float, float]],
+                        rho: float = DC_RHO) -> float | None:
     """从大小球各线反推期望总进球 λ_total。
 
     ou_rows: [(盘口线, 大球赔率, 小球赔率), ...]（同一节点、多庄可先取均值）
-    做法：对每条线求去抽水后的 P(大球)，用泊松总进球分布拟合出最匹配的 λ。
-    取多条线的拟合结果中位数，抗单线噪声。
+
+    做法：**最小化所有线的总偏差**，而不是逐线各拟合一个再取中位——
+    不同线要求的 λ 常不一致（实测一场：2.5 线要 3.607、3.0 线要 4.272，差 0.67），
+    逐线拟合再挑一个会让其余线全偏。故改为在 λ 上搜索使
+    Σ|P_模型(>line) − P_市场(>line)| 最小的那个值。
+
+    另：拟合用的 P(>line) 与最终状态求值**同口径**（都走 DC 修正矩阵），
+    避免「拟合用纯泊松、求值用 DC」造成的系统性错位。
     """
-    cands = []
+    obs = []
     for line, over, under in ou_rows:
         p_over, _ = _devig_two(over, under)
         if p_over <= 0.02 or p_over >= 0.98:
             continue                             # 极端值不可靠，跳过
-        # 在 [0.3, 6.0] 上二分找使 P(总进球 > line) = p_over 的 λ
-        lo, hi = 0.3, 6.0
-        for _ in range(60):
-            mid = (lo + hi) / 2
-            # P(总进球 > line)：总进球服从 Pois(λ)（两独立泊松之和仍是泊松）
-            p = 1.0 - sum(_pois(k, mid) for k in range(int(line) + 1))
-            if p < p_over:
-                lo = mid
-            else:
-                hi = mid
-        cands.append((lo + hi) / 2)
-    if not cands:
+        obs.append((line, p_over))
+    if not obs:
         return None
-    cands.sort()
-    return cands[len(cands) // 2]
+
+    def total_err(lam: float) -> float:
+        # 与求值同口径：用 DC 矩阵。λ 未拆分时按均势对半拆（总进球分布对拆分不敏感）
+        m = score_matrix(lam / 2, lam / 2, rho)
+        err = 0.0
+        for line, p_mkt in obs:
+            s = ou_states(m, line)
+            p_mod = s["win"] + 0.5 * s.get("half_win", 0.0)
+            denom = 1.0 - s.get("push", 0.0)
+            if denom > 0.01:
+                p_mod /= denom                   # 排除走盘，与市场两出口同口径
+            err += abs(p_mod - p_mkt)
+        return err
+
+    # 三分搜索（total_err 关于 λ 单峰）
+    lo, hi = 0.3, 6.0
+    for _ in range(80):
+        m1 = lo + (hi - lo) / 3
+        m2 = hi - (hi - lo) / 3
+        if total_err(m1) <= total_err(m2):
+            hi = m2
+        else:
+            lo = m1
+    return (lo + hi) / 2
 
 
 def states_for_csv(ah_lines: list[float], ou_rows: list[tuple[float, float, float]],
@@ -315,8 +391,13 @@ def states_for_csv(ah_lines: list[float], ou_rows: list[tuple[float, float, floa
         out["ah"][ln] = {k: round(v, 4)
                          for k, v in ah_states(m, ln).items() if v > 0}
     for line, _o, _u in ou_rows:
-        out["ou"][line] = {k: round(v, 4)
-                           for k, v in ou_states(m, line).items() if v > 0}
+        # 大小球优先用市场报价直接算（不依赖泊松假设）；相邻线缺失才退回模型
+        s_mkt = ou_states_from_market(ou_rows, line)
+        out["ou"][line] = ({k: round(v, 4) for k, v in s_mkt.items() if v > 0}
+                           if s_mkt else
+                           {k: round(v, 4) for k, v in ou_states(m, line).items()
+                            if v > 0})
+        out.setdefault("ou_source", {})[line] = "市场" if s_mkt else "模型"
     # 大小球一致性：λ_total 由大小球反推、λ 拆分由胜平负反标定，
     # 两个约束不必然兼容（市场可同时认为「主队大胜」且「总进球不多」）。
     # 记下模型与市场 P(大球) 的最大偏差，供 prompt 显式提示。
@@ -398,13 +479,18 @@ def format_states_block(st: dict | None) -> str:
             f"| {s.get('push',0):.1%} | {s.get('half_lose',0):.1%} "
             f"| {s.get('lose',0):.1%} |")
     lines += ["", "**各大小球线结算状态**（大球视角）：", "",
-              "| 总进球线 | 全赢 | 半赢 | 走盘 | 半输 | 全输 |",
-              "|----------|------|------|------|------|------|"]
+              "| 总进球线 | 全赢 | 半赢 | 走盘 | 半输 | 全输 | 来源 |",
+              "|----------|------|------|------|------|------|------|"]
+    src = st.get("ou_source", {})
     for ln, s in sorted(st["ou"].items()):
         lines.append(
             f"| {ln:g} | {s.get('win',0):.1%} | {s.get('half_win',0):.1%} "
             f"| {s.get('push',0):.1%} | {s.get('half_lose',0):.1%} "
-            f"| {s.get('lose',0):.1%} |")
+            f"| {s.get('lose',0):.1%} | {src.get(ln, '模型')} |")
+    lines.append("")
+    lines.append("> 「来源=市场」的行由相邻半线报价直接去抽水相减得到"
+                 "（`P(=3) = P(>2.5) − P(>3.5)`），**不依赖泊松假设，可直接采信**；"
+                 "「来源=模型」的行是相邻线缺失时的插值，按下方警告审慎使用。")
     lines += [
         "",
         "> ⚠️ 这是**模型估计**，非观测频率：泊松假设进球独立且强度恒定，",
