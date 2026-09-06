@@ -440,6 +440,32 @@ FUND_ANALYZE_RULE_FILES = [
     "rules/方法论/reference_competition_context.md",
     "rules/方法论/reference_over_under.md",
 ]
+
+# 基本面预处理是【证据分层的 B 层】，故须加载 B 层主题规则——否则它在做
+# B 层判断时手上没有 B 层的权重、条件覆盖要件与近况质量分级标准。
+# 按本场条件挑选（同 lesson_topic_files 的判据，仅取 B 层那几个）。
+FUND_B_LAYER_SLUGS = {
+    "fundamentals_weight": ("always", None),      # 权重分配/碾压级/战意，每场必读
+    "home_away_quality":   ("has_form", None),    # 近况按对手质量分级
+    "h2h_weight":          ("has_h2h", None),     # H2H 权重双向调整
+    "csl_fundamentals":    ("league", ("中超", "足协杯", "csl", "chinese super")),
+}
+
+
+def fund_topic_files(league_name: str = "", has_h2h: bool = True,
+                     has_form: bool = True) -> list[str]:
+    """基本面预处理要加载的 B 层主题文件（相对路径）。判据同 lesson_topic_files。"""
+    lg = (league_name or "").lower()
+    out = []
+    for slug, (kind, param) in FUND_B_LAYER_SLUGS.items():
+        keep = (kind == "always"
+                or (kind == "has_h2h" and bool(has_h2h))
+                or (kind == "has_form" and bool(has_form))
+                or (kind == "league"
+                    and any(str(k).lower() in lg for k in (param or ()))))
+        if keep:
+            out.append(f"rules/实战教训/feedback_{slug}.md")
+    return out
 # ─── 赛前精算规则加载（分层预算）────────────────────────────────────────────
 # 分三层：核心层每场必加载；主题层按本场命中的触发条件加载；两层都进同一个
 # system prompt。超上下文预算时按 RULE_BUDGET_ORDER 的倒序丢弃（详见 analyzer）。

@@ -1051,6 +1051,27 @@ def _build_csv(fid: int):
         ])
     meta = {"home": home, "away": away, "league": league,
             "kick_cst": kick_cst, "rows": len(rows)}
+    # 同节点时间一致性（审查第 7 项）：SQL 按 (节点,公司,市场,盘口) 各取最新行，
+    # 并非为整个节点选共同快照。某公司/某条线较早停更时，其旧报价会与其他分组的
+    # 新报价并列在同一节点里——若当成同一时刻的市场，会制造跨庄分歧/同步变盘的假象。
+    # 实测 1077 个节点跨度均 ≤1h（整批轮询所致），故不改去重逻辑，只做度量与标注。
+    spans: dict[str, list] = {}
+    for r in rows:
+        if r[1] and r[0]:
+            spans.setdefault(r[1], []).append(r[0])
+    stale = []
+    for node, ts in spans.items():
+        if len(ts) < 2:
+            continue
+        try:
+            lo = min(datetime.fromisoformat(t.replace("Z", "+00:00")) for t in ts)
+            hi = max(datetime.fromisoformat(t.replace("Z", "+00:00")) for t in ts)
+        except (ValueError, AttributeError):
+            continue
+        mins = (hi - lo).total_seconds() / 60
+        if mins > 60:
+            stale.append(f"{node}（跨度 {mins:.0f} 分钟）")
+    meta["node_span_warning"] = stale
     return buf.getvalue(), meta
 
 
@@ -1067,6 +1088,10 @@ def _cmd_export(chat_id: int, args: list[str]) -> None:
     content = ("﻿" + csv_str).encode("utf-8")
     teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
     caption = f"{meta['league']} {meta['home']} vs {meta['away']}\n共 {meta['rows']} 行快照"
+    if meta.get("node_span_warning"):
+        caption += ("\n⚠️ 同节点报价时间不同步："
+                    + "、".join(meta["node_span_warning"])
+                    + "\n（该节点内含较早停更的旧报价，勿据此判跨庄分歧/同步变盘）")
     send_document(chat_id, f"{teams}_stages.csv", content, caption)
 
 

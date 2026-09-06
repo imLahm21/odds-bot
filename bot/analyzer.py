@@ -27,8 +27,7 @@ LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
 
 _live_rules_cache: str | None = None
 _live_rules_mtimes: dict | None = None
-_fund_rules_cache: str | None = None
-_fund_rules_mtimes: dict | None = None
+_fund_rules_cache: dict[tuple, tuple[str, dict]] = {}
 
 # 规则缓存：key = 文件列表元组 → (拼接文本, {文件: mtime})。
 # 带 mtime 是为了让磁盘上改过的规则【下一次分析即生效】，不必重启进程——
@@ -177,16 +176,27 @@ def load_live_rules() -> str:
     return text
 
 
-def load_fund_rules() -> str:
-    """读取基本面分析专用规则（国家队/赛事情境/大小球），独立缓存。
-    仅供两阶段基本面预处理用，不含全套 SOP 精算规则。带 mtime 校验。"""
-    global _fund_rules_cache, _fund_rules_mtimes
-    cur = _mtimes(config.FUND_ANALYZE_RULE_FILES)
-    if _fund_rules_cache is not None and _fund_rules_mtimes == cur:
-        return _fund_rules_cache
-    text, _ = _read_rule_files(config.FUND_ANALYZE_RULE_FILES)
-    _fund_rules_cache, _fund_rules_mtimes = text, cur
-    log.info("基本面规则已加载，共 %d 字符", len(text))
+def load_fund_rules(league_name: str = "", has_h2h: bool = True,
+                    has_form: bool = True) -> str:
+    """读取基本面分析专用规则（国家队/赛事情境/大小球 + 命中的 B 层主题）。
+
+    基本面预处理属**证据分层的 B 层**，故除方法论外还须加载 B 层主题规则
+    （权重分配、碾压级要件、近况质量分级、H2H 权重）——否则它在做 B 层判断时
+    手上没有 B 层的判据。不含全套 SOP 精算规则。缓存按文件列表 + mtime 双重校验。
+    """
+    rels = list(config.FUND_ANALYZE_RULE_FILES) + config.fund_topic_files(
+        league_name, has_h2h, has_form)
+    key = tuple(rels)
+    cur = _mtimes(rels)
+    hit = _fund_rules_cache.get(key)
+    if hit is not None and hit[1] == cur:
+        return hit[0]
+    text, missing = _read_rule_files(rels)
+    _fund_rules_cache[key] = (text, cur)
+    log.info("基本面规则已加载 %d 字符｜方法论 %d + B层主题 %d 个%s",
+             len(text), len(config.FUND_ANALYZE_RULE_FILES),
+             len(rels) - len(config.FUND_ANALYZE_RULE_FILES),
+             f"｜缺失 {len(missing)}" if missing else "")
     return text
 
 
@@ -326,7 +336,11 @@ def _fund_prompts(raw_funds: str, home: str, away: str,
                   league: str) -> tuple[str, str]:
     """构造基本面预处理的 (system, user) prompt，供阻塞版与流式版共用。"""
     system = (
-        load_fund_rules()
+        load_fund_rules(
+            league_name=league,
+            has_h2h=any(k in (raw_funds or "") for k in ("交锋", "H2H", "h2h")),
+            has_form=any(k in (raw_funds or "")
+                         for k in ("近10场", "近 10 场", "近况", "战绩")))
         + "\n\n===== 任务（基本面分析） =====\n"
         "你是足球赛事基本面分析师。下面是某场比赛的原始基本面数据"
         "（两队近 10 场、历史交锋、未来 5 场赛程、积分榜，来自 API-Football）。"
@@ -339,6 +353,14 @@ def _fund_prompts(raw_funds: str, home: str, away: str,
         "H2H 权重、出线形势与战意、两队攻防与大小球倾向。\n"
         "3. 产出研判结论（不是复述数据），指出对盘口的参考意义与风险点。\n"
         "数据缺失的部分明确标注「无数据」，不要编造。控制在合理篇幅内。\n"
+        "\n【本步骤的定位：证据分层的 B 层，权重 30%】\n"
+        "你的产出是**基本面侧证据**，供后续盘口精算（A 层：盘口定性 + 操盘手法，权重 40%）参考。\n"
+        "· **不要下最终方向结论**（不写「所以本场推荐客胜/上盘」）——方向由 A 层盘口决定，\n"
+        "  你的任务是提供基本面事实与倾向，让操盘手去比对盘口是否合理。\n"
+        "· 允许并鼓励明确指出**基本面倾向哪一方、强度多少**，以及\n"
+        "  **是否达到「条件覆盖」级别**（碾压级五要素、极端动力差异 ≥3 项等明文要件）——\n"
+        "  只有达到这些明文要件时，基本面才可覆盖盘口方向；否则只作权重与置信度参考。\n"
+        "· 基本面与盘口矛盾时的处理留给后续步骤，你只需如实标注矛盾点与强度。\n"
         "输出用纯文字，不要使用 Markdown 符号（不要出现 #、*、**、>、--- 等），"
         "分点可用「1. 2. 3.」或「·」，标题直接用文字，方便在纯文本聊天窗展示。"
     )
