@@ -76,13 +76,22 @@ def parse_ah_value(value_str: str) -> tuple[str, float] | None:
     """
     解析亚盘 value 文本 → (side, raw_num)，raw_num 为 API 原始带符号数值。
 
-    ⚠️ 符号约定（已用 data/ 真实导出反向验证，勿凭字面直觉改）：
-      API 原始值：正 = 主队【让出】，负 = 主队【受让】
-        "Home +0.75" → ("home", +0.75)  主队让 0.75
-        "Home -1"    → ("home", -1.0)   主队受让 1
-      内部 handicap 字段（CLAUDE.md「让球」列同口径，与 API 相反）：
+    ⚠️ 符号约定（2026-09-07 用 6 场实时比赛实测确认，见 probe_ah_sign.py）：
+      API 原始值 = 主队视角，与 CLAUDE.md「让球」列**同向**：
         负 = 主队【让出】，正 = 主队【受让】
-      转换在 extract_asian_handicap() 内完成：handicap = -raw_num。
+        "Home -0.75" → ("home", -0.75)  主队让 0.75
+        "Home +1"    → ("home", +1.0)   主队受让 1
+      故内部 handicap = raw_num，**不取反**。
+
+      实测证据（平衡线 raw 随主队变强单调变负）：
+        主胜 95.2% → 平衡线 raw −2.86    主胜 80.8% → −1.21
+        主胜 73.6% → −0.66               主胜 47.5% → +0.02
+
+      历史 bug（已修）：曾写作 handicap = -raw_num，理由是「API 正=主队让出」。
+      该结论由无判别力的检验反推得出（只看平衡线落在正/负，未与欧赔方向交叉验证），
+      导致所有让球符号整体翻转 —— 深盘被当成受让盘、受让盘被当成深盘，
+      进而使 edge 用错概率（实测 Arsenal vs Chelsea 报告因此出现 −34.2% 的假负 edge）。
+      改动前请用 probe_ah_sign.py 重跑实测，勿凭字面直觉或单一样本改。
 
     本函数只做文本拆分，不做符号转换。side 决定该赔率归主水还是客水。
     """
@@ -101,15 +110,13 @@ def extract_asian_handicap(values: list[dict]) -> dict[float, dict]:
     将一家庄的亚盘 values 列表，按"主队视角让球数"聚合主客水位。
     返回 {handicap: {"home_water":x, "away_water":y}}
 
-    关键（已用真实数据验证）：API-Football 对同一盘口同时给两条 value，
-    数字和符号相同、仅 Home/Away 前缀不同，二者是同一盘口的两侧水位：
-    因此二者的内部 handicap 相同 = -num（API 正=主队让出 → 内部负=主队让出）：
-      Home/Away +0.75 → 主队让出 0.75 → handicap = -0.75
-      Home/Away -1    → 主队受让 1    → handicap = +1.0
+    关键：API-Football 对同一盘口同时给两条 value，数字和符号相同、
+    仅 Home/Away 前缀不同，二者是同一盘口的两侧水位。
+    API raw 已是主队视角（负=主队让出），与内部口径同向，故 handicap = num：
+      Home/Away -0.75 → 主队让出 0.75 → handicap = -0.75
+      Home/Away +1    → 主队受让 1    → handicap = +1.0
 
-    验证依据（data/ 导出实测，两侧水位均落在 1.8~2.1 平衡区间）：
-      Beijing(主 1.67/客 4.64，主热) → handicap -0.75，主水 1.98/客水 1.85
-      Bournemouth(主 4.57/客 1.69，客热) → handicap +0.75，主水 1.84/客水 2.02
+    符号方向的实测依据见 parse_ah_value() 文档字符串（probe_ah_sign.py，6 场活数据）。
     side 仅决定这条赔率存进 home_water 还是 away_water。
     """
     by_line: dict[float, dict] = {}
@@ -121,7 +128,7 @@ def extract_asian_handicap(values: list[dict]) -> dict[float, dict]:
         odd = _to_float(v.get("odd"))
         if odd is None:
             continue
-        home_view = -num   # Home/Away 同号同数字 → 同一盘口，主队视角 = -num
+        home_view = num    # API raw 已是主队视角（负=让出），与内部口径同向，不取反
         rec = by_line.setdefault(home_view, {})
         if side == "home":
             rec["home_water"] = odd
