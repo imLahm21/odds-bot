@@ -299,7 +299,7 @@ def build_markdown(rows):
                    f"| {net:+.2f} | {verdict} |")
     out.append("")
     out.append("### 玩法分类表现\n")
-    out.append("| 玩法 | 笔数 | 命中 | ROI | 净盈亏 | 用法 |")
+    out.append("| 玩法 | 笔数 | 方向命中率 | ROI | 净盈亏 | 用法 |")
     out.append("|------|------|------|-----|--------|------|")
     for cat in PLAY_CATS:
         sel = [x for x in rows if classify_play(x[5]) == cat]
