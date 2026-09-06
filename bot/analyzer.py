@@ -119,6 +119,52 @@ def load_rules(league_name: str = "", has_h2h: bool = True,
     return text
 
 
+def rules_manifest(league_name: str = "", has_h2h: bool = True,
+                   has_form: bool = True) -> dict:
+    """本次分析实际加载了哪些规则文件、各自内容指纹与总量。
+
+    供报告记录「规则版本」用（审查第 35 项）：仅有报告日期或 git 历史
+    无法证明运行进程当时用的就是哪一版——进程可能持有旧缓存、
+    磁盘可能已被后续提交改写。故把**实际读到的内容**算指纹存进报告，
+    两份同场报告差异才能归因到规则/输入/模型三者之一。
+    """
+    import hashlib
+    rels = list(config.ANALYZE_RULE_FILES) + config.lesson_topic_files(
+        league_name, has_h2h, has_form)
+    rels, dropped = _apply_budget(rels)
+    items, total = [], 0
+    for rel in rels:
+        try:
+            with open(rel, encoding="utf-8") as f:
+                body = f.read()
+        except OSError:
+            items.append({"file": rel, "sha": "MISSING", "chars": 0})
+            continue
+        total += len(body)
+        items.append({
+            "file": rel,
+            "sha": hashlib.sha256(body.encode("utf-8")).hexdigest()[:8],
+            "chars": len(body),
+        })
+    return {"files": items, "total_chars": total, "dropped": dropped,
+            "budget": config.RULE_CONTEXT_BUDGET}
+
+
+def format_rules_manifest(mf: dict) -> str:
+    """把 rules_manifest 渲染成报告末尾的可追溯区块。"""
+    lines = ["<!-- 规则版本（可追溯性，审查第 35 项）-->",
+             f"> **规则集**：{len(mf['files'])} 个文件、{mf['total_chars']:,} 字符"
+             f"（预算 {mf['budget']:,}）"]
+    if mf["dropped"]:
+        lines.append(f"> ⚠️ **超预算丢弃**：{'、'.join(mf['dropped'])}")
+    miss = [i["file"] for i in mf["files"] if i["sha"] == "MISSING"]
+    if miss:
+        lines.append(f"> ⚠️ **缺失文件**：{'、'.join(miss)}")
+    lines.append("> 内容指纹：" + "、".join(
+        f"{i['file'].split('/')[-1]}@{i['sha']}" for i in mf["files"]))
+    return "\n".join(lines)
+
+
 def load_live_rules() -> str:
     """读取走地规则文件，独立缓存(不混进赛前 SOP 规则)。带 mtime 校验。"""
     global _live_rules_cache, _live_rules_mtimes
@@ -180,7 +226,7 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     """构造精算的 (system, user) prompt，供阻塞版与流式版共用。
 
     extra_instruction: 用户自定义侧重，非空时追加到标准任务说明之后；
-    明确要求不违背 SOP 与输出格式，以保护进度条依赖的 ### 1~7 段落结构。
+    明确要求不违背 SOP 与输出格式，以保护进度条依赖的 ### 1~8 段落结构。
     """
     # 主题防错规则按本场条件加载：联赛决定是否要中超专项，基本面文本里
     # 有无 H2H/近况决定是否要那两个主题（判据保守——拿不准就加载）。
@@ -191,7 +237,14 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         load_rules(league_name=league, has_h2h=has_h2h, has_form=has_form)
         + "\n\n===== 任务 =====\n"
         "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
-        "步骤1~7执行分析，按文档「输出格式」章节的结构输出完整精算报告。"
+        "步骤 1~8 执行分析（含步骤 7.5 投注决策），按文档「输出格式」章节的结构"
+        "输出完整精算报告——**必须包含 `### 8. 投注决策` 段**，串关裁判依赖该段。"
+        "\n\n【证据分层铁律】方向只由 A 层（盘口定性 + 操盘手法匹配，权重 40%）决定。"
+        "B 层基本面（30%）仅在明文触发的条件覆盖场景（碾压级五要素、极端动力差异 ≥3 项）"
+        "可改方向；**C 层凯利/返还率（20%）与 D 层案例教训（10%）永不改方向**，"
+        "只能「扣置信度 + 把反向结果列为次选」。"
+        "不可按权重加总投票决定方向（否则 B+C+D=60% 会架空 A=40%）——权重只用于算置信度。"
+        "报告第 7 节须先写「分层判断」行，标明 A/B/C/D 各层结论与依据。"
         "盘口数据为 CSV，基本面为【原始数据】文本（含两队近10场、历史交锋、"
         "未来5场赛程、积分榜，来自 API-Football）。你需先按 SOP 步骤1的读法"
         "自行分析这份原始基本面——判赛事情境（阶段/赛制/赛程密度）、近况分层加权、"
@@ -202,7 +255,7 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     if extra_instruction.strip():
         system += (
             "\n\n===== 用户额外侧重 =====\n"
-            "在不违背上述 SOP 步骤与「输出格式」章节结构（必须保留 ### 1~7 各段标题）"
+            "在不违背上述 SOP 步骤与「输出格式」章节结构（必须保留 ### 1~8 各段标题）"
             "的前提下，优先满足以下用户要求：\n" + extra_instruction.strip()
         )
     user = (
@@ -223,7 +276,15 @@ def analyze(csv_text: str, fundamentals: str,
         return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
-    return _call_llm(system, user, effort, tier="heavy", visitor=visitor)
+    report = _call_llm(system, user, effort, tier="heavy", visitor=visitor)
+    if report and not report.startswith(_LLM_ERR_PREFIXES):
+        fund = fundamentals or ""
+        mf = rules_manifest(
+            league_name=league,
+            has_h2h=any(k in fund for k in ("交锋", "H2H", "h2h")),
+            has_form=any(k in fund for k in ("近10场", "近 10 场", "近况", "战绩")))
+        report += "\n\n" + format_rules_manifest(mf)
+    return report
 
 
 def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
@@ -857,7 +918,15 @@ def analyze_stream(csv_text: str, fundamentals: str,
                     seen.add(n)
                     yield ("stage", n, _STAGE_NAMES[n])
         elif kind == "done":
-            yield ("done", payload)
+            # 报告末尾附规则版本指纹（审查第 35 项）：让两份同场报告的差异
+            # 能归因到「规则变了 / 输入变了 / 模型变了」三者之一。
+            fund = fundamentals or ""
+            mf = rules_manifest(
+                league_name=league,
+                has_h2h=any(k in fund for k in ("交锋", "H2H", "h2h")),
+                has_form=any(k in fund for k in
+                             ("近10场", "近 10 场", "近况", "战绩")))
+            yield ("done", payload + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)
 
@@ -865,12 +934,13 @@ def analyze_stream(csv_text: str, fundamentals: str,
 def review_blind_stream(csv_text: str, home: str, away: str, league: str,
                         effort: str = "", visitor: bool = False):
     """复盘第一遍【盲推】：只喂盘口 CSV，不给比分、不给基本面，
-    让模型从上到下正向跑 SOP 步骤 1~7 得出赛前预判（它此时并不知道结果）。
-    直接复用 analyze_stream（基本面置空），阶段名沿用精算 7 段。
+    让模型从上到下正向跑 SOP 步骤 1~8 得出赛前预判（它此时并不知道结果）。
+    直接复用 analyze_stream（基本面置空），阶段名沿用精算 8 段。
     effort: 推理强度，透传给 analyze_stream。visitor: 透传角色。
     """
     blind_note = ("（赛后复盘·第一遍盲推：本次不提供基本面与比赛结果，"
-                  "请仅依据盘口走势正向执行 SOP 步骤1~7，给出赛前预判结论。）")
+                  "请仅依据盘口走势正向执行 SOP 步骤 1~8，给出赛前预判结论"
+                  "与当时应下的投注决策。）")
     yield from analyze_stream(csv_text, blind_note, home, away, league,
                               effort=effort, visitor=visitor)
 

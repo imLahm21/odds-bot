@@ -1644,11 +1644,17 @@ def _lesson_step_apply(chat_id: int, message_id: int, token: str) -> None:
     files = "\n".join(f"  • {p}" for p in cs["files"])
     chk = ("✅ 自检通过" if not problems
            else "⚠️ 自检发现问题：\n" + "\n".join(f"  • {p}" for p in problems))
+    # 自动 commit（不 push）——推送由人工审阅后执行，见 ARCHIVING_PROTOCOL 第五节
+    ok, detail = lesson_archive.commit_changeset(cs, slug)
+    git_line = (f"📝 已自动 commit（{detail}）\n"
+                "提示：<b>未 push</b>。请 <code>git show HEAD</code> 审阅后"
+                " <code>git push origin HEAD</code>。"
+                if ok else
+                f"⚠️ 未自动提交：{detail}\n"
+                "提示：请 <code>git diff rules/实战教训/</code> 审阅后手动 commit。")
     edit_text(chat_id, message_id,
               f"✅ 已归档实战教训（案例 #{cs['case_no']}）\n\n"
-              f"落盘文件：\n{files}\n\n{chk}\n\n"
-              "提示：改动未提交 git，请 <code>git diff rules/实战教训/</code> "
-              "审阅后手动 commit。")
+              f"落盘文件：\n{files}\n\n{chk}\n\n{git_line}")
 
 
 def _lesson_date_keyboard() -> dict | None:

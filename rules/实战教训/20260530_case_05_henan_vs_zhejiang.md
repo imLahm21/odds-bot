@@ -1,4 +1,4 @@
-# 案例 21：河南 0-2 浙江（2026-05-30 中超第 15 轮）
+# 案例 23（数据存档）：河南 0-2 浙江（2026-05-30 中超第 15 轮）
 
 **比赛结果**：浙江客场 0-2 赢球赢盘（-0.25 盘客队赢盘）。
 
@@ -249,5 +249,4 @@
 
 **编号**：案例 21  
 **比赛**：河南 0-2 浙江（2026-05-30 中超第 15 轮）  
-**衍生章节**：十八、十九、二十、二十一  
-**关联 feedback**：待创建（临场④超大异动、凯利反转优先、中超单场大败、H2H+本赛季实力接近）
+**关联 feedback**：[feedback_late_stage_shift.md](feedback_late_stage_shift.md) B 节（临场④超大异动）、[feedback_kelly_signals.md](feedback_kelly_signals.md) E 节（凯利反转优先）、[feedback_csl_fundamentals.md](feedback_csl_fundamentals.md) C 节（中超单场大败）、[feedback_h2h_weight.md](feedback_h2h_weight.md) B 节（H2H+本赛季实力接近）

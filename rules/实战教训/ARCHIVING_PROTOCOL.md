@@ -83,12 +83,25 @@
 
 ---
 
-## 五、提交
+## 五、提交与推送（职责分工）
 
-- 暂存范围：仅 `rules/实战教训/`（含新数据卡、改动的主题文件、总览）。
-- **不要**暂存 `.claude/`、`report/`、`data/` 等无关或 gitignore 目录。
-- commit message 格式：`新增案例N: <对阵> — <一句话教训>（<主题缩写> <节>）`
-- 推送：`git push origin main`（当前工作流直接在 main 上迭代）。
+**机器人负责到 commit；push 由人工审阅后执行。** 三个阶段的责任人写明如下：
+
+| 阶段 | 执行者 | 完成状态 |
+|------|--------|---------|
+| ① 写文件（数据卡 / 主题文件 / 总览索引） | **机器人**（`apply_changeset`，原子落盘） | 落盘成功 ≠ 已提交 |
+| ② 自检 | **机器人**（`run_self_check`，结果随完成提示回报） | 有问题会列出，但不阻止提交 |
+| ③ `git add` + `git commit` | **机器人**（`commit_changeset`，自动执行） | 已提交 ≠ 已推送 |
+| ④ 审阅 + `git push` | **人工** | 唯一改变远端状态的一步 |
+
+- 暂存范围：**只暂存本次 changeset 列出的文件**（不用 `git add -A`），
+  避免把 `data/`、`report/`、`.claude/` 或他人改动一起卷进来。
+- commit message：`新增案例N（<主题 slug>）`，由 `commit_changeset` 自动生成。
+- 内容无变化时**不产生空提交**（重复归档同内容的场景）。
+- commit 失败不回滚已落盘的文件——文件已写成功，只是未提交；完成提示会如实告知，由人工接手。
+- **推送**：审阅 `git show HEAD` 后执行 `git push origin HEAD`。
+  > ⚠️ 不要写死 `git push origin main`：服务器与本地可能分叉（两侧都在提交），
+  > 用 `HEAD` 推当前分支；遇到分叉先 `git pull`（首次需 `git config pull.rebase false`）再推。
 
 ---
 

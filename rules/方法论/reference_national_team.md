@@ -71,7 +71,7 @@
 3. **世预赛出线含金量**：欧洲区出线难度 > 亚洲区直接出线；从强区厮杀出线的球队实力锚更高。
 
 > **用法**：把上述实力锚与盘口方向对照——**盘口与实力锚一致才可提置信度**；
-> 盘口方向与实力锚背离时，优先怀疑诱盘（见 [reference_case_lessons.md](../实战教训/reference_case_lessons.md) 第十八章），不可提置信度。
+> 盘口方向与实力锚背离时，优先怀疑诱盘（见 [feedback_strong_team_deep.md](../实战教训/feedback_strong_team_deep.md) A 节「强队深盘+高平赔冷平」），不可提置信度。
 
 ---
 
@@ -140,6 +140,6 @@
 |----------|------|
 | CLAUDE.md 步骤 1 第 5~7 条（联赛基本面读法） | 本文件为其**国家队赛事分支**：判定为国家队赛事时整体替换 5~7 条口径 |
 | [reference_competition_context.md](reference_competition_context.md)（赛事情境判断） | **姊妹文件**：本文件管国家队专属读法，情境文件管赛事阶段/赛制/俱乐部赛程情境（两者都在情境判断阶段先跑） |
-| [reference_case_lessons.md](../实战教训/reference_case_lessons.md) 第十八章（强队深盘+高平赔冷平） | 本文件第四、六章为其**基本面侧成因**；该章为盘型侧表现，配合使用 |
-| [reference_case_lessons.md](../实战教训/reference_case_lessons.md) 第十九章（升盘至深盘后临场降温=受让方可能获胜） | 本文件第六章战意研判为其**基本面侧佐证** |
+| [feedback_strong_team_deep.md](../实战教训/feedback_strong_team_deep.md) A 节（强队深盘+高平赔冷平） | 本文件第四、六章为其**基本面侧成因**；该节为盘型侧表现，配合使用 |
+| [feedback_strong_team_deep.md](../实战教训/feedback_strong_team_deep.md) B 节（受让方 +1 赢盘可升级为反胜） | 本文件第六章战意研判为其**基本面侧佐证** |
 | [reference_over_under.md](reference_over_under.md)（大小球） | 本文件第六章的「留力/默契球/保守求点球利小球」是其国家队场景的战意输入 |

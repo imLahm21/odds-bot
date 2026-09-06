@@ -363,40 +363,157 @@ def apply_changeset(changeset: dict) -> None:
 
 def run_self_check(changeset: dict, topic_slug: str,
                    lessons_dir: str = LESSONS_DIR) -> list[str]:
-    """返回问题列表（空 = 全过）。"""
+    """返回问题列表（空 = 全过）。
+
+    对齐 ARCHIVING_PROTOCOL 第四节的八项承诺。分两类：
+      · **本次变更检查**：只看这次归档写入的内容（案例号、字母节、检查项、链接）。
+      · **全库检查**：扫整个 lessons_dir（裸章节号残留）。
+    历史遗留问题不应阻塞本次归档，故全库类问题标注「[全库]」前缀以区分。
+    """
     problems = []
     overview_path = os.path.join(lessons_dir, OVERVIEW)
     topic_path = os.path.join(lessons_dir, slug_to_filename(topic_slug))
-    # 数据卡存在
+    card_name = os.path.basename(changeset["card_path"])
+
+    # ① 数据卡存在
     if not os.path.exists(changeset["card_path"]):
         problems.append("数据卡未写入")
-    # 索引表含新案例号
+
+    ov = ""
     try:
         with open(overview_path, encoding="utf-8") as f:
             ov = f.read()
-        if not re.search(rf"^\|\s*{changeset['case_no']}\s*\|", ov, re.M):
-            problems.append(f"索引表缺案例 #{changeset['case_no']} 行")
     except OSError:
         problems.append("总览读取失败")
-    # 字母节连续（无重复）
+
+    if ov:
+        case_no = changeset["case_no"]
+        # ② 索引表含新案例号
+        row = re.search(rf"^\|\s*{case_no}\s*\|.*$", ov, re.M)
+        if not row:
+            problems.append(f"索引表缺案例 #{case_no} 行")
+        else:
+            # ③ 索引行须链接到本次数据卡（三方一致的一环）
+            if card_name not in row.group(0):
+                problems.append(f"索引案例 #{case_no} 行未链接数据卡 {card_name}")
+            # ④ 索引行的主题缩写须与本次主题对得上
+            short = topic_slug.split("_")[0]
+            if short and short not in row.group(0):
+                problems.append(
+                    f"索引案例 #{case_no} 行的主题缩写与本次主题 {topic_slug} 不符")
+        # ⑤ 案例号不得重复
+        nums = re.findall(r"^\|\s*(\d+)\s*\|", ov, re.M)
+        dup = {n for n in nums if nums.count(n) > 1}
+        if dup:
+            problems.append(f"索引存在重复案例号：{sorted(dup)}")
+        # ⑥ 索引表不得被空行截断（空行会让后续行脱离表格渲染）
+        if "## 案例索引" in ov:
+            sec = ov[ov.index("## 案例索引"):]
+            if re.search(r"^\|.*\|\s*\n\s*\n\|", sec, re.M):
+                problems.append("索引表中间有空行，会截断 Markdown 表格")
+
     try:
         with open(topic_path, encoding="utf-8") as f:
             tt = f.read()
-        letters = re.findall(r"^##\s+([A-Z])\.\s", tt, re.M)
-        if len(letters) != len(set(letters)):
-            problems.append("主题文件字母节有重复")
     except OSError:
         problems.append("主题文件读取失败")
-    # 无残留裸章节号
+        tt = ""
+
+    if tt:
+        letters = re.findall(r"^##\s+([A-Z])\.\s", tt, re.M)
+        # ⑦ 字母节不重复 **且连续**（原实现只查重复，跳号查不出来）
+        if len(letters) != len(set(letters)):
+            problems.append("主题文件字母节有重复")
+        elif letters:
+            seq = sorted(letters)
+            expect = [chr(ord("A") + i) for i in range(len(seq))]
+            if seq != expect:
+                missing = [c for c in expect if c not in seq]
+                problems.append(
+                    f"主题文件字母节不连续，缺 {missing}（现有 {''.join(seq)}）")
+        # ⑧ 新增节须在「本主题检查项」补勾选项
+        letter = changeset.get("_section_letter") or changeset.get("section_letter")
+        if letter:
+            if f"## {letter}." not in tt:
+                problems.append(f"主题文件缺新增节 {letter}.")
+            m = re.search(r"##\s*本主题检查项(.*?)(?=\n##\s|\Z)", tt, re.S)
+            if not m:
+                problems.append("主题文件缺「本主题检查项」段")
+            elif not re.search(r"^- \[ \]", m.group(1), re.M):
+                problems.append("「本主题检查项」未补新勾选项")
+        # ⑨ 主题文件内部链接指向的文件须存在
+        for target in set(re.findall(r"\]\((feedback_[\w-]+\.md)\)", tt)):
+            if not os.path.exists(os.path.join(lessons_dir, target)):
+                problems.append(f"主题文件链接指向不存在的文件：{target}")
+
+    # ⑩ [全库] 无残留裸章节号
     try:
         for name in os.listdir(lessons_dir):
             if re.match(r"2026\d+_case_.*\.md", name):
                 with open(os.path.join(lessons_dir, name), encoding="utf-8") as f:
                     if re.search(r"第[一二三四五六七八九十]+[、~-]?章", f.read()):
-                        problems.append(f"{name} 含裸章节号引用")
+                        problems.append(f"[全库] {name} 含裸章节号引用")
     except OSError:
         pass
     return problems
+
+
+# ─── 归档后自动 commit（不 push）───────────────────────────────────────────────
+
+
+def commit_changeset(changeset: dict, topic_slug: str = "") -> tuple[bool, str]:
+    """把本次归档的文件 `git add` + `git commit`，**不 push**。
+
+    职责边界（ARCHIVING_PROTOCOL 第五节）：
+      机器人负责「写文件 + 提交」；**推送由人工审阅后执行**。
+      故本函数只到 commit，绝不调用 push——远端状态由人决定。
+
+    只暂存本次 changeset 里的文件（不用 `git add -A`），避免把
+    data/、report/、.claude/ 或其他人的改动一起卷进来。
+
+    返回 (成功, 说明)。任何异常都不抛出——归档已落盘成功，
+    commit 失败不应回滚文件，只需如实告知由人工接手。
+    """
+    import subprocess
+
+    paths = list(changeset.get("files", {}).keys())
+    if not paths:
+        return False, "changeset 无文件，跳过 commit"
+
+    def _git(*args: str) -> tuple[int, str]:
+        try:
+            p = subprocess.run(("git",) + args, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace",
+                               timeout=30)
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except Exception as e:            # noqa: BLE001
+            return 1, str(e)
+
+    rc, out = _git("rev-parse", "--is-inside-work-tree")
+    if rc != 0:
+        return False, "非 git 仓库，跳过 commit"
+
+    rc, out = _git("add", "--", *paths)
+    if rc != 0:
+        return False, f"git add 失败：{out.strip()[:200]}"
+
+    # 无实际差异时不产生空提交（重复归档同内容的情况）
+    rc, _ = _git("diff", "--cached", "--quiet")
+    if rc == 0:
+        return False, "文件内容无变化，未产生提交"
+
+    case_no = changeset.get("case_no", "?")
+    title = changeset.get("commit_title") or ""
+    if not title:
+        title = f"新增案例{case_no}"
+        if topic_slug:
+            title += f"（{topic_slug}）"
+    rc, out = _git("commit", "-m", title)
+    if rc != 0:
+        return False, f"git commit 失败：{out.strip()[:200]}"
+
+    rc, sha = _git("rev-parse", "--short", "HEAD")
+    return True, (sha.strip() if rc == 0 else "已提交")
 
 
 # ─── dry-run CLI 入口 ─────────────────────────────────────────────────────────

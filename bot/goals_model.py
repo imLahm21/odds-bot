@@ -520,9 +520,9 @@ def parse_csv_lines(csv_text: str) -> tuple[list[float], list[tuple],
     try:
         rows = list(_csv.DictReader(_io.StringIO(csv_text)))
     except Exception:
-        return [], [], None
+        return [], [], None, None
     if not rows:
-        return [], [], None
+        return [], [], None, None
 
     def _f(v):
         try:
