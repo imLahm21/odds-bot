@@ -542,7 +542,7 @@ def _dry_run(review_path: str) -> int:
             "away": away.replace("_", " ") or "客队",
             "league": "", "kick_cst": date_dir}
 
-    print("== 路由判断（gpt-5.5）==")
+    print("== 路由判断（重档模型）==")
     route, err = analyzer.route_lesson(report, meta["home"], meta["away"],
                                        meta["league"])
     if not route:

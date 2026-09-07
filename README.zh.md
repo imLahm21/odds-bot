@@ -127,15 +127,17 @@ probe.py             # 阶段0 探针：实测 API 真实 JSON（开发用，部
 
 LLM 精算按**档位**（而非写死模型名）路由，运行时可在 `/llm` 面板随时切换、免重启：
 
-| 档位 | 用途 | 说明 |
-|------|------|------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review`）| 推理模型 + 高强度 + 长报告；访客不可用（自动降级到平衡/轻档）|
-| 平衡 balanced | 基本面预分析 + SEO/科普段 | 轻量模型读数据出研判，与主精算职责分离 |
-| 轻档 light | 走地实时研判 | 秒级反应，最低推理档 + 短超时，不阻塞盘口快报 |
+| 档位 | 用途 | 管理员主模型 | 访客主模型 | 回退模型 |
+|------|------|--------------|------------|----------|
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review`）| `gpt-6-astra` | `grok-4.6` | `grok-4.6` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 | `gpt-5.6-sol` | `grok-4.6` | `grok-4.6` |
+| 轻档 light | 走地实时研判 | `deepseek-v4-flash` | `deepseek-v4-flash` | `deepseek-v4-flash` |
 
 - **推理强度**：`/analyze` 选完预设/自定义后再选一档（低/普通/高/极高/最高/超高）；访客仅限低/普通/高。
 - **多端点故障转移**：主端点 + 任意多个备用端点，一条不通自动切下一条；坏端点触发熔断后冷却自动恢复，熔断/恢复会 TG 告警管理员。
-- **一键回退**：新模型出问题时管理员在 `/llm` 点「↩️ 回退旧模型」一次性切回升级前方案。---
+- **一键回退**：主模型异常时，管理员在 `/llm` 点「🛟 启用回退模型」；点「✨ 恢复主模型默认」即可恢复。
+
+---
 
 ## 🎓 访客使用教程（保姆级）
 
@@ -268,16 +270,16 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 # 可选：/publish 成功后可广播的群/频道，格式「标签|chat_id」逗号分隔（-100 开头）
 # TELEGRAM_BROADCAST_TARGETS=群聊|-1001111111,频道|-1002222222
 
-# 可选：启用 /analyze LLM 精算（任意 OpenAI 兼容平台）
-LLM_BASE_URL=https://<your-openai-compatible-endpoint>/v1
+# 可选：启用 /analyze LLM 精算（IKuncode，OpenAI 兼容）
+LLM_BASE_URL=https://api.ikuncode.cc/v1
 LLM_API_KEY=你的LLM密钥
 # 可选：多端点故障转移。主端点=上面的 LLM_BASE_URL/LLM_API_KEY；这里追加备用，
-# 逗号或换行分隔、条数不限。每条格式：key|base_url|标签|重模型:轻模型
+# 逗号或换行分隔、条数不限。每条格式：key|base_url|标签[|重模型:平衡模型:轻模型]
 #   - base_url 省略 → 复用主端点 URL；标签省略 → 自动编号
-#   - 第4段「重模型:轻模型」用于某端点模型名与默认不同时声明其支持的名字
+#   - IKuncode 各 key 支持同名模型时，推荐省略第4段，统一跟随 /llm 档位
 # 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复；熔断/恢复会 TG 告警管理员。
 # ⚠️ base_url 记得带 /v1（漏了会「HTTP200 假通」）。管理员发 /llm 可测连通性并实时改熔断参数。
-# LLM_ENDPOINTS=<key>|https://<backup-endpoint>/v1|<标签>|<重模型>:<轻模型>
+# LLM_ENDPOINTS=<key>|https://api.ikuncode.cc/v1|<标签>
 
 # 可选：把精算报告一键发布到 Ghost 博客（/publish）
 # GHOST_ADMIN_API_KEY=id:secret     # Ghost 后台 Integrations 里生成

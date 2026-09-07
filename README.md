@@ -107,8 +107,8 @@ APIFOOTBALL_KEY=your-api-football-key
 TELEGRAM_BOT_TOKEN=token-from-@BotFather
 TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id,guest_chat_id
 TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
-# Optional: LLM analysis (any OpenAI-compatible platform)
-LLM_BASE_URL=https://<your-openai-compatible-endpoint>/v1
+# Optional: LLM analysis (IKuncode, OpenAI-compatible)
+LLM_BASE_URL=https://api.ikuncode.cc/v1
 LLM_API_KEY=your-llm-key
 EOF
 ```

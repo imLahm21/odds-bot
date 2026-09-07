@@ -105,10 +105,10 @@ CREATE TABLE IF NOT EXISTS llm_endpoint_state (
 
 -- 三档模型运行时选定：key=model_heavy/model_balanced/model_light，value=模型名（字符串）。
 -- 数值型 llm_settings 存不了模型名，故独立建表。默认由 config.LLM_TIER_MODELS 各档 default 灌。
--- /llm 面板切换、一键回退旧模型都写这里；缺行时 getter 回退 config 默认。
+-- /llm 面板切换、一键回退模型都写这里；缺行时 getter 回退 config 默认。
 CREATE TABLE IF NOT EXISTS llm_runtime_state (
-    key        TEXT PRIMARY KEY,             -- model_heavy / model_balanced / model_light
-    value      TEXT NOT NULL,                -- 选定的模型名
+    key        TEXT PRIMARY KEY,             -- 六个 model_* 键；另含模型方案版本标记
+    value      TEXT NOT NULL,                -- 选定的模型名或方案版本
     updated_at TEXT
 );
 
@@ -232,8 +232,8 @@ def seed_config(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO llm_settings (key, value, updated_at) "
         "VALUES (?,?,?)", llm_rows)
 
-    # 三档模型运行时选定默认值（INSERT OR IGNORE：/llm 切过的不覆盖）。
-    # 每档两份：model_<tier>（管理员）+ model_<tier>_visitor（访客），初值各取 default/visitor_default。
+    # 三档模型运行时选定默认值。每档两份：管理员 + 访客。
+    # INSERT OR IGNORE 保留现值；随后版本化迁移只改一次已知旧方案，不碰未知自定义值。
     tier_rows = []
     for tier in config.LLM_TIER_MODELS:
         tier_rows.append((f"model_{tier}", config.llm_tier_default(tier, False), now))
@@ -242,7 +242,45 @@ def seed_config(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO llm_runtime_state (key, value, updated_at) "
         "VALUES (?,?,?)", tier_rows)
+    _migrate_llm_tier_model_profile(conn, now)
     conn.commit()
+
+
+_LLM_MODEL_PROFILE_KEY = "_tier_model_profile_version"
+
+
+def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:
+    """把旧六档模型一次性迁移到当前方案，同时保留未知的自定义模型。
+
+    版本标记保证只执行一次：迁移后用户再通过 /llm 切换模型，后续重启不会覆盖。
+    返回实际改写的档位数，便于测试和诊断。
+    """
+    target_version = config.LLM_TIER_MODEL_PROFILE_VERSION
+    row = conn.execute(
+        "SELECT value FROM llm_runtime_state WHERE key=?",
+        (_LLM_MODEL_PROFILE_KEY,)).fetchone()
+    if row and row[0] == target_version:
+        return 0
+
+    current = dict(conn.execute(
+        "SELECT key, value FROM llm_runtime_state").fetchall())
+    updates = []
+    for key, upgrade_map in config.LLM_TIER_MODEL_UPGRADE_MAP.items():
+        old_value = current.get(key)
+        new_value = upgrade_map.get(old_value)
+        if new_value and new_value != old_value:
+            updates.append((new_value, now, key))
+    if updates:
+        conn.executemany(
+            "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=?",
+            updates)
+
+    conn.execute(
+        "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (_LLM_MODEL_PROFILE_KEY, target_version, now))
+    return len(updates)
 
 
 def _now_utc_iso() -> str:
@@ -459,7 +497,7 @@ def get_llm_runtime_state(conn: sqlite3.Connection) -> dict[str, str]:
 def set_llm_runtime_state(conn: sqlite3.Connection, key: str, value: str,
                           allow_any: bool = False) -> bool:
     """写单档单角色选定模型（UPSERT）。key ∈ model_<tier>[_visitor] 白名单；
-    默认校验 value ∈ 该档该角色 choices，allow_any=True 时豁免（一键回退旧模型用）。非法返回 False。"""
+    默认校验 value ∈ 该档该角色 choices，allow_any=True 时豁免（一键回退模型用）。非法返回 False。"""
     parsed = _parse_runtime_key(key)
     if parsed is None:
         return False
@@ -476,7 +514,7 @@ def set_llm_runtime_state(conn: sqlite3.Connection, key: str, value: str,
 
 
 def reset_llm_runtime_state(conn: sqlite3.Connection) -> None:
-    """把六档模型恢复为 config 的 default/visitor_default（新模型默认）。"""
+    """把六档模型恢复为 config 的 default/visitor_default（主模型默认）。"""
     now = _now_utc_iso()
     rows = []
     for tier in config.LLM_TIER_MODELS:

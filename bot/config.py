@@ -292,17 +292,17 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
 #   LLM_BASE_URL=https://api.ikuncode.cc/v1
 #   LLM_API_KEY=sk-xxx
 # LLM_MODEL 是【重档默认模型】的兼容常量：等于 LLM_TIER_MODELS["heavy"]["default"]。
-# 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 sol/5.5），
+# 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 astra/grok），
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
-LLM_MODEL = "gpt-5.6-sol"
-LLM_TIMEOUT = 300             # 秒，gpt-5.5 high 推理 + 长报告，给足超时
-LLM_MAX_TOKENS = 32000        # 报告输出上限。gpt-5.5 是推理模型，先消耗大量
+LLM_MODEL = "gpt-6-astra"
+LLM_TIMEOUT = 300             # 秒，重档推理 + 长报告，给足超时
+LLM_MAX_TOKENS = 32000        # 报告输出上限。重档模型会先消耗大量
                               # reasoning token 再写正文；规则 system prompt 约
                               # 7万字符，上限太低（曾设8000）会在推理阶段就被吃光、
                               # 正文为空 → "LLM 返回空内容"。放宽到 32000 留足空间。
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
 # key = 传给 LLM 的 reasoning_effort 值（OpenAI 兼容字段），value = TG 按钮中文标签。
-# gpt-5.5/Codex 系支持 xhigh（超高）扩展档；IKuncode 网关透传。
+# Astra/Codex 系支持 xhigh（超高）扩展档；IKuncode 网关透传。
 LLM_EFFORT_LABELS: dict[str, str] = {
     "low":    "低",
     "medium": "普通",
@@ -318,32 +318,32 @@ LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
 LLM_EFFORT_DEFAULT = "high"
 
 # ─── 三档模型（重/平衡/轻）运行时可选（TG /llm 面板切换，落 db.llm_runtime_state）──
-# 新出的 gpt-5.6 系不稳定，用户要能在新旧模型间随时切换免重启。这里是三档候选的
+# 用户要能在主模型和回退模型间随时切换免重启。这里是三档候选的
 # 【唯一真相源】：db seed 读 default 灌初值、TG 面板展示 choices 供轮换、set 时校验 val∈choices。
 #   heavy    —— 主 SOP 精算（/analyze /review）
 #   balanced —— 基本面预分析 + SEO/科普段
 #   light    —— 走地实时研判
-# visitor=True 的档访客可用（访客不能用 heavy）。
+# visitor=True 时使用该档独立的访客模型配置。
 # 每档存两份运行时选定：管理员自己用的（default/choices）+ 访客用的（visitor_default/visitor_choices）。
-# 访客不碰重模型：重档的访客候选 = 平衡/轻模型（terra/mini），默认 terra；
-# 平衡/轻档访客候选同管理员。管理员可在 /llm 面板把两份各自再调。
+# 访客重档/平衡档固定走 grok-4.6；轻档双方固定走 deepseek-v4-flash。
+# 管理员重档可在 astra/grok 间切换，平衡档可在 sol/grok 间切换。
 #   choices          —— 管理员该档可选模型
 #   visitor_choices  —— 访客该档可选模型（省略则同 choices）
 #   default          —— 管理员该档初值
 #   visitor_default  —— 访客该档初值（省略则同 default）
 LLM_TIER_MODELS: dict[str, dict] = {
-    "heavy":    {"label": "重档·主精算", "choices": ["gpt-5.6-sol", "gpt-5.5"],
+    "heavy":    {"label": "重档·主精算", "choices": ["gpt-6-astra", "grok-4.6"],
+                 "default": "gpt-6-astra",
+                 "visitor_choices": ["grok-4.6"],
+                 "visitor_default": "grok-4.6"},
+    "balanced": {"label": "平衡·基本面/SEO", "choices": ["gpt-5.6-sol", "grok-4.6"],
                  "default": "gpt-5.6-sol",
-                 "visitor_choices": ["gpt-5.6-terra", "gpt-5.4-mini"],
-                 "visitor_default": "gpt-5.6-terra"},
-    "balanced": {"label": "平衡·基本面/SEO", "choices": ["gpt-5.6-terra", "gpt-5.4-mini"],
-                 "default": "gpt-5.6-terra",
-                 "visitor_choices": ["gpt-5.6-terra", "gpt-5.4-mini"],
-                 "visitor_default": "gpt-5.6-terra"},
-    "light":    {"label": "轻档·走地", "choices": ["gpt-5.6-luna", "gpt-5.4-mini"],
-                 "default": "gpt-5.6-luna",
-                 "visitor_choices": ["gpt-5.6-luna", "gpt-5.4-mini"],
-                 "visitor_default": "gpt-5.6-luna"},
+                 "visitor_choices": ["grok-4.6"],
+                 "visitor_default": "grok-4.6"},
+    "light":    {"label": "轻档·走地", "choices": ["deepseek-v4-flash"],
+                 "default": "deepseek-v4-flash",
+                 "visitor_choices": ["deepseek-v4-flash"],
+                 "visitor_default": "deepseek-v4-flash"},
 }
 
 
@@ -361,11 +361,45 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
     if visitor:
         return spec.get("visitor_default", spec.get("default", ""))
     return spec.get("default", "")
-# 一键回退：新 5.6 三档都出问题时，管理员在 /llm 点「↩️ 回退旧模型」一次性切回升级前方案
-# ——主 SOP 用 gpt-5.5，走地/基本面/SEO 全用 gpt-5.4-mini（本功能引入前的确切行为）。
-# 回退值即便不在上面 choices 里也允许写入（回退优先级最高，见 llm_client.apply_legacy_models）。
-LLM_LEGACY_TIER_MODELS: dict[str, str] = {
-    "heavy": "gpt-5.5", "balanced": "gpt-5.4-mini", "light": "gpt-5.4-mini",
+# 一键回退：管理员在 /llm 点「启用回退模型」，六档一次性切换。
+# 当前回退方案：重/平衡=grok-4.6，轻=deepseek-v4-flash（管理员与访客相同）。
+LLM_FALLBACK_TIER_MODELS: dict[str, str] = {
+    "heavy": "grok-4.6",
+    "balanced": "grok-4.6",
+    "light": "deepseek-v4-flash",
+}
+# 兼容可能仍引用旧常量名的外部脚本；语义已改为当前回退方案。
+LLM_LEGACY_TIER_MODELS = LLM_FALLBACK_TIER_MODELS
+
+# 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
+# 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-07-gpt6-grok-deepseek-v1"
+LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
+    "model_heavy": {
+        "gpt-5.6-sol": "gpt-6-astra",
+        "gpt-5.5": "grok-4.6",
+    },
+    "model_heavy_visitor": {
+        "gpt-5.6-terra": "grok-4.6",
+        "gpt-5.5": "grok-4.6",
+        "gpt-5.4-mini": "grok-4.6",
+    },
+    "model_balanced": {
+        "gpt-5.6-terra": "gpt-5.6-sol",
+        "gpt-5.4-mini": "grok-4.6",
+    },
+    "model_balanced_visitor": {
+        "gpt-5.6-terra": "grok-4.6",
+        "gpt-5.4-mini": "grok-4.6",
+    },
+    "model_light": {
+        "gpt-5.6-luna": "deepseek-v4-flash",
+        "gpt-5.4-mini": "deepseek-v4-flash",
+    },
+    "model_light_visitor": {
+        "gpt-5.6-luna": "deepseek-v4-flash",
+        "gpt-5.4-mini": "deepseek-v4-flash",
+    },
 }
 
 # ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
@@ -413,20 +447,20 @@ LLM_SETTING_SPECS: dict[str, dict] = {
 
 # ─── 走地(滚球)实时研判专用 LLM ──────────────────────────────────────────────
 # 走地 live_brief 跑在 1min 一轮的广播循环里、是同步阻塞调用，要的是【秒级】反应。
-# gpt-5.5(推理模型)先烧大量 reasoning token 再出正文，单次可能几十秒~1min+，会拖住
+# 重档推理模型先消耗 reasoning token 再出正文，单次可能几十秒~1min+，会拖住
 # 下一轮抓取。故走地单独用轻量模型 + 最低推理档 + 短超时 + 小输出（研判仅 3~5 句）。
-# 赛前 7 步精算继续用上面的 LLM_MODEL=gpt-5.5 high 不变。
+# 赛前 7 步精算继续使用上面的重档模型。
 # LLM_LIVE_MODEL 是【轻档默认模型】兼容常量（=LLM_TIER_MODELS["light"]["default"]）；走地用。
-# 运行时实际模型由 db.llm_runtime_state 决定（/llm 可切 luna/mini），按档位路由。
-LLM_LIVE_MODEL = "gpt-5.6-luna"   # 走地轻量模型（轻档默认）
+# 运行时实际模型由 db.llm_runtime_state 决定，按档位和角色路由。
+LLM_LIVE_MODEL = "deepseek-v4-flash"  # 走地轻量模型（轻档默认）
 LLM_LIVE_EFFORT = "low"           # 走地推理强度（最低档，求快）
 LLM_LIVE_TIMEOUT = 30             # 走地超时（秒）：超过即跳过研判，不阻塞盘口快报
-LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 mini 的少量推理 + 3~5 句正文
+LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足轻档的少量推理 + 3~5 句正文
 # ─── 基本面分析（/analyze 精算前的两阶段预处理）─────────────────────────────
 # 用轻量模型先把 build_fundamentals 的原始数据（近况/交锋/赛程/积分榜）依据
 # 国家队/赛事情境/大小球方法论规则，分析成一份「基本面研判」，再喂给主 SOP 精算。
-# 好处：mini 专注读数据出研判，gpt-5.5 专注盘口精算，职责分离。
-FUND_ANALYZE_MODEL = "gpt-5.6-terra"  # 【平衡档默认模型】兼容常量；基本面/SEO 用（运行时可切）
+# 好处：平衡档专注读数据出研判，重档专注盘口精算，职责分离。
+FUND_ANALYZE_MODEL = "gpt-5.6-sol"  # 【平衡档默认模型】兼容常量；基本面/SEO 用（运行时可切）
 FUND_ANALYZE_EFFORT = "medium"        # 基本面研判要点判断，比走地 low 略高
 FUND_ANALYZE_TIMEOUT = 90             # 秒，比走地 30 长（研判内容多），比主精算 300 短
 FUND_ANALYZE_MAX_TOKENS = 4000        # 研判输出上限（走地 1200 太小，主精算 32000 太大）

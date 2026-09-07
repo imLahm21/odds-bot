@@ -3,7 +3,7 @@ LLM 精算 —— 读全量 SOP 规则 + 调 IKuncode(OpenAI 兼容) chat/comple
 
 - 规则文件进程内缓存（启动读一次）
 - 用 requests 直接打 /v1/chat/completions，不依赖 openai SDK
-- gpt-5.5 是推理模型，不传 temperature（最稳）
+- 重档模型可能是推理模型，不传 temperature（兼容性最稳）
 """
 
 import os
@@ -466,9 +466,9 @@ def distill_lesson(review_report: str, home: str, away: str,
     return out.strip(), True
 
 
-# ─── 实战教训「三写一改」归档：路由判断 + 结构化方案生成（重档 gpt-5.5）─────────
+# ─── 实战教训「三写一改」归档：路由判断 + 结构化方案生成（重档模型）────────────
 # 这两步是重逻辑活（判归入哪个主题、写规则节、联动多处），一律走 .env 的重档
-# LLM_MODEL（gpt-5.5, high），不用 distill_lesson 的轻档 mini。落盘由 lesson_archive
+# 运行时模型（high），不用 distill_lesson 的轻档模型。落盘由 lesson_archive
 # 做确定性文件编辑，编号/插入位置由代码算，LLM 只产文本内容与路由建议。
 
 _LESSONS_DIR = os.path.join("rules", "实战教训")
@@ -523,7 +523,7 @@ def load_lesson_route_context() -> str:
 
 def route_lesson(review_report: str, home: str, away: str,
                  league: str) -> tuple[dict | None, str | None]:
-    """判定新复盘教训应归入哪个 feedback_*.md 主题。重档 gpt-5.5。
+    """判定新复盘教训应归入哪个 feedback_*.md 主题。使用重档模型。
 
     返回 (dict, None) 成功 / (None, 原因) 失败——调用方据此降级为仅存数据卡。
     dict: {recommended: slug, candidates: [slug...], reason: str,
@@ -591,7 +591,7 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
                          topic_file_text: str, *, section_letter: str,
                          is_new_topic: bool = False
                          ) -> tuple[dict | None, str | None]:
-    """产出「三写一改」的结构化文本方案。重档 gpt-5.5。
+    """产出「三写一改」的结构化文本方案。使用重档模型。
 
     编号（案例#、case_NN、字母节）由 lesson_archive 计算后回填占位符——这里只让
     LLM 用给定的 section_letter 写内容。返回 (plan_dict, None) 或 (None, 原因)。

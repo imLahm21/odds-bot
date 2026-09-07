@@ -98,10 +98,10 @@ def _parse_model_map(spec: str) -> dict:
     兼容 2 段（旧）与 3 段（新）：
       - 空/缺省 → {}（该端点不映射，各档用运行时选定模型）
       - 2 段「重:轻」（旧格式）→ {"heavy":重, "light":轻}（平衡档回退运行时选定，不破坏老配置）
-        例 "gpt-5.5:gpt-5-codex"
+        例 "gpt-6-astra:deepseek-v4-flash"
       - 3 段「重:平衡:轻」（新格式）→ {"heavy":重, "balanced":平衡, "light":轻}
-        例 "gpt-5.5:gpt-5.6-terra:gpt-5-codex"
-      - 空段跳过：如 "gpt-5.5::gpt-5-codex"=只映射重和轻；"gpt-5.5"=只映射重
+        例 "gpt-6-astra:gpt-5.6-sol:deepseek-v4-flash"
+      - 空段跳过：如 "gpt-6-astra::deepseek-v4-flash"=只映射重和轻
     """
     spec = (spec or "").strip()
     if not spec:
@@ -127,10 +127,11 @@ def _parse_model_map(spec: str) -> dict:
 
 def _parse_endpoints() -> list[dict]:
     """主端点 = LLM_BASE_URL/LLM_API_KEY（0 号，向后兼容）。
-    追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条 `key|base_url|标签|重模型:轻模型`：
+    追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条
+    `key|base_url|标签|重模型:平衡模型:轻模型`：
       - base_url 省略 → 复用主端点 URL（用户「通常同一 base_url」的场景）
       - 标签省略 → 自动编号「端点N」
-      - 第 4 段（模型映射）省略 → 不映射，两档都用全局默认（向后兼容）
+      - 第 4 段（模型映射）省略 → 不映射，三档都用运行时选定模型
     条数不限（想加几条加几条）。按 (key, base_url) 去重，避免同一端点被重复探测/统计。
     """
     main_url = clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
@@ -176,7 +177,7 @@ def _sig(ep: dict) -> str:
 
 
 # ─── 三档模型运行时选定（DB 懒加载，TG 改后 reload_runtime_models 失效）─────────
-# 按【档位 tier】路由，不再靠模型名判定——模型运行时可切（重档可能 sol 也可能 5.5），
+# 按【档位 tier】路由，不再靠模型名判定——模型运行时可切（如 astra/grok），
 # 名字比较会失效。tier ∈ heavy/balanced/light。
 _runtime_models: dict[str, str] | None = None
 _runtime_lock = threading.Lock()
@@ -244,25 +245,32 @@ def set_tier_model(tier: str, model: str, visitor: bool = False) -> bool:
     return ok
 
 
-def apply_legacy_models() -> None:
-    """一键回退旧模型：六档（管理员+访客）一次性写成 config.LLM_LEGACY_TIER_MODELS
-    （重=gpt-5.5、平衡/轻=gpt-5.4-mini），免重启。回退值豁免 choices 校验（allow_any）。"""
+def apply_fallback_models() -> None:
+    """一键启用回退模型：六档一次性写成 config.LLM_FALLBACK_TIER_MODELS。
+
+    当前为重/平衡=grok-4.6、轻=deepseek-v4-flash（管理员与访客相同），免重启。
+    """
     try:
         conn = db.get_conn()
         try:
-            for tier, model in config.LLM_LEGACY_TIER_MODELS.items():
+            for tier, model in config.LLM_FALLBACK_TIER_MODELS.items():
                 db.set_llm_runtime_state(conn, f"model_{tier}", model, allow_any=True)
                 db.set_llm_runtime_state(conn, f"model_{tier}_visitor", model,
                                          allow_any=True)
         finally:
             conn.close()
     except Exception as e:
-        log.warning("一键回退旧模型失败: %s", e)
+        log.warning("一键启用回退模型失败: %s", e)
     reload_runtime_models()
 
 
+def apply_legacy_models() -> None:
+    """兼容旧调用名；行为等同 apply_fallback_models。"""
+    apply_fallback_models()
+
+
 def reset_runtime_models() -> None:
-    """恢复六档为新模型默认（管理员 sol/terra/luna + 访客 terra/terra/luna），免重启。"""
+    """恢复六档主模型默认（管理员 astra/sol/deepseek，访客 grok/grok/deepseek）。"""
     try:
         conn = db.get_conn()
         try:
@@ -952,7 +960,7 @@ def _save_probe(idx: int, res: dict) -> dict:
 def probe(idx: int, which: str = "heavy") -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
     which ∈ heavy/balanced/light：测哪档——按该档运行时选定模型 + 端点映射解析真实模型名
-    （Anyrouter 测重→gpt-5.5、测平衡/轻→其映射值）。
+    （端点有映射时测映射模型，否则测该角色当前档位模型）。
     返回 {ok, http_status, latency_ms, model, req_model, which, error, breaker_state}。
     max_tokens 用 16（而非 1）：部分推理模型对过小预算会 400，16 既够连通判定又极廉价。
     纯诊断——不喂 Breaker，避免健康检查污染故障转移的错误率。

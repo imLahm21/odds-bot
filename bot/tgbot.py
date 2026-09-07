@@ -80,7 +80,7 @@ def _submit_for_chat(chat_id: int, fn, *args) -> None:
 
 # ─── 通用后台池：给「重但无需中断」的内联操作用（命令最高优先级的关键）──────────
 # 命令/停止键走 per-chat 单线程执行器（秒回）。但若在那里直接跑耗时的内联 LLM/网络
-# 活（/llm 连通性测试、教训归档的 gpt-5.5 路由/编排、/publish 的 SEO+Ghost 发文、
+# 活（/llm 连通性测试、教训归档的重档模型路由/编排、/publish 的 SEO+Ghost 发文、
 # 群广播），会占死该 chat 的唯一工作线程——分析期间用户发的命令、点的停止键全排在
 # 后面，这正是「推算时命令无响应」的根因之一。故把这些重内联活丢到本多线程池异步跑，
 # per-chat 工作线程点完即回，命令与停止/新建始终即时响应，且能与正在跑的分析并行。
@@ -2177,7 +2177,7 @@ def _broadcast_do(chat_id: int, message_id: int, token: str) -> None:
 
 
 def _tier_model_label(chat_id: int, tier: str = "heavy") -> str:
-    """该 chat 身份下某档【当前选定模型名】，供进度提示显示（不再写死 gpt-5.5）。
+    """该 chat 身份下某档【当前选定模型名】，供进度提示动态显示。
     显示的是档位选定模型（主力端点跟随面板即用它）；若某次故障转移落到端点映射钉死的
     兜底端点，实际模型可能不同，但对跟随面板的主力端点这就是准确值。"""
     return llm_client.get_tier_model(tier, visitor=not _is_admin(chat_id))
@@ -2364,7 +2364,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         log.warning("基本面拉取失败: %s", e)
         funds = "（基本面拉取失败）"
 
-    # 精算阶段不再用轻量模型预处理基本面：主 SOP（gpt-5.5）的 system prompt 已
+    # 精算阶段不再用轻量模型预处理基本面：主 SOP 重档模型的 system prompt 已
     # 加载国家队/赛事情境/大小球等全套规则，有能力直接分析原始基本面并并入推算。
     # 故把原始基本面数据直接喂主 SOP，由重模型一次性完成基本面研判 + 盘口精算，
     # 省去一次轻量调用与等待。（第一步展示的轻量概述仅供用户预览，与此独立。）
@@ -2951,6 +2951,12 @@ def _llm_panel_text() -> str:
         lines.append(f"· {spec['label']}\n"
                      f"　管理员：<b>{cur_a}</b>　访客：<b>{cur_v}</b>")
 
+    lines.append("\n<b>🛟 回退模型</b>（点下方按钮一次性启用）")
+    for tier, spec in config.LLM_TIER_MODELS.items():
+        fallback = config.LLM_FALLBACK_TIER_MODELS[tier]
+        lines.append(f"· {spec['label']}\n"
+                     f"　管理员：<b>{fallback}</b>　访客：<b>{fallback}</b>")
+
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():
         cur = _fmt_num(settings.get(key, spec["default"]))
@@ -3011,8 +3017,7 @@ def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
         rows.append(param_row)
 
     # 模型档位切换区：每档一行两个按钮——管理员那份(lmt:<tier>:<idx>) + 访客那份(lmt:<tier>:<idx>:v)。
-    # 各自在自己角色的候选里轮换到下一个（访客候选可能与管理员不同，如重档访客只有 terra/mini）。
-    # 当前值不在候选里（如已回退旧模型）时点一下切到首个候选。
+    # 各自在自己角色的候选里轮换到下一个；当前值不在候选里时点一下切到首个候选。
     for tier in config.LLM_TIER_MODELS:
         row = []
         for vis in (False, True):
@@ -3030,9 +3035,9 @@ def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
 
     rows.append([{"text": "🔄 刷新", "callback_data": "lm:"},
                  {"text": "↩️ 参数恢复默认", "callback_data": "lx:reset"}])
-    # 模型档位专用：回退旧模型 / 恢复新模型默认
-    rows.append([{"text": "🛟 回退旧模型(5.5+mini)", "callback_data": "lmt:legacy"},
-                 {"text": "✨ 恢复新模型默认", "callback_data": "lmt:reset"}])
+    # 保留 lmt:legacy 回调值，兼容更新前已经发到 Telegram 的旧面板按钮。
+    rows.append([{"text": "🛟 启用回退模型", "callback_data": "lmt:legacy"},
+                 {"text": "✨ 恢复主模型默认", "callback_data": "lmt:reset"}])
     return {"inline_keyboard": rows}
 
 
@@ -3056,17 +3061,19 @@ def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
     """处理模型档位回调：
       lmt:<tier>:<idx>     切某档【管理员】那份到该角色候选[idx]
       lmt:<tier>:<idx>:v   切某档【访客】那份
-      lmt:legacy           一键回退旧模型（管理员+访客都设：重=5.5、平衡/轻=mini）
-      lmt:reset            恢复新模型默认（管理员 sol/terra/luna + 访客 terra/terra/luna）
+      lmt:legacy           一键启用回退模型（双方重/平衡=grok、轻=deepseek）
+      lmt:reset            恢复主模型默认（管理员 astra/sol/deepseek，访客 grok/grok/deepseek）
     """
     if data == "lmt:legacy":
-        llm_client.apply_legacy_models()
-        answer_callback(cb_id, "已回退旧模型：重=gpt-5.5，平衡/轻=gpt-5.4-mini（管理员+访客）")
+        llm_client.apply_fallback_models()
+        answer_callback(
+            cb_id,
+            "已启用回退模型：重/平衡=grok-4.6，轻=deepseek-v4-flash（管理员+访客）")
         _llm_refresh(chat_id, message_id)
         return
     if data == "lmt:reset":
         llm_client.reset_runtime_models()
-        answer_callback(cb_id, "已恢复新模型默认")
+        answer_callback(cb_id, "已恢复主模型默认")
         _llm_refresh(chat_id, message_id)
         return
     # lmt:<tier>:<idx>[:v]
@@ -3497,7 +3504,7 @@ def handle_callback(cb: dict) -> None:
             edit_text(chat_id, message_id, "已跳过，未归档实战教训。")
             return
         answer_callback(cb_id, "判断归属中…")
-        # gpt-5.5 路由判断较慢，丢后台池，不占死该 chat 工作线程（命令仍即时响应）
+        # 重档路由判断较慢，丢后台池，不占死该 chat 工作线程（命令仍即时响应）
         _submit_bg(_lesson_step_route, chat_id, message_id, token)  # 三写一改向导第1步
         return
 
@@ -3512,7 +3519,7 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "参数错误")
             return
         answer_callback(cb_id, "生成方案中…")
-        # gpt-5.5 编排归档方案较慢，丢后台池，不占死该 chat 工作线程
+        # 重档编排归档方案较慢，丢后台池，不占死该 chat 工作线程
         _submit_bg(_lesson_step_compose, chat_id, message_id, token, slug_choice)
         return
 
@@ -3569,7 +3576,7 @@ def handle_callback(cb: dict) -> None:
             browse["date"], existing=True)
         path = os.path.join(directory, browse["files"][idx])
         answer_callback(cb_id, "归档中…")
-        # 读报告 + gpt-5.5 路由较慢，丢后台池，不占死该 chat 工作线程
+        # 读报告 + 重档路由较慢，丢后台池，不占死该 chat 工作线程
         _submit_bg(_lesson_archive_from_file, chat_id, message_id, path)
         return
 
