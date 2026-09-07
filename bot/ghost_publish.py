@@ -358,8 +358,12 @@ def report_to_post(report_md: str, *, title: str | None = None,
     seo_err：LLM 概括失败原因（成功为 None）；调用方可据此先发 TG 提示再正常发布。
     付费墙：第 7 节「最终精算结论」之前免费，之后付费。
     """
+    from . import analyzer
+
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
     text = _ARCHIVE_LINE_RE.sub("", text)   # 剥掉「> 归档路径：…」行，不进发布正文
+    # 规则指纹区块只作本地溯源，不进公开文章（HTML 注释虽不渲染，但会留在页面源码里）
+    text = analyzer.strip_rules_manifest(text)
 
     # 队名/赛事等元信息始终从完整原文提取（复盘的「## 比赛/赛事」在第一步盲推开头）。
     meta_src = text

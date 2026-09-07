@@ -7,6 +7,7 @@ LLM 精算 —— 读全量 SOP 规则 + 调多供应商 OpenAI 兼容 chat/comp
 """
 
 import os
+import re
 import math
 import logging
 
@@ -149,19 +150,52 @@ def rules_manifest(league_name: str = "", has_h2h: bool = True,
             "budget": config.RULE_CONTEXT_BUDGET}
 
 
+# 规则指纹注释的起始标记。旧格式（首行注释 + 两行可见引用块）也以它开头，
+# 故 strip 正则对新旧两种归档都生效。
+_MANIFEST_OPEN = "<!-- rules_manifest 规则版本（可追溯性，审查第 35 项）"
+
+# 剥离规则指纹区块，供人可见的出口用（TG 纯文本、Ghost/微信发布正文）。
+# 两种形态都吃掉：
+#   新：`<!-- rules_manifest … {json} -->` 单个注释
+#   旧：`<!-- 规则版本…-->` 后紧跟若干 `> **规则集**/> 内容指纹/> ⚠️ …` 引用行
+_MANIFEST_RE = re.compile(
+    r"(?m)^[ \t]*<!--[ \t]*(?:rules_manifest|规则版本)[\s\S]*?-->[ \t]*$\n?"
+    r"(?:^[ \t]*>.*(?:规则集|内容指纹|超预算丢弃|缺失文件).*$\n?)*")
+
+
+def strip_rules_manifest(text: str) -> str:
+    """去掉报告末尾的规则指纹区块（含历史归档里的旧可见格式）。
+
+    归档文件保留该区块作溯源依据；TG 显示与对外发布都要剥掉——
+    TG 是纯文本，HTML 注释会原样露出；发布正文不该带内部规则指纹。
+    """
+    return _MANIFEST_RE.sub("", text).rstrip() + "\n"
+
+
 def format_rules_manifest(mf: dict) -> str:
-    """把 rules_manifest 渲染成报告末尾的可追溯区块。"""
-    lines = ["<!-- 规则版本（可追溯性，审查第 35 项）-->",
-             f"> **规则集**：{len(mf['files'])} 个文件、{mf['total_chars']:,} 字符"
-             f"（预算 {mf['budget']:,}）"]
-    if mf["dropped"]:
-        lines.append(f"> ⚠️ **超预算丢弃**：{'、'.join(mf['dropped'])}")
-    miss = [i["file"] for i in mf["files"] if i["sha"] == "MISSING"]
-    if miss:
-        lines.append(f"> ⚠️ **缺失文件**：{'、'.join(miss)}")
-    lines.append("> 内容指纹：" + "、".join(
-        f"{i['file'].split('/')[-1]}@{i['sha']}" for i in mf["files"]))
-    return "\n".join(lines)
+    """把 rules_manifest 渲染成报告末尾的可追溯区块。
+
+    整块包进**单个 HTML 注释**：Markdown 渲染器（归档 md 预览、Ghost 的
+    markdown→html）会原样保留但不显示，故「机器可见、人不可见」。
+    早先版本只有首行是注释、`> **规则集**…` 两行是可见引用块，会露在报告正文末尾。
+
+    注释体内为单行 JSON（键名 ASCII），便于脚本 `json.loads` 直接取用，
+    不必再解析中文标签。`-->` 在 JSON 字符串里转义成 `--\\u003e`，
+    避免文件名意外提前闭合注释。
+    """
+    import json
+    payload = {
+        "schema": "rules_manifest/1",
+        "budget": mf["budget"],
+        "total_chars": mf["total_chars"],
+        "dropped": mf["dropped"],
+        "missing": [i["file"] for i in mf["files"] if i["sha"] == "MISSING"],
+        "files": [{"file": i["file"], "sha": i["sha"], "chars": i["chars"]}
+                  for i in mf["files"]],
+    }
+    body = json.dumps(payload, ensure_ascii=False,
+                      separators=(",", ":")).replace("-->", "--\\u003e")
+    return f"{_MANIFEST_OPEN} {body} -->"
 
 
 def load_live_rules() -> str:

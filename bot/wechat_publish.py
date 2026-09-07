@@ -274,6 +274,7 @@ def report_to_wx_article(report_md: str, home: str, away: str,
 
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
     text = _ARCHIVE_LINE_RE.sub("", text)
+    text = analyzer.strip_rules_manifest(text)   # 规则指纹不进公众号正文
 
     # 只喂免费正文（第 7 节「最终精算结论」之前）给 LLM——天然不含下注结论。
     pm = re.search(r"(?m)^\#{3}\s*7\s*[\.、]?\s*最终精算结论", text)
