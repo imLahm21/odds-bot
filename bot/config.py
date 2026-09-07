@@ -288,9 +288,10 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
                               # 外键，不随 CLEANUP_DAYS 的子查询一起清，需独立保留期
 
 # ─── LLM 精算 (/analyze) ─────────────────────────────────────────────────────
-# IKuncode（OpenAI 兼容），从 .env 读：
-#   LLM_BASE_URL=https://api.ikuncode.cc/v1
+# 多供应商 OpenAI 兼容端点，从 .env 读；当前主端点仅承载官方 Luna：
+#   LLM_BASE_URL=https://api.openai.com/v1
 #   LLM_API_KEY=sk-xxx
+#   LLM_SUPPORTED_MODELS=gpt-5.6-luna
 # LLM_MODEL 是【重档默认模型】的兼容常量：等于 LLM_TIER_MODELS["heavy"]["default"]。
 # 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 astra/grok），
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
@@ -325,7 +326,7 @@ LLM_EFFORT_DEFAULT = "high"
 #   light    —— 走地实时研判
 # visitor=True 时使用该档独立的访客模型配置。
 # 每档存两份运行时选定：管理员自己用的（default/choices）+ 访客用的（visitor_default/visitor_choices）。
-# 访客重档/平衡档固定走 grok-4.6；轻档双方固定走 deepseek-v4-flash。
+# 访客重档/平衡档固定走 deepseek-v4-flash；轻档双方默认走 OpenAI 官方 Luna。
 # 管理员重档可在 astra/grok 间切换，平衡档可在 sol/grok 间切换。
 #   choices          —— 管理员该档可选模型
 #   visitor_choices  —— 访客该档可选模型（省略则同 choices）
@@ -334,16 +335,17 @@ LLM_EFFORT_DEFAULT = "high"
 LLM_TIER_MODELS: dict[str, dict] = {
     "heavy":    {"label": "重档·主精算", "choices": ["gpt-6-astra", "grok-4.6"],
                  "default": "gpt-6-astra",
-                 "visitor_choices": ["grok-4.6"],
-                 "visitor_default": "grok-4.6"},
-    "balanced": {"label": "平衡·基本面/SEO", "choices": ["gpt-5.6-sol", "grok-4.6"],
-                 "default": "gpt-5.6-sol",
-                 "visitor_choices": ["grok-4.6"],
-                 "visitor_default": "grok-4.6"},
-    "light":    {"label": "轻档·走地", "choices": ["deepseek-v4-flash"],
-                 "default": "deepseek-v4-flash",
                  "visitor_choices": ["deepseek-v4-flash"],
                  "visitor_default": "deepseek-v4-flash"},
+    "balanced": {"label": "平衡·基本面/SEO", "choices": ["gpt-5.6-sol", "grok-4.6"],
+                 "default": "gpt-5.6-sol",
+                 "visitor_choices": ["deepseek-v4-flash"],
+                 "visitor_default": "deepseek-v4-flash"},
+    "light":    {"label": "轻档·走地",
+                 "choices": ["gpt-5.6-luna", "glm-5.3-flash"],
+                 "default": "gpt-5.6-luna",
+                 "visitor_choices": ["gpt-5.6-luna", "glm-5.3-flash"],
+                 "visitor_default": "gpt-5.6-luna"},
 }
 
 
@@ -362,43 +364,105 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
         return spec.get("visitor_default", spec.get("default", ""))
     return spec.get("default", "")
 # 一键回退：管理员在 /llm 点「启用回退模型」，六档一次性切换。
-# 当前回退方案：重/平衡=grok-4.6，轻=deepseek-v4-flash（管理员与访客相同）。
-LLM_FALLBACK_TIER_MODELS: dict[str, str] = {
-    "heavy": "grok-4.6",
-    "balanced": "grok-4.6",
-    "light": "deepseek-v4-flash",
+# 当前回退方案按角色分别配置，全部走 IKuncode。
+LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
+    "heavy": {
+        "admin": "grok-4.6",
+        "visitor": "deepseek-v4-flash",
+    },
+    "balanced": {
+        "admin": "grok-4.6",
+        "visitor": "deepseek-v4-flash",
+    },
+    "light": {
+        "admin": "glm-5.3-flash",
+        "visitor": "glm-5.3-flash",
+    },
 }
-# 兼容可能仍引用旧常量名的外部脚本；语义已改为当前回退方案。
-LLM_LEGACY_TIER_MODELS = LLM_FALLBACK_TIER_MODELS
+
+
+def llm_tier_fallback(tier: str, visitor: bool = False) -> str:
+    """取某档某角色的一键回退模型。"""
+    spec = LLM_FALLBACK_TIER_MODELS.get(tier, {})
+    return spec.get("visitor" if visitor else "admin", "")
+
+
+# 兼容旧外部脚本：旧常量只代表管理员侧；bot 内部使用 llm_tier_fallback。
+LLM_LEGACY_TIER_MODELS = {
+    tier: spec["admin"] for tier, spec in LLM_FALLBACK_TIER_MODELS.items()
+}
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
 # 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
-LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-07-gpt6-grok-deepseek-v1"
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-07-role-split-luna-v3"
+
+# 精确识别上一版方案，解决 deepseek-v4-flash 在上一版中同时可能表示主轻档或
+# 回退轻档的歧义：主方案升级到 Luna，回退方案升级到 GLM Flash。
+LLM_TIER_MODEL_PROFILE_UPGRADES: list[
+        tuple[dict[str, str], dict[str, str]]] = [
+    (
+        {
+            "model_heavy": "gpt-6-astra",
+            "model_heavy_visitor": "grok-4.6",
+            "model_balanced": "gpt-5.6-sol",
+            "model_balanced_visitor": "grok-4.6",
+            "model_light": "deepseek-v4-flash",
+            "model_light_visitor": "deepseek-v4-flash",
+        },
+        {
+            "model_heavy": "gpt-6-astra",
+            "model_heavy_visitor": "deepseek-v4-flash",
+            "model_balanced": "gpt-5.6-sol",
+            "model_balanced_visitor": "deepseek-v4-flash",
+            "model_light": "gpt-5.6-luna",
+            "model_light_visitor": "gpt-5.6-luna",
+        },
+    ),
+    (
+        {
+            "model_heavy": "grok-4.6",
+            "model_heavy_visitor": "grok-4.6",
+            "model_balanced": "grok-4.6",
+            "model_balanced_visitor": "grok-4.6",
+            "model_light": "deepseek-v4-flash",
+            "model_light_visitor": "deepseek-v4-flash",
+        },
+        {
+            "model_heavy": "grok-4.6",
+            "model_heavy_visitor": "deepseek-v4-flash",
+            "model_balanced": "grok-4.6",
+            "model_balanced_visitor": "deepseek-v4-flash",
+            "model_light": "glm-5.3-flash",
+            "model_light_visitor": "glm-5.3-flash",
+        },
+    ),
+]
+
 LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
     "model_heavy": {
         "gpt-5.6-sol": "gpt-6-astra",
         "gpt-5.5": "grok-4.6",
     },
     "model_heavy_visitor": {
-        "gpt-5.6-terra": "grok-4.6",
-        "gpt-5.5": "grok-4.6",
-        "gpt-5.4-mini": "grok-4.6",
+        "gpt-5.6-terra": "deepseek-v4-flash",
+        "gpt-5.5": "deepseek-v4-flash",
+        "gpt-5.4-mini": "deepseek-v4-flash",
+        "grok-4.6": "deepseek-v4-flash",
     },
     "model_balanced": {
         "gpt-5.6-terra": "gpt-5.6-sol",
         "gpt-5.4-mini": "grok-4.6",
     },
     "model_balanced_visitor": {
-        "gpt-5.6-terra": "grok-4.6",
-        "gpt-5.4-mini": "grok-4.6",
+        "gpt-5.6-terra": "deepseek-v4-flash",
+        "gpt-5.4-mini": "deepseek-v4-flash",
+        "grok-4.6": "deepseek-v4-flash",
     },
     "model_light": {
-        "gpt-5.6-luna": "deepseek-v4-flash",
-        "gpt-5.4-mini": "deepseek-v4-flash",
+        "gpt-5.4-mini": "glm-5.3-flash",
     },
     "model_light_visitor": {
-        "gpt-5.6-luna": "deepseek-v4-flash",
-        "gpt-5.4-mini": "deepseek-v4-flash",
+        "gpt-5.4-mini": "glm-5.3-flash",
     },
 }
 
@@ -452,10 +516,10 @@ LLM_SETTING_SPECS: dict[str, dict] = {
 # 赛前 7 步精算继续使用上面的重档模型。
 # LLM_LIVE_MODEL 是【轻档默认模型】兼容常量（=LLM_TIER_MODELS["light"]["default"]）；走地用。
 # 运行时实际模型由 db.llm_runtime_state 决定，按档位和角色路由。
-LLM_LIVE_MODEL = "deepseek-v4-flash"  # 走地轻量模型（轻档默认）
+LLM_LIVE_MODEL = "gpt-5.6-luna"     # 走地轻量模型（OpenAI 官方轻档默认）
 LLM_LIVE_EFFORT = "low"           # 走地推理强度（最低档，求快）
 LLM_LIVE_TIMEOUT = 30             # 走地超时（秒）：超过即跳过研判，不阻塞盘口快报
-LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足轻档的少量推理 + 3~5 句正文
+LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 Luna 的少量推理 + 3~5 句正文
 # ─── 基本面分析（/analyze 精算前的两阶段预处理）─────────────────────────────
 # 用轻量模型先把 build_fundamentals 的原始数据（近况/交锋/赛程/积分榜）依据
 # 国家队/赛事情境/大小球方法论规则，分析成一份「基本面研判」，再喂给主 SOP 精算。

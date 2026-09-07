@@ -5,7 +5,7 @@ analyzer.py 只负责构造 prompt，真正的 HTTP 调用、重试、失败隔�
 设计对标 cc switch 的「多供应商 + 熔断」思路，落到本项目的既有模式：
 
   - 多端点来自 .env（secret 不落库）：主 LLM_BASE_URL/LLM_API_KEY 为 0 号端点，
-    LLM_ENDPOINTS 追加更多（key|base_url|标签，base_url 省略则复用主端点 URL）。
+    LLM_ENDPOINTS 追加更多；可声明支持模型，不支持的请求直接跳过且不污染熔断。
     多 key 轮换/标记坏点/切换的模式移植自 api_client.py 的 _switch_key/api_get。
   - 每端点一个内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），9 个可调参数
     来自 db.llm_settings（TG /llm 面板实时改，免重启），缺库/缺键回退 config 默认。
@@ -98,10 +98,10 @@ def _parse_model_map(spec: str) -> dict:
     兼容 2 段（旧）与 3 段（新）：
       - 空/缺省 → {}（该端点不映射，各档用运行时选定模型）
       - 2 段「重:轻」（旧格式）→ {"heavy":重, "light":轻}（平衡档回退运行时选定，不破坏老配置）
-        例 "gpt-6-astra:deepseek-v4-flash"
+        例 "gpt-6-astra:gpt-5.6-luna"
       - 3 段「重:平衡:轻」（新格式）→ {"heavy":重, "balanced":平衡, "light":轻}
-        例 "gpt-6-astra:gpt-5.6-sol:deepseek-v4-flash"
-      - 空段跳过：如 "gpt-6-astra::deepseek-v4-flash"=只映射重和轻
+        例 "gpt-6-astra:gpt-5.6-sol:gpt-5.6-luna"
+      - 空段跳过：如 "gpt-6-astra::gpt-5.6-luna"=只映射重和轻
     """
     spec = (spec or "").strip()
     if not spec:
@@ -125,21 +125,35 @@ def _parse_model_map(spec: str) -> dict:
     return m
 
 
+def _parse_supported_models(spec: str) -> set[str] | None:
+    """解析端点支持模型列表（冒号分隔）；空值或 * 表示不限制、兼容旧配置。"""
+    names = {name.strip() for name in (spec or "").split(":")
+             if name.strip()}
+    if not names or "*" in names:
+        return None
+    return names
+
+
 def _parse_endpoints() -> list[dict]:
     """主端点 = LLM_BASE_URL/LLM_API_KEY（0 号，向后兼容）。
     追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条
-    `key|base_url|标签|重模型:平衡模型:轻模型`：
+    `key|base_url|标签|模型映射|支持模型列表`：
       - base_url 省略 → 复用主端点 URL（用户「通常同一 base_url」的场景）
       - 标签省略 → 自动编号「端点N」
       - 第 4 段（模型映射）省略 → 不映射，三档都用运行时选定模型
+      - 第 5 段（冒号分隔）声明该端点支持的模型；不在列表就直接跳过且不计故障
+    主端点用 LLM_SUPPORTED_MODELS 声明能力；空值保持旧行为（视为支持全部模型）。
     条数不限（想加几条加几条）。按 (key, base_url) 去重，避免同一端点被重复探测/统计。
     """
     main_url = clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
     main_key = clean_header_value(os.getenv("LLM_API_KEY", ""))
+    main_supported = _parse_supported_models(
+        os.getenv("LLM_SUPPORTED_MODELS", ""))
     eps: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    def _add(key: str, url: str, label: str, model_map: dict) -> None:
+    def _add(key: str, url: str, label: str, model_map: dict,
+             supported_models: set[str] | None) -> None:
         if not (key and url):
             return
         sig = (key, url)
@@ -147,10 +161,11 @@ def _parse_endpoints() -> list[dict]:
             return
         seen.add(sig)
         eps.append({"key": key, "base_url": url, "label": label,
-                    "model_map": model_map})
+                    "model_map": model_map,
+                    "supported_models": supported_models})
 
     if main_url and main_key:
-        _add(main_key, main_url, "主端点", {})   # 主端点默认不映射
+        _add(main_key, main_url, "主端点", {}, main_supported)
 
     raw = os.getenv("LLM_ENDPOINTS", "")
     for item in re.split(r"[,\n]", raw):
@@ -163,7 +178,9 @@ def _parse_endpoints() -> list[dict]:
                if len(parts) > 1 and parts[1] else main_url)
         label = parts[2] if len(parts) > 2 and parts[2] else f"端点{len(eps) + 1}"
         model_map = _parse_model_map(parts[3]) if len(parts) > 3 else {}
-        _add(key, url, label, model_map)
+        supported_models = _parse_supported_models(
+            parts[4] if len(parts) > 4 else "")
+        _add(key, url, label, model_map, supported_models)
     return eps
 
 
@@ -246,17 +263,18 @@ def set_tier_model(tier: str, model: str, visitor: bool = False) -> bool:
 
 
 def apply_fallback_models() -> None:
-    """一键启用回退模型：六档一次性写成 config.LLM_FALLBACK_TIER_MODELS。
-
-    当前为重/平衡=grok-4.6、轻=deepseek-v4-flash（管理员与访客相同），免重启。
-    """
+    """一键启用按角色配置的六档回退模型，免重启。"""
     try:
         conn = db.get_conn()
         try:
-            for tier, model in config.LLM_FALLBACK_TIER_MODELS.items():
-                db.set_llm_runtime_state(conn, f"model_{tier}", model, allow_any=True)
-                db.set_llm_runtime_state(conn, f"model_{tier}_visitor", model,
-                                         allow_any=True)
+            for tier in config.LLM_FALLBACK_TIER_MODELS:
+                admin_model = config.llm_tier_fallback(tier, False)
+                visitor_model = config.llm_tier_fallback(tier, True)
+                db.set_llm_runtime_state(
+                    conn, f"model_{tier}", admin_model, allow_any=True)
+                db.set_llm_runtime_state(
+                    conn, f"model_{tier}_visitor", visitor_model,
+                    allow_any=True)
         finally:
             conn.close()
     except Exception as e:
@@ -270,7 +288,7 @@ def apply_legacy_models() -> None:
 
 
 def reset_runtime_models() -> None:
-    """恢复六档主模型默认（管理员 astra/sol/deepseek，访客 grok/grok/deepseek）。"""
+    """恢复主模型默认（管理员 astra/sol/luna，访客 deepseek/deepseek/luna）。"""
     try:
         conn = db.get_conn()
         try:
@@ -294,15 +312,25 @@ def _resolve_model(tier: str, ep: dict, visitor: bool = False) -> str:
     return get_tier_model(tier, visitor)
 
 
+def _supports_model(ep: dict, model: str) -> bool:
+    """端点是否声明支持该模型；未声明时为向后兼容视为支持全部。"""
+    supported = ep.get("supported_models")
+    return supported is None or model in supported
+
+
 def available() -> bool:
     """至少有一个可用端点（key + base_url 齐全）。"""
     return bool(_ENDPOINTS)
 
 
 def endpoints() -> list[dict]:
-    """只读端点列表（label/base_url/model_map，不含 key）供 TG 面板展示。"""
+    """只读端点列表（含模型映射/能力，不含 key）供 TG 面板展示。"""
     return [{"label": e["label"], "base_url": e["base_url"],
-             "model_map": e.get("model_map") or {}} for e in _ENDPOINTS]
+             "model_map": e.get("model_map") or {},
+             "supported_models": (sorted(e["supported_models"])
+                                  if e.get("supported_models") is not None
+                                  else None)}
+            for e in _ENDPOINTS]
 
 
 # ─── 端点手动开关（DB 懒加载，TG 改后 reload_endpoint_state 失效）────────────
@@ -718,15 +746,21 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
     all_timeout = True            # 是否全部端点都是超时类失败
+    eligible_count = 0            # 声明支持本次真实模型的已启用端点数
+    requested_models: set[str] = set()
     for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
+        # 先按档位×角色解析真实模型；端点未声明支持时直接跳过，不请求、不污染熔断。
+        model = _resolve_model(tier, ep, visitor)
+        requested_models.add(model)
+        if not _supports_model(ep, model):
+            continue
+        eligible_count += 1
         br = _breakers[idx]
         if not br.allow():
             labeled.append(f"{ep['label']}熔断跳过")
             all_timeout = False
             continue
-        # 每端点按档位解析真实模型名（运行时选定 + 端点映射；Anyrouter 轻档→gpt-5-codex 等）
-        payload = _payload(_resolve_model(tier, ep, visitor), system, user,
-                           tok, effort, False)
+        payload = _payload(model, system, user, tok, effort, False)
         content, ok, err, was_to, rate_limited = _do_chat(
             ep, payload, read_to, max_retries)
         # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
@@ -744,6 +778,10 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
         if enabled_count() == 0:
             return ("LLM 请求失败（所有端点均被手动停用，请用 /llm 面板开启至少"
                     "一个端点）")
+        if eligible_count == 0:
+            models = "、".join(sorted(requested_models)) or "当前模型"
+            return (f"LLM 请求失败（已启用端点均未声明支持：{models}；"
+                    "请检查 .env 的支持模型列表）")
         return ("LLM 请求失败（所有端点均处于熔断中，暂无可用端点，"
                 "请稍后重试或用 /llm 重置熔断）")
     if len(_ENDPOINTS) == 1:
@@ -893,14 +931,19 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     tok = max_tokens or config.LLM_MAX_TOKENS
 
     last_err = None
+    eligible_count = 0
+    requested_models: set[str] = set()
     for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
+        model = _resolve_model(tier, ep, visitor)
+        requested_models.add(model)
+        if not _supports_model(ep, model):
+            continue
+        eligible_count += 1
         br = _breakers[idx]
         if not br.allow():
             last_err = f"{ep['label']} 熔断中（已跳过）"
             continue
-        # 按档位×角色解析真实模型名（运行时选定 + 端点映射）
-        payload = _payload(_resolve_model(tier, ep, visitor), system, user,
-                           tok, effort, True)
+        payload = _payload(model, system, user, tok, effort, True)
         produced = False        # 是否已向用户吐过正文 delta
         failed_pre = False      # 首字节前失败 → 可切下一端点
         for ev in _stream_one(ep, payload, first_byte_to, idle_to,
@@ -931,6 +974,10 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
             continue   # 首字节前失败/限流，尝试下一端点
     if last_err is None and enabled_count() == 0:
         yield ("error", "LLM 全部端点均被手动停用（请用 /llm 面板开启至少一个端点）")
+        return
+    if last_err is None and eligible_count == 0:
+        models = "、".join(sorted(requested_models)) or "当前模型"
+        yield ("error", f"LLM 已启用端点均未声明支持：{models}（请检查 .env）")
         return
     yield ("error", last_err or "LLM 全部端点不可用（请用 /llm 测试/重置端点）")
 
@@ -977,12 +1024,20 @@ def probe(idx: int, which: str = "heavy") -> dict:
                 "error": "端点序号越界", "breaker_state": "-"}
     ep = _ENDPOINTS[idx]
     req_model = _resolve_model(which, ep)   # which 即档位
+    bstate = _breakers[idx].state
+    if not _supports_model(ep, req_model):
+        return _save_probe(idx, {
+            "ok": False, "skipped": True, "http_status": None,
+            "latency_ms": 0, "model": "", "req_model": req_model,
+            "which": which,
+            "error": "端点未声明支持该模型，未发请求",
+            "breaker_state": bstate,
+        })
     st = get_settings()
     probe_to = min(30, int(st["non_stream_timeout"]))   # 探针用短超时，不等满
     payload = {"model": req_model,
                "messages": [{"role": "user", "content": "ping"}],
                "max_tokens": 16}
-    bstate = _breakers[idx].state
     t0 = monotonic()
     try:
         r = requests.post(f"{ep['base_url']}/chat/completions",

@@ -265,11 +265,24 @@ def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:
     current = dict(conn.execute(
         "SELECT key, value FROM llm_runtime_state").fetchall())
     updates = []
-    for key, upgrade_map in config.LLM_TIER_MODEL_UPGRADE_MAP.items():
-        old_value = current.get(key)
-        new_value = upgrade_map.get(old_value)
-        if new_value and new_value != old_value:
-            updates.append((new_value, now, key))
+    matched_profile = False
+    for old_profile, new_profile in config.LLM_TIER_MODEL_PROFILE_UPGRADES:
+        if all(current.get(key) == value
+               for key, value in old_profile.items()):
+            matched_profile = True
+            for key, new_value in new_profile.items():
+                if current.get(key) != new_value:
+                    updates.append((new_value, now, key))
+            break
+
+    # 非完整已知方案（例如用户只手调过一档）按无歧义的单值映射升级；
+    # deepseek 的主/回退歧义只由上面的完整方案匹配处理，混合自定义值保持原样。
+    if not matched_profile:
+        for key, upgrade_map in config.LLM_TIER_MODEL_UPGRADE_MAP.items():
+            old_value = current.get(key)
+            new_value = upgrade_map.get(old_value)
+            if new_value and new_value != old_value:
+                updates.append((new_value, now, key))
     if updates:
         conn.executemany(
             "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=?",

@@ -2889,6 +2889,8 @@ def _fmt_last_probe(idx: int) -> str:
     tier = _WHICH_ZH.get(r.get("which", "heavy"), "")
     req = r.get("req_model", "")
     when = _ago_zh(r["ts"]) if r.get("ts") else ""
+    if r.get("skipped"):
+        return f"　上次测试：⏭️ {tier} {req} · 不支持，未发请求（{when}）"
     if r["ok"]:
         return (f"　上次测试：✅ {tier} {req} · {r['latency_ms']}ms（{when}）").rstrip()
     status = r["http_status"] if r.get("http_status") is not None else "无响应"
@@ -2936,11 +2938,16 @@ def _llm_panel_text() -> str:
             mm_line = "　映射：" + " ".join(parts)
         else:
             mm_line = "　映射：默认（跟随各档运行时选定模型）"
+        supported = ep.get("supported_models")
+        support_line = ("　支持：" + "、".join(supported)
+                        if supported is not None
+                        else "　支持：未声明（兼容全部模型）")
         lines.append(
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
             f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
             f"  {mm_line}\n"
+            f"  {support_line}\n"
             f"{_fmt_last_probe(i)}")
 
     # 模型档位段：每档两份（管理员/访客），当前选定模型
@@ -2953,9 +2960,10 @@ def _llm_panel_text() -> str:
 
     lines.append("\n<b>🛟 回退模型</b>（点下方按钮一次性启用）")
     for tier, spec in config.LLM_TIER_MODELS.items():
-        fallback = config.LLM_FALLBACK_TIER_MODELS[tier]
+        fallback_a = config.llm_tier_fallback(tier, False)
+        fallback_v = config.llm_tier_fallback(tier, True)
         lines.append(f"· {spec['label']}\n"
-                     f"　管理员：<b>{fallback}</b>　访客：<b>{fallback}</b>")
+                     f"　管理员：<b>{fallback_a}</b>　访客：<b>{fallback_v}</b>")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():
@@ -3061,14 +3069,14 @@ def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
     """处理模型档位回调：
       lmt:<tier>:<idx>     切某档【管理员】那份到该角色候选[idx]
       lmt:<tier>:<idx>:v   切某档【访客】那份
-      lmt:legacy           一键启用回退模型（双方重/平衡=grok、轻=deepseek）
-      lmt:reset            恢复主模型默认（管理员 astra/sol/deepseek，访客 grok/grok/deepseek）
+      lmt:legacy           一键启用按角色配置的回退模型
+      lmt:reset            恢复主模型默认（管理员 astra/sol/luna，访客 deepseek/deepseek/luna）
     """
     if data == "lmt:legacy":
         llm_client.apply_fallback_models()
         answer_callback(
             cb_id,
-            "已启用回退模型：重/平衡=grok-4.6，轻=deepseek-v4-flash（管理员+访客）")
+            "已启用回退：管理=grok/grok/glm，访客=deepseek/deepseek/glm")
         _llm_refresh(chat_id, message_id)
         return
     if data == "lmt:reset":
@@ -3105,6 +3113,8 @@ def _fmt_probe_line(r: dict) -> str:
     tier = _WHICH_ZH.get(r.get("which", "heavy"), "")
     req = r.get("req_model", "")
     label = f"{r['label']} {tier} {req}".strip()
+    if r.get("skipped"):
+        return f"⏭️ {label}：端点未声明支持，未发请求"
     if r["ok"]:
         model = f" · 应答 {r['model']}" if r.get("model") else ""
         return f"✅ {label}：HTTP {r['http_status']} · {r['latency_ms']}ms{model}"

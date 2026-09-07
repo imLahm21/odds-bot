@@ -129,9 +129,9 @@ LLM 精算按**档位**（而非写死模型名）路由，运行时可在 `/llm
 
 | 档位 | 用途 | 管理员主模型 | 访客主模型 | 回退模型 |
 |------|------|--------------|------------|----------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review`）| `gpt-6-astra` | `grok-4.6` | `grok-4.6` |
-| 平衡 balanced | 基本面预分析 + SEO/科普段 | `gpt-5.6-sol` | `grok-4.6` | `grok-4.6` |
-| 轻档 light | 走地实时研判 | `deepseek-v4-flash` | `deepseek-v4-flash` | `deepseek-v4-flash` |
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review`）| `gpt-6-astra` | `deepseek-v4-flash` | 管理员 `grok-4.6`；访客 `deepseek-v4-flash` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 | `gpt-5.6-sol` | `deepseek-v4-flash` | 管理员 `grok-4.6`；访客 `deepseek-v4-flash` |
+| 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` | 双方 `glm-5.3-flash` |
 
 - **推理强度**：`/analyze` 选完预设/自定义后再选一档（低/普通/高/极高/最高/超高）；访客仅限低/普通/高。
 - **多端点故障转移**：主端点 + 任意多个备用端点，一条不通自动切下一条；坏端点触发熔断后冷却自动恢复，熔断/恢复会 TG 告警管理员。
@@ -270,16 +270,19 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 # 可选：/publish 成功后可广播的群/频道，格式「标签|chat_id」逗号分隔（-100 开头）
 # TELEGRAM_BROADCAST_TARGETS=群聊|-1001111111,频道|-1002222222
 
-# 可选：启用 /analyze LLM 精算（IKuncode，OpenAI 兼容）
-LLM_BASE_URL=https://api.ikuncode.cc/v1
-LLM_API_KEY=你的LLM密钥
+# OpenAI 官方主端点只承载 Luna
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=你的OpenAI官方密钥
+LLM_SUPPORTED_MODELS=gpt-5.6-luna
 # 可选：多端点故障转移。主端点=上面的 LLM_BASE_URL/LLM_API_KEY；这里追加备用，
-# 逗号或换行分隔、条数不限。每条格式：key|base_url|标签[|重模型:平衡模型:轻模型]
+# 逗号或换行分隔、条数不限。每条格式：
+# key|base_url|标签|可选模型映射|支持模型列表
 #   - base_url 省略 → 复用主端点 URL；标签省略 → 自动编号
-#   - IKuncode 各 key 支持同名模型时，推荐省略第4段，统一跟随 /llm 档位
+#   - 第4段留空表示跟随 /llm 档位；第5段用冒号列出该端点支持的模型
+#   - 不支持的模型会直接跳过，不发请求、不计故障、不触发熔断
 # 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复；熔断/恢复会 TG 告警管理员。
 # ⚠️ base_url 记得带 /v1（漏了会「HTTP200 假通」）。管理员发 /llm 可测连通性并实时改熔断参数。
-# LLM_ENDPOINTS=<key>|https://api.ikuncode.cc/v1|<标签>
+# LLM_ENDPOINTS=<IKUNCODE_KEY>|https://api.ikuncode.cc/v1|Codex||gpt-6-astra:gpt-5.6-sol:deepseek-v4-flash:grok-4.6:glm-5.3-flash
 
 # 可选：把精算报告一键发布到 Ghost 博客（/publish）
 # GHOST_ADMIN_API_KEY=id:secret     # Ghost 后台 Integrations 里生成

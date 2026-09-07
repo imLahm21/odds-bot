@@ -1,5 +1,5 @@
 """
-LLM 精算 —— 读全量 SOP 规则 + 调 IKuncode(OpenAI 兼容) chat/completions
+LLM 精算 —— 读全量 SOP 规则 + 调多供应商 OpenAI 兼容 chat/completions
 
 - 规则文件进程内缓存（启动读一次）
 - 用 requests 直接打 /v1/chat/completions，不依赖 openai SDK
