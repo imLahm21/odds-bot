@@ -24,6 +24,7 @@ import re
 import time
 import logging
 import threading
+from html import escape as _html_escape
 
 import requests
 from dotenv import load_dotenv
@@ -44,11 +45,12 @@ _ARCHIVE_LINE_RE = re.compile(r"(?m)^\s*>?\s*归档路径[：:].*$\n?")
 
 # ── 合规黑名单：任何博彩/操盘术语命中即拦截，不存草稿 ──
 # 面向大陆法规——公众号文章只能是纯基本面 + 球迷观点，不得涉赌。
-# 用词边界宽松匹配（含中英文庄家名、盘口/水位/凯利/让球/大小球/下注引导等）。
+# 高置信术语可直接匹配；「一球/两球/大球/上盘」等同时可能出现在正常足球叙述
+# 中的词，必须连同盘口语境匹配，避免误杀「一球小胜」「加拿大球员」「场上盘带」。
 _BANNED_PATTERNS = [
-    r"让球", r"受让", r"平手盘", r"半球", r"一球", r"球半", r"两球",
+    r"让球", r"受让", r"平手盘",
     r"亚盘", r"欧赔", r"欧指", r"盘口", r"水位", r"凯利", r"返还率",
-    r"大小球", r"大球", r"小球", r"上盘", r"下盘", r"初盘", r"临场盘",
+    r"大小球", r"初盘", r"临场盘",
     r"诱盘", r"诱上", r"诱下", r"阻盘", r"给水", r"降盘", r"升盘",
     r"下注", r"投注", r"注额", r"串关", r"串[0-9]", r"押注", r"稳胆",
     r"庄家", r"操盘", r"资金流向", r"赔率",
@@ -57,9 +59,47 @@ _BANNED_PATTERNS = [
 ]
 _BANNED_RE = re.compile("|".join(f"(?:{p})" for p in _BANNED_PATTERNS))
 
+# 盘口档位和方向词有正常语义，不能再做无条件子串扫描：
+#   - 正常：一球小胜、净胜两球、足球半决赛、加拿大球员、小球员、场上盘带
+#   - 涉盘：主让一球、一球盘、一球/球半、看好大球、上盘方向
+_HANDICAP_TERM = (
+    r"(?:平手|平\s*[/／]\s*半|平半|半球|半\s*[/／]\s*一|半一|"
+    r"一球(?:\s*[/／]\s*球半)?|球半|两球(?:\s*[/／]\s*两球半)?|两球半)"
+)
+_MARKET_SIDE_TERM = r"(?:大球|小球|上盘|下盘)"
+_CONTEXTUAL_BANNED_PATTERNS = [
+    # 斜杠复合档位本身就是盘口写法。
+    r"一球\s*[/／]\s*球半",
+    r"平\s*[/／]\s*半",
+    r"半\s*[/／]\s*一",
+    # 无斜杠档位必须伴随明确的让步/盘口上下文。
+    rf"(?:主|客)?(?:让|受让)\s*{_HANDICAP_TERM}",
+    rf"{_HANDICAP_TERM}\s*(?:盘|盘口|高水|中水|低水|满水|让步|档位)",
+    # 大小/上下盘方向必须伴随明确市场动作，避免跨词误命中。
+    rf"{_MARKET_SIDE_TERM}\s*(?:方向|玩法|盘口|水位|赔率|选择|推荐|打出|赢盘|输盘)",
+    rf"(?:看好|倾向|选择|推荐|追|买)\s*{_MARKET_SIDE_TERM}",
+]
+_CONTEXTUAL_BANNED_RE = re.compile(
+    "|".join(f"(?:{p})" for p in _CONTEXTUAL_BANNED_PATTERNS))
+
 
 class WechatError(Exception):
     """微信接口业务错误或合规拦截，message 已是可读文案。"""
+
+
+class ComplianceError(WechatError):
+    """合规扫描错误；生成已完成时同时携带可恢复的标题和 HTML 源稿。"""
+
+    def __init__(self, hits: list[str] | tuple[str, ...], *, title: str = "",
+                 content_html: str = ""):
+        self.hits = tuple(sorted(set(hits)))
+        self.title = title
+        self.content_html = content_html
+        shown = ", ".join(self.hits[:12])
+        suffix = " 等" if len(self.hits) > 12 else ""
+        super().__init__(
+            "合规扫描拦截：正文/标题命中疑似博彩术语 "
+            f"{shown}{suffix}。已阻止存草稿。")
 
 
 def available() -> bool:
@@ -150,14 +190,11 @@ def _compliance_scan(*texts: str) -> None:
     这是发到公众号前的最后一道闸，防 LLM 偶尔漏词把涉赌内容发出去。"""
     hits: list[str] = []
     for t in texts:
-        for m in _BANNED_RE.finditer(t or ""):
-            hits.append(m.group(0))
+        for pattern in (_BANNED_RE, _CONTEXTUAL_BANNED_RE):
+            for m in pattern.finditer(t or ""):
+                hits.append(m.group(0))
     if hits:
-        uniq = sorted(set(hits))
-        raise WechatError(
-            "合规扫描拦截：正文/标题命中疑似博彩术语 "
-            f"{', '.join(uniq[:12])}"
-            f"{' 等' if len(uniq) > 12 else ''}。已阻止存草稿，请检查报告或重试。")
+        raise ComplianceError(hits)
 
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -181,6 +218,47 @@ def _md_to_wx_html(md_text: str) -> str:
             '<p style="margin:0 0 20px;font-size:16px;line-height:1.85;'
             f'color:#3a3a3a;letter-spacing:0.3px">{inner}</p>')
     return "\n".join(out)
+
+
+def editable_source_document(title: str, content_html: str) -> str:
+    """把微信正文片段包装成可直接下载、浏览和编辑的 UTF-8 HTML 源稿。"""
+    safe_title = _html_escape(title or "微信公众号草稿")
+    return (
+        "<!doctype html>\n"
+        '<html lang="zh-CN">\n<head>\n'
+        '  <meta charset="utf-8"/>\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n'
+        f"  <title>{safe_title}</title>\n"
+        "</head>\n"
+        '<body style="max-width:720px;margin:24px auto;padding:0 16px;">\n'
+        "<!-- 微信公众号可编辑正文开始 -->\n"
+        f"{content_html}\n"
+        "<!-- 微信公众号可编辑正文结束 -->\n"
+        "</body>\n</html>\n"
+    )
+
+
+def save_editable_source(report_path: str, title: str,
+                         content_html: str) -> tuple[str, bytes]:
+    """在原报告旁的 wechat_drafts/ 保存唯一版本，并返回绝对路径与文件字节。"""
+    report_abs = os.path.abspath(report_path)
+    out_dir = os.path.join(os.path.dirname(report_abs), "wechat_drafts")
+    os.makedirs(out_dir, exist_ok=True)
+
+    stem = os.path.splitext(os.path.basename(report_abs))[0]
+    for suffix in ("_report", "_review"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    nonce = f"{time.time_ns() % 1_000_000_000:09d}"
+    filename = f"{stem}_wechat_{stamp}_{nonce}.html"
+    out_path = os.path.join(out_dir, filename)
+    payload = editable_source_document(title, content_html).encode("utf-8")
+    # 唯一文件名 + xb：重试只新增版本，绝不覆盖之前可编辑的源稿。
+    with open(out_path, "xb") as f:
+        f.write(payload)
+    return out_path, payload
 
 
 def report_to_wx_article(report_md: str, home: str, away: str,
@@ -223,6 +301,12 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     highlights = result.get("highlights") or []
     prediction = result.get("prediction") or {}
 
+    # 先渲染无副作用的 HTML。若合规扫描拦截，把生成结果附在异常上，调用方仍可
+    # 保存/回传源稿供人工编辑；这里只阻止进微信草稿箱，不再销毁生成成果。
+    wx_html = _build_article_html(
+        title, subtitle, lead, sections, compare, highlights, prediction,
+        home or "主队", away or "客队", league or "足球", kick)
+
     # 合规双闸：正则黑名单扫描所有 LLM 产出文本
     scan_texts = [title, subtitle, lead,
                   prediction.get("score", ""), prediction.get("note", "")]
@@ -232,11 +316,12 @@ def report_to_wx_article(report_md: str, home: str, away: str,
         scan_texts += [row.get("item", ""), row.get("home", ""), row.get("away", "")]
     for h in highlights:
         scan_texts += [h.get("label", ""), h.get("value", "")]
-    _compliance_scan(*scan_texts)
-
-    wx_html = _build_article_html(
-        title, subtitle, lead, sections, compare, highlights, prediction,
-        home or "主队", away or "客队", league or "足球", kick)
+    try:
+        _compliance_scan(*scan_texts)
+    except ComplianceError as e:
+        e.title = title[:64]
+        e.content_html = wx_html
+        raise
     return title[:64], wx_html
 
 

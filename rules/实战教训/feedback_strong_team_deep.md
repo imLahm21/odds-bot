@@ -86,4 +86,4 @@ aliases:
 - 军规 #11（初盘合适+升盘=诱上）→ `reference_asian_handicap.md` 第十二章；本卡为其杯赛/胜平负侧补充
 - 大小球与亚盘深度联动 → `reference_over_under.md` 第四章（A4 为其细化）
 - 国家队基本面读法 → `reference_national_team.md` 第四、六章
-- 案例：England 0-0 Ghana（A，复盘 `report/2026-06-24/England_vs_Ghana_review.md`）、Ecuador 2-1 Germany（B，复盘 `report/2026-06-26/Ecuador_vs_Germany_review.md`）、Brazil 1-2 Norway（C，存档 [20260706_case_06_brazil_vs_norway.md](20260706_case_06_brazil_vs_norway.md)）
+- 案例：England 0-0 Ghana（A，复盘 `report/2026/06/2026-06-24/England_vs_Ghana_review.md`）、Ecuador 2-1 Germany（B，复盘 `report/2026/06/2026-06-26/Ecuador_vs_Germany_review.md`）、Brazil 1-2 Norway（C，存档 [20260706_case_06_brazil_vs_norway.md](20260706_case_06_brazil_vs_norway.md)）

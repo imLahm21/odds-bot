@@ -585,6 +585,7 @@ if __name__ == "__main__":
     import sys
     args = [a for a in sys.argv[1:] if a != "--dry-run"]
     if not args:
-        print("用法：python -m bot.lesson_archive --dry-run <report/日期/xxx_review.md>")
+        print("用法：python -m bot.lesson_archive --dry-run "
+              "<report/年/月/日期/xxx_review.md>")
         raise SystemExit(2)
     raise SystemExit(_dry_run(args[0]))

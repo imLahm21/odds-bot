@@ -30,7 +30,7 @@ import requests
 from dotenv import load_dotenv
 
 from . import (config, db, api_client, analyzer, llm_client, ghost_publish,
-               wechat_publish, lesson_archive)
+               wechat_publish, lesson_archive, report_paths)
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -226,7 +226,8 @@ _pending_fixarg: dict[int, str] = {}
 _FIXARG_CMDS = {"review", "analyze", "coverage", "export", "live", "unlive"}
 
 # ─── /publish 发布到 Ghost 博客的会话状态（仅管理员）──────────────────────────
-# 浏览态：chat_id -> {"date": 日期, "files": [文件名列表]}。/publish 选日期后置位，
+# 浏览态：chat_id -> {"date": 日期, "dir": 实际目录, "files": [文件名列表]}。
+# /publish 选日期后置位，
 # 供 pf:<idx> 把短索引映射回文件名（避免长文件名塞进 callback_data 64 字节）。
 _publish_browse: dict[int, dict] = {}
 # 待发布态：token -> {"path", "is_review", "title"}。选定报告后生成短 token，
@@ -239,7 +240,7 @@ _publish_lock = threading.Lock()
 
 # ─── /wxpublish 存微信公众号草稿的会话状态（仅管理员）─────────────────────────
 # 复用 /publish 的选日期→选报告流程，但回调前缀独立（wd:/wf:）避免与 Ghost 冲突。
-# 浏览态：chat_id -> {"date", "files"}；wf:<idx> 映射回文件名后直接存草稿。
+# 浏览态：chat_id -> {"date", "dir", "files"}；wf:<idx> 映射回文件名后直接存草稿。
 _wxpublish_browse: dict[int, dict] = {}
 
 # ─── /review 复盘后「可选归档为实战教训」的会话状态（仅管理员）──────────────────
@@ -252,7 +253,7 @@ _wxpublish_browse: dict[int, dict] = {}
 #      → lc:<token>:go 确认原子落盘 / lc:<token>:no 取消。
 _lesson_pending: dict[str, dict] = {}
 _lesson_lock = threading.Lock()
-# /lesson 独立命令的浏览态：chat_id -> {"date", "files"}。选日期(ld:)后置位，
+# /lesson 独立命令的浏览态：chat_id -> {"date", "dir", "files"}。选日期(ld:)后置位，
 # lf:<idx> 把短索引映射回复盘报告文件名（避免长文件名塞进 callback_data）。
 _lesson_browse: dict[int, dict] = {}
 
@@ -371,13 +372,13 @@ def clear_alert_dedup(dedup_key: str) -> None:
 
 
 def send_document(chat_id: int, filename: str, content: bytes,
-                  caption: str = "") -> None:
+                  caption: str = "", mime_type: str = "text/csv") -> None:
     """以文件形式发送（multipart 上传）。content 为文件字节。"""
     try:
         requests.post(
             f"{API_BASE}/sendDocument",
             data={"chat_id": chat_id, "caption": caption},
-            files={"document": (filename, content, "text/csv")},
+            files={"document": (filename, content, mime_type)},
             timeout=60)
     except requests.exceptions.RequestException as e:
         log.warning("sendDocument 失败: %s", e)
@@ -1423,21 +1424,44 @@ def _send_long(chat_id: int, text: str, plain: bool = True) -> None:
         text = text[cut:].lstrip("\n")
 
 
+_REPORT_ROOT = "report"
+
+
+def _report_base(chat_id: int | None = None) -> str:
+    """管理员与访客各自的报告根目录。"""
+    if chat_id is not None and not _is_admin(chat_id):
+        return os.path.join(_REPORT_ROOT, "visitors", str(chat_id))
+    return _REPORT_ROOT
+
+
+def _report_date_dir(value: str, chat_id: int | None = None, *,
+                     existing: bool = False) -> str:
+    """取年月日期目录；existing=True 时兼容读取旧的 report/<日期>/。"""
+    base = _report_base(chat_id)
+    if existing:
+        return report_paths.resolve_date_dir(base, value)
+    return report_paths.canonical_date_dir(base, value)
+
+
 def _report_path(meta: dict, suffix: str = "report",
-                 chat_id: int | None = None) -> str:
+                 chat_id: int | None = None, *,
+                 existing: bool = False) -> str:
     """拼归档报告路径（纯路径，不建目录、不写文件），供归档与读取共用，
     避免路径规则两处漂移。
-    - 管理员（或 chat_id 缺省）：report/<开球日期>/<主队>_vs_<客队>_<suffix>.md
-    - 访客：report/visitors/<chat_id>/<开球日期>/<...>.md
+    - 管理员：report/<年>/<月>/<开球日期>/<主队>_vs_<客队>_<suffix>.md
+    - 访客：report/visitors/<chat_id>/<年>/<月>/<开球日期>/<...>.md
+    existing=True 仅用于读取，会逐文件回退兼容旧扁平目录。
     """
-    import os
-    date = (meta.get("kick_cst") or "")[:10] or "未知日期"
+    value = (meta.get("kick_cst") or "")[:10] or "未知日期"
     teams = f"{meta['home']}_vs_{meta['away']}".replace(" ", "_")
-    if chat_id is not None and not _is_admin(chat_id):
-        out_dir = os.path.join("report", "visitors", str(chat_id), date)
-    else:
-        out_dir = os.path.join("report", date)
-    return os.path.join(out_dir, f"{teams}_{suffix}.md")
+    filename = f"{teams}_{suffix}.md"
+    base = _report_base(chat_id)
+    if existing:
+        for directory in report_paths.date_dir_candidates(base, value):
+            candidate = os.path.join(directory, filename)
+            if os.path.isfile(candidate):
+                return candidate
+    return os.path.join(report_paths.canonical_date_dir(base, value), filename)
 
 
 def _archive_report(meta: dict, report: str, suffix: str = "report",
@@ -1465,7 +1489,7 @@ def _load_blind_forecast(meta: dict, chat_id: int | None = None) -> str | None:
     """
     import os
     for suffix in ("review_blind", "review"):
-        path = _report_path(meta, suffix, chat_id)
+        path = _report_path(meta, suffix, chat_id, existing=True)
         if not os.path.exists(path):
             continue
         try:
@@ -1683,23 +1707,17 @@ def _lesson_step_apply(chat_id: int, message_id: int, token: str) -> None:
 
 
 def _lesson_date_keyboard() -> dict | None:
-    """扫 report/ 下含【复盘报告(_review.md)】的日期目录，构造日期选择键盘。
+    """扫 report/<年>/<月>/<日期>/ 下的复盘报告，构造日期选择键盘。
     只有对照复盘(_review.md)才有比分归因可提炼教训，纯精算(_report.md)不列。
     无则返回 None。回调 ld:<date>。"""
     import os
-    base = "report"
-    if not os.path.isdir(base):
-        return None
     dates = []
-    for name in os.listdir(base):
-        d = os.path.join(base, name)
-        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
-            n = len([f for f in os.listdir(d) if f.endswith("_review.md")])
-            if n:
-                dates.append((name, n))
+    for value, directory in report_paths.iter_date_dirs(_REPORT_ROOT):
+        n = len([f for f in os.listdir(directory) if f.endswith("_review.md")])
+        if n:
+            dates.append((value, n))
     if not dates:
         return None
-    dates.sort(reverse=True)
     rows = [[{"text": f"{date}（{n}）", "callback_data": f"ld:{date}"}]
             for date, n in dates]
     return {"inline_keyboard": rows}
@@ -1709,14 +1727,14 @@ def _lesson_report_keyboard(chat_id: int, date: str) -> dict | None:
     """列某日期下所有复盘报告(_review.md)，构造选择键盘。回调 lf:<idx>。
     文件名列表暂存 _lesson_browse[chat_id]，idx 映射回文件名。"""
     import os
-    d = os.path.join("report", date)
+    d = _report_date_dir(date, existing=True)
     if not os.path.isdir(d):
         return None
     files = sorted(f for f in os.listdir(d) if f.endswith("_review.md"))
     if not files:
         return None
     with _lesson_lock:
-        _lesson_browse[chat_id] = {"date": date, "files": files}
+        _lesson_browse[chat_id] = {"date": date, "dir": d, "files": files}
     rows = []
     for idx, fname in enumerate(files):
         label = fname[:-len("_review.md")].replace("_", " ") + "（复盘）"
@@ -1752,7 +1770,7 @@ def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
     fname = os.path.basename(path)
     stem = fname[:-len("_review.md")] if fname.endswith("_review.md") else fname
     home, _, away = stem.partition("_vs_")
-    date_dir = os.path.basename(os.path.dirname(path))   # report/<date>/
+    date_dir = os.path.basename(os.path.dirname(path))   # report/<年>/<月>/<date>/
     m = re.match(r"\d{4}-\d{2}-\d{2}", date_dir)
     meta = {"home": home.replace("_", " ") or "主队",
             "away": away.replace("_", " ") or "客队",
@@ -1764,24 +1782,17 @@ def _lesson_archive_from_file(chat_id: int, message_id: int, path: str) -> None:
 
 
 def _publish_date_keyboard(page: int = 0) -> dict | None:
-    """扫描 report/ 下日期子目录，构造日期选择键盘（倒序，含当日报告数，分页）。
+    """扫描 report/<年>/<月>/<日期>/，构造日期选择键盘（倒序、计数、分页）。
     每个日期一行 pd:<date>；底部一行翻页 pdp:<page>。无任何报告时返回 None。
     日期会随天数累积变长，故分页——与 /leagues 面板同一套翻页约定。"""
     import os
-    base = "report"
-    if not os.path.isdir(base):
-        return None
     dates = []
-    for name in os.listdir(base):
-        d = os.path.join(base, name)
-        # 仅取形如 2026-06-12 的日期目录（排除 visitors 等）
-        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
-            n = len([f for f in os.listdir(d) if f.endswith(".md")])
-            if n:
-                dates.append((name, n))
+    for value, directory in report_paths.iter_date_dirs(_REPORT_ROOT):
+        n = len([f for f in os.listdir(directory) if f.endswith(".md")])
+        if n:
+            dates.append((value, n))
     if not dates:
         return None
-    dates.sort(reverse=True)   # 最新日期在前
 
     per_page = config.PUBLISH_DATES_PER_PAGE
     pages = max(1, (len(dates) + per_page - 1) // per_page)
@@ -1806,14 +1817,14 @@ def _publish_report_keyboard(chat_id: int, date: str) -> dict | None:
     """列某日期目录下所有 *.md，构造报告选择键盘。回调 pf:<idx>。
     把文件名列表暂存 _publish_browse[chat_id]，idx 映射回文件名。"""
     import os
-    d = os.path.join("report", date)
+    d = _report_date_dir(date, existing=True)
     if not os.path.isdir(d):
         return None
     files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
     if not files:
         return None
     with _publish_lock:
-        _publish_browse[chat_id] = {"date": date, "files": files}
+        _publish_browse[chat_id] = {"date": date, "dir": d, "files": files}
     rows = []
     for idx, fname in enumerate(files):
         # Mexico_vs_South_Africa_report.md → Mexico vs South Africa（复盘）
@@ -1861,22 +1872,16 @@ def _cmd_publish(chat_id: int, args: list[str]) -> None:
 
 # ─── /wxpublish：报告 → 合规基本面文章 → 微信公众号草稿 ──────────────────────
 def _wxpublish_date_keyboard(page: int = 0) -> dict | None:
-    """扫描 report/ 下日期子目录，构造日期选择键盘（回调 wd:/wdp:，与 Ghost 独立）。
+    """扫描 report/<年>/<月>/<日期>/（回调 wd:/wdp:，与 Ghost 独立）。
     仿 _publish_date_keyboard，仅前缀不同以隔离两条发布流程。无报告返回 None。"""
     import os
-    base = "report"
-    if not os.path.isdir(base):
-        return None
     dates = []
-    for name in os.listdir(base):
-        d = os.path.join(base, name)
-        if os.path.isdir(d) and len(name) == 10 and name[4] == "-":
-            n = len([f for f in os.listdir(d) if f.endswith(".md")])
-            if n:
-                dates.append((name, n))
+    for value, directory in report_paths.iter_date_dirs(_REPORT_ROOT):
+        n = len([f for f in os.listdir(directory) if f.endswith(".md")])
+        if n:
+            dates.append((value, n))
     if not dates:
         return None
-    dates.sort(reverse=True)
     per_page = config.WXPUBLISH_DATES_PER_PAGE
     pages = max(1, (len(dates) + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
@@ -1898,14 +1903,14 @@ def _wxpublish_report_keyboard(chat_id: int, date: str) -> dict | None:
     """列某日期目录下所有 *.md，构造报告选择键盘（回调 wf:<idx>）。
     文件名列表暂存 _wxpublish_browse[chat_id]。"""
     import os
-    d = os.path.join("report", date)
+    d = _report_date_dir(date, existing=True)
     if not os.path.isdir(d):
         return None
     files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
     if not files:
         return None
     with _publish_lock:
-        _wxpublish_browse[chat_id] = {"date": date, "files": files}
+        _wxpublish_browse[chat_id] = {"date": date, "dir": d, "files": files}
     rows = []
     for idx, fname in enumerate(files):
         is_review = fname.endswith("_review.md")
@@ -1934,6 +1939,36 @@ def _cmd_wxpublish(chat_id: int, args: list[str]) -> None:
     send(chat_id, "📮 存公众号草稿 —— 选择报告日期：", kb)
 
 
+def _preserve_wx_source(report_path: str, title: str,
+                        content_html: str) -> dict | None:
+    """保存可编辑微信 HTML；本地保存失败时仍返回字节，供 Telegram 下载。"""
+    if not content_html:
+        return None
+    try:
+        saved_path, payload = wechat_publish.save_editable_source(
+            report_path, title, content_html)
+        filename = os.path.basename(saved_path)
+    except Exception as e:
+        log.warning("微信可编辑源稿保存失败: %s", e)
+        saved_path = ""
+        stem = os.path.splitext(os.path.basename(report_path))[0]
+        filename = f"{stem}_wechat_draft.html"
+        payload = wechat_publish.editable_source_document(
+            title, content_html).encode("utf-8")
+    return {"path": saved_path, "filename": filename, "content": payload}
+
+
+def _send_wx_source(chat_id: int, source: dict | None, caption: str) -> None:
+    """把已生成的可编辑 HTML 发回 Telegram；服务器路径放在纯文本 caption。"""
+    if not source:
+        return
+    full_caption = caption
+    if source["path"]:
+        full_caption += f"\n服务器备份：{source['path']}"
+    send_document(chat_id, source["filename"], source["content"],
+                  full_caption, mime_type="text/html; charset=utf-8")
+
+
 def _wxpublish_do(chat_id: int, message_id: int, path: str) -> None:
     """读报告 → LLM 合规改写 → 合规扫描 → 存草稿 → 回执。全程只存草稿不直发。"""
     try:
@@ -1943,22 +1978,45 @@ def _wxpublish_do(chat_id: int, message_id: int, path: str) -> None:
         edit_text(chat_id, message_id, f"❌ 读取报告失败：{e}")
         return
     edit_text(chat_id, message_id, "⏳ 正在生成合规文章并存入公众号草稿…")
+    title = ""
+    html = ""
+    source = None
     try:
         home, away, league = wechat_publish.parse_meta(md)
         title, html = wechat_publish.report_to_wx_article(md, home, away, league)
+        # 微信网络请求之前先落一份版本化源稿：后续任何接口错误都不会丢文案。
+        source = _preserve_wx_source(path, title, html)
         digest = f"{home} vs {away} 赛前基本面导读" if home and away else ""
         media_id = wechat_publish.add_draft(title, html, digest=digest)
+    except wechat_publish.ComplianceError as e:
+        source = _preserve_wx_source(path, e.title, e.content_html)
+        edit_text(chat_id, message_id,
+                  f"❌ 存草稿失败：{e}\n\n"
+                  "生成内容没有丢失：已另存并发送可编辑 HTML 源稿，"
+                  "修改命中词后可在公众号后台继续编辑。")
+        _send_wx_source(
+            chat_id, source,
+            "合规扫描拦截，未进入公众号草稿箱；这是可编辑源稿。")
+        return
     except wechat_publish.WechatError as e:
         edit_text(chat_id, message_id, f"❌ 存草稿失败：{e}")
+        _send_wx_source(
+            chat_id, source,
+            "微信存草稿失败，但生成内容已保留；这是可编辑源稿。")
         return
     except Exception as e:
         log.exception("wxpublish 异常")
         edit_text(chat_id, message_id, f"❌ 存草稿异常：{e}")
+        _send_wx_source(
+            chat_id, source,
+            "存草稿发生异常，但生成内容已保留；这是可编辑源稿。")
         return
     edit_text(chat_id, message_id,
               f"✅ 已存入公众号草稿箱：《{title}》\n"
               f"（草稿 id: {media_id[:16]}…）\n"
-              "去 mp.weixin.qq.com 后台「草稿箱」核对内容后手动发布。")
+              "去 mp.weixin.qq.com 后台「草稿箱」核对内容后手动发布。\n"
+              "可编辑 HTML 源稿也已另存并发送。")
+    _send_wx_source(chat_id, source, "微信公众号草稿的可编辑 HTML 源稿备份。")
 
 
 def _handle_wxpublish_callback(cb_id: str, data: str, chat_id: int,
@@ -2000,7 +2058,9 @@ def _handle_wxpublish_callback(cb_id: str, data: str, chat_id: int,
         if not browse or idx >= len(browse["files"]):
             edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /wxpublish。")
             return
-        path = os.path.join("report", browse["date"], browse["files"][idx])
+        directory = browse.get("dir") or _report_date_dir(
+            browse["date"], existing=True)
+        path = os.path.join(directory, browse["files"][idx])
         # LLM 改写 + 微信 HTTP 较慢，丢后台池，不占死该 chat 工作线程
         _submit_bg(_wxpublish_do, chat_id, message_id, path)
         return
@@ -3307,7 +3367,9 @@ def _handle_publish_callback(cb_id: str, data: str, chat_id: int,
             edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /publish。")
             return
         fname = browse["files"][idx]
-        path = os.path.join("report", browse["date"], fname)
+        directory = browse.get("dir") or _report_date_dir(
+            browse["date"], existing=True)
+        path = os.path.join(directory, fname)
         token = uuid.uuid4().hex[:12]
         with _publish_lock:
             _publish_pending[token] = {
@@ -3503,7 +3565,9 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "会话已过期，请重新 /lesson")
             edit_text(chat_id, message_id, "⏳ 会话已过期，请重新 /lesson。")
             return
-        path = os.path.join("report", browse["date"], browse["files"][idx])
+        directory = browse.get("dir") or _report_date_dir(
+            browse["date"], existing=True)
+        path = os.path.join(directory, browse["files"][idx])
         answer_callback(cb_id, "归档中…")
         # 读报告 + gpt-5.5 路由较慢，丢后台池，不占死该 chat 工作线程
         _submit_bg(_lesson_archive_from_file, chat_id, message_id, path)
