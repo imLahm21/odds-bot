@@ -443,9 +443,14 @@ def _llm_audit(chat_id: int, action: str, tier: str, *,
     try:
         visitor = not _is_admin(chat_id)
         role = "访客" if visitor else "管理员"
-        model = llm_client.get_tier_model(tier, visitor=visitor)
+        chain = llm_client.resolve_model_chain(tier, visitor=visitor)
+        # 记整条链（主>回退）而非单个模型——故障转移后能对上账。
+        chain_s = ">".join(chain) or "无可用模型"
+        groups = "/".join(g for m in chain
+                          for g in llm_client.route_groups_for_model(m)) or "未登记"
         parts = [f"LLM调用 who={chat_id}", f"role={role}", f"action={action}",
-                 f"tier={tier}", f"model={model}"]
+                 f"tier={tier}", f"model_chain={chain_s}",
+                 f"route_groups={groups}"]
         if fid is not None:
             parts.append(f"fixture={fid}")
         if effort:
@@ -1748,7 +1753,7 @@ def _cmd_lesson(chat_id: int) -> None:
     """独立命令：从 report/ 历史复盘报告里选一份，蒸馏归档为实战教训（仅管理员）。
     补足「错过 /review 后那个按钮」或「给历史复盘补归教训」的入口。"""
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法提炼教训。")
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法提炼教训。")
         return
     kb = _lesson_date_keyboard()
     if kb is None:
@@ -1931,7 +1936,7 @@ def _cmd_wxpublish(chat_id: int, args: list[str]) -> None:
                       "配好后重启 bot 即可用 /wxpublish。")
         return
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），"
                       "无法生成合规文章。")
         return
     kb = _wxpublish_date_keyboard()
@@ -2234,7 +2239,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
                   f"已获取 {meta['nodes']} 个节点的盘口走势。", plain=False)
 
     if not analyzer.available():
-        send(chat_id, "⚠️ 未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），"
+        send(chat_id, "⚠️ 未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），"
                       "无法进行 SOP 精算预测，仅能查看上方数据。")
         return
     # 三个按钮：基本面预分析（可选、轻量模型）/ 预设精算 / 自定义侧重
@@ -2338,7 +2343,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     """
     from . import fundamentals
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法精算。")
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法精算。")
         return
     csv_str, meta = _build_csv(fid)
     if not csv_str:
@@ -2520,7 +2525,7 @@ def _cmd_parlay(chat_id: int, args: list[str]) -> None:
         send(chat_id, "⚠️ 三腿必须是不同比赛（同场腿属相关性套利，须另算）。")
         return
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法串关。")
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法串关。")
         return
 
     # 配额预检（消费前）：串关专属 ≥1 且共享 analyze 桶 ≥ 腿数
@@ -2602,10 +2607,10 @@ def _run_parlay(chat_id: int, fids: list[int], effort: str = "",
         if path:
             send(chat_id, f"📁 腿 {i+1} 报告已归档：{path}")
 
-        # extract_decision 内部固定 visitor=False（用管理员平衡档抽 JSON），审计如实标注
-        _llm_audit(chat_id, "parlay-extract", "balanced", fid=fid,
-                   extra="note=extract固定管理员平衡档")
-        dec = analyzer.extract_decision(report, meta["home"], meta["away"])
+        # 决策抽取继续继承调用者角色，访客不得偷用管理员 GPT 密钥组。
+        _llm_audit(chat_id, "parlay-extract", "balanced", fid=fid)
+        dec = analyzer.extract_decision(
+            report, meta["home"], meta["away"], visitor=_visitor)
         if dec is None:
             if msg_id:
                 edit_text(chat_id, msg_id,
@@ -2639,7 +2644,7 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
         send(chat_id, "用法：/review &lt;fixture_id&gt;（对已结束的比赛复盘）")
         return
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法复盘。")
         return
     fid = int(args[0])
     # 盘口数据校验（读库，无 API 成本）；是否结束的校验留给 _run_review（它要拉结果）
@@ -2672,7 +2677,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
         {"text": "🛑 停止复盘", "callback_data": f"stopan:{task_id}"}]]}
     from . import api_client
     if not analyzer.available():
-        send(chat_id, "未配置 LLM（.env 缺 LLM_BASE_URL / LLM_API_KEY），无法复盘。")
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法复盘。")
         return
     _visitor = not _is_admin(chat_id)   # 访客复盘用访客那份模型
     _llm_audit(chat_id, f"review-{sub_mode}", "heavy", fid=fid, effort=effort)
@@ -2905,8 +2910,11 @@ def _fmt_last_probe(idx: int) -> str:
 def _llm_panel_text() -> str:
     """三段面板文字：端点池 / 熔断状态 / 可调参数。"""
     if not llm_client.available():
-        return ("⚠️ 未配置任何 LLM 端点（.env 缺 LLM_BASE_URL / LLM_API_KEY）。\n"
-                "配置后重启 bot 即可用。多端点见 .env 的 LLM_ENDPOINTS。")
+        issues = llm_client.routing_issues()
+        detail = "\n".join(f"· {item}" for item in issues)
+        return ("⚠️ 未配置可用 LLM 密钥组。\n"
+                "请在 .env 配置 LLM_ROUTE_ENDPOINTS 后重启。"
+                + (f"\n{detail}" if detail else ""))
     eps = llm_client.endpoints()
     stats = llm_client.breaker_stats()
     settings = llm_client.get_settings()
@@ -2914,6 +2922,21 @@ def _llm_panel_text() -> str:
     lines = [f"<b>🤖 LLM 端点池（{len(eps)} 条，启用 {llm_client.enabled_count()}）</b>",
              "（✅正常=全速派发 / 🟠降级=近期偶发失败·仍用但选路降优先 / "
              "🔴熔断=已摘除等冷却 / 🟡半开=探活中；点 ⬜/✅ 手动开关）"]
+    issues = llm_client.routing_issues()
+    if issues:
+        lines.append("\n<b>⚠️ 路由配置问题</b>\n"
+                     + "\n".join(f"· {item}" for item in issues))
+    lines.append("\n<b>🔐 密钥授权组</b>（一条 key 只覆盖本组模型）")
+    for group, spec in config.LLM_ROUTE_GROUPS.items():
+        indices = [i for i, ep in enumerate(eps)
+                   if ep["route_group"] == group]
+        enabled = sum(1 for i in indices if llm_client.is_enabled(i))
+        models = config.llm_models_in_group(group)
+        mark = "✅" if indices else "❌"
+        lines.append(
+            f"· {mark} <code>{group}</code> {spec['label']}："
+            f"{enabled}/{len(indices)} 启用\n"
+            f"　模型：{', '.join(models) if models else '未绑定'}")
     for i, (ep, st) in enumerate(zip(eps, stats)):
         on = llm_client.is_enabled(i)
         sw = "🟢启用" if on else "⚪停用"
@@ -2927,45 +2950,39 @@ def _llm_panel_text() -> str:
             extra = "，选路已降优先"
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
-        # 模型映射（第4段）：有则显示各档，无则标「默认（随档位）」
-        mm = ep.get("model_map") or {}
-        if mm:
-            parts = []
-            if mm.get("heavy"):
-                parts.append(f"重→{mm['heavy']}")
-            if mm.get("balanced"):
-                parts.append(f"平→{mm['balanced']}")
-            if mm.get("light"):
-                parts.append(f"轻→{mm['light']}")
-            mm_line = "　映射：" + " ".join(parts)
-        else:
-            mm_line = "　映射：默认（跟随各档运行时选定模型）"
-        supported = ep.get("supported_models")
-        support_line = ("　支持：" + "、".join(supported)
-                        if supported is not None
-                        else "　支持：未声明（兼容全部模型）")
+        group = ep["route_group"]
+        models = config.llm_models_in_group(group)
         lines.append(
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
             f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
-            f"  {mm_line}\n"
-            f"  {support_line}\n"
+            f"　密钥组：<code>{group}</code>\n"
+            f"　组内模型：{'、'.join(models) or '未绑定'}\n"
             f"{_fmt_last_probe(i)}")
 
-    # 模型档位段：每档两份（管理员/访客），当前选定模型
-    lines.append("\n<b>🎚️ 模型档位</b>（管理员/访客分开；点按钮轮换，即时生效免重启）")
-    for tier, spec in config.LLM_TIER_MODELS.items():
-        cur_a = llm_client.get_tier_model(tier, visitor=False)
-        cur_v = llm_client.get_tier_model(tier, visitor=True)
-        lines.append(f"· {spec['label']}\n"
-                     f"　管理员：<b>{cur_a}</b>　访客：<b>{cur_v}</b>")
+    # 模型槽位段：3 档 × 2 角色，每槽位「主模型 + 回退模型」。
+    # ❌ = 该模型的密钥组在 .env 里没配端点（这次故障的病根，必须一眼可见）。
+    lines.append("\n<b>🎚️ 模型槽位</b>（主模型那组全挂时自动落到回退模型）\n"
+                 "✅=密钥组已配 / ❌=缺密钥组 / ⚠️=未登记模型（按前缀路由，"
+                 "上游不认会 404）/ —=未设")
 
-    lines.append("\n<b>🛟 回退模型</b>（点下方按钮一次性启用）")
-    for tier, spec in config.LLM_TIER_MODELS.items():
-        fallback_a = config.llm_tier_fallback(tier, False)
-        fallback_v = config.llm_tier_fallback(tier, True)
-        lines.append(f"· {spec['label']}\n"
-                     f"　管理员：<b>{fallback_a}</b>　访客：<b>{fallback_v}</b>")
+    def _slot_mark(ready: bool, retired: bool, model: str) -> str:
+        if not model:
+            return "—"
+        if not ready:
+            return "❌"
+        return "⚠️" if retired else "✅"
+
+    for slot in llm_client.slot_snapshot():
+        role = "访客" if slot["role"] == "visitor" else "管理员"
+        fb = slot["fallback"] or "未设"
+        p_mark = _slot_mark(slot["primary_ready"], slot["primary_retired"],
+                            slot["primary"])
+        f_mark = _slot_mark(slot["fallback_ready"], slot["fallback_retired"],
+                            slot["fallback"])
+        lines.append(f"· {slot['label']} · {role}\n"
+                     f"　主：{p_mark} <b>{slot['primary']}</b>\n"
+                     f"　回退：{f_mark} <b>{fb}</b>")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
     for key, spec in config.LLM_SETTING_SPECS.items():
@@ -2983,35 +3000,27 @@ def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
     stats = llm_client.breaker_stats()
     rows: list[list[dict]] = []
 
-    # 测试区：全部测试分重/平衡/轻三档（lt:all:<tier>）+ 逐端点一行（测试重档 / 开关 / 熔断时重置）
-    rows.append([
-        {"text": "🧪 测·重", "callback_data": "lt:all:heavy"},
-        {"text": "🧪 测·平衡", "callback_data": "lt:all:balanced"},
-        {"text": "🧪 测·轻", "callback_data": "lt:all:light"},
-    ])
+    # 按授权组测试组内真实模型，不再拿 GPT key 去测 DeepSeek 等（必然 403）。
+    group_row: list[dict] = []
+    for group in sorted(llm_client.configured_groups()):
+        group_row.append({"text": f"🧪 {group}",
+                          "callback_data": f"ltg:{group}"})
+        if len(group_row) >= 2:
+            rows.append(group_row)
+            group_row = []
+    if group_row:
+        rows.append(group_row)
     for i, st in enumerate(stats):
         on = llm_client.is_enabled(i)
         mark = "✅" if on else "⬜"
-        if expand_test == i:
-            # 该端点「测试」已展开：原地换成 重/平衡/轻 三个子按钮(仅测这一条)+收起。
-            # TG 内联按钮无长按，只能点击展开——点「测试 N」置 expand=N 重绘成这行。
-            rows.append([
-                {"text": f"🔬{i}·重", "callback_data": f"lt:{i}:heavy"},
-                {"text": f"🔬{i}·平衡", "callback_data": f"lt:{i}:balanced"},
-                {"text": f"🔬{i}·轻", "callback_data": f"lt:{i}:light"},
-                {"text": "↩︎", "callback_data": "lte:x"},
-            ])
-        else:
-            # 开关按钮沿用 /leagues、/bookmakers 的约定：✅/⬜ 显示【当前状态】，
-            # 点击即翻转（le:<idx>:<目标状态 1开/0关>）。
-            # 「测试 N」点击不再直接测，而是展开该端点的重/平衡/轻子按钮(lte:<i>)。
-            ep_row: list[dict] = [
-                {"text": f"🔌 测试 {i}", "callback_data": f"lte:{i}"},
-                {"text": f"{mark} 端点{i}", "callback_data": f"le:{i}:{0 if on else 1}"},
-            ]
-            if st["state"] in ("OPEN", "HALF_OPEN"):
-                ep_row.append({"text": f"♻️ 重置 {i}", "callback_data": f"lr:{i}"})
-            rows.append(ep_row)
+        ep_row: list[dict] = [
+            {"text": f"{mark} 端点{i}",
+             "callback_data": f"le:{i}:{0 if on else 1}"},
+        ]
+        if st["state"] in ("OPEN", "HALF_OPEN"):
+            ep_row.append({"text": f"♻️ 重置 {i}",
+                           "callback_data": f"lr:{i}"})
+        rows.append(ep_row)
 
     # 参数区：每行两个参数按钮（文案带当前值）
     settings = llm_client.get_settings()
@@ -3026,28 +3035,48 @@ def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
     if param_row:
         rows.append(param_row)
 
-    # 模型档位切换区：每档一行两个按钮——管理员那份(lmt:<tier>:<idx>) + 访客那份(lmt:<tier>:<idx>:v)。
-    # 各自在自己角色的候选里轮换到下一个；当前值不在候选里时点一下切到首个候选。
+    # 模型槽位区：每槽位两个按钮（主 / 回退），点开子菜单从该档可选池里挑。
+    # 回调 lms:<tier>:<a|v>:<p|f> 打开选择器，lmv:<tier>:<a|v>:<p|f>:<i> 写值。
     for tier in config.LLM_TIER_MODELS:
-        row = []
         for vis in (False, True):
-            cur = llm_client.get_tier_model(tier, visitor=vis)
-            choices = config.llm_tier_choices(tier, vis)
-            try:
-                nxt = (choices.index(cur) + 1) % len(choices)
-            except ValueError:
-                nxt = 0
             role = "访客" if vis else "管理"
-            suffix = ":v" if vis else ""
-            row.append({"text": f"🎚️{role} {cur} ⇄",
-                        "callback_data": f"lmt:{tier}:{nxt}{suffix}"})
-        rows.append(row)
+            r = "v" if vis else "a"
+            primary = llm_client.get_tier_model(tier, visitor=vis)
+            fallback = llm_client.get_fallback_model(tier, visitor=vis) or "未设"
+            rows.append([
+                {"text": f"🎚️{role}主 {primary}",
+                 "callback_data": f"lms:{tier}:{r}:p"},
+                {"text": f"🛟{role}退 {fallback}",
+                 "callback_data": f"lms:{tier}:{r}:f"},
+            ])
 
     rows.append([{"text": "🔄 刷新", "callback_data": "lm:"},
                  {"text": "↩️ 参数恢复默认", "callback_data": "lx:reset"}])
     # 保留 lmt:legacy 回调值，兼容更新前已经发到 Telegram 的旧面板按钮。
-    rows.append([{"text": "🛟 启用回退模型", "callback_data": "lmt:legacy"},
-                 {"text": "✨ 恢复主模型默认", "callback_data": "lmt:reset"}])
+    rows.append([{"text": "🛟 一键切到回退模型", "callback_data": "lmt:legacy"},
+                 {"text": "✨ 恢复模型默认", "callback_data": "lmt:reset"}])
+    return {"inline_keyboard": rows}
+
+
+def _llm_slot_keyboard(tier: str, r: str, kind: str) -> dict:
+    """某槽位的模型选择子菜单：列该档可选池，标 ✅/❌ 是否已配密钥组。
+    回调 lmv:<tier>:<a|v>:<p|f>:<i>；i=x 表示清空回退。"""
+    models = config.llm_tier_eligible_models(tier)
+    visitor = r == "v"
+    cur = (llm_client.get_fallback_model(tier, visitor) if kind == "f"
+           else llm_client.get_tier_model(tier, visitor))
+    rows: list[list[dict]] = []
+    for i, model in enumerate(models):
+        ready = "✅" if llm_client.configured_count_for_model(model) else "❌"
+        here = "· 当前" if model == cur else ""
+        rows.append([{
+            "text": f"{ready} {config.llm_model_label(model)} {here}".strip(),
+            "callback_data": f"lmv:{tier}:{r}:{kind}:{i}",
+        }])
+    if kind == "f":
+        rows.append([{"text": "🚫 不设回退",
+                      "callback_data": f"lmv:{tier}:{r}:f:x"}])
+    rows.append([{"text": "↩️ 返回面板", "callback_data": "lm:"}])
     return {"inline_keyboard": rows}
 
 
@@ -3068,41 +3097,90 @@ _WHICH_ZH = {"heavy": "重", "balanced": "平衡", "light": "轻"}
 
 def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
                                message_id: int) -> None:
-    """处理模型档位回调：
-      lmt:<tier>:<idx>     切某档【管理员】那份到该角色候选[idx]
-      lmt:<tier>:<idx>:v   切某档【访客】那份
-      lmt:legacy           一键启用按角色配置的回退模型
-      lmt:reset            恢复主模型默认（管理员 astra/sol/luna，访客 deepseek/deepseek/luna）
+    """处理模型槽位回调：
+      lms:<tier>:<a|v>:<p|f>        打开该槽位的模型选择子菜单
+      lmv:<tier>:<a|v>:<p|f>:<i>    设为该档可选池第 i 个（i=x 清空回退）
+      lmt:legacy                    一键把各槽位的回退模型切成主模型
+      lmt:reset                     恢复 12 槽位默认
+      lmt:<tier>:<idx>[:v]          旧面板按钮（已发出的消息还在，点了不能报错）
     """
     if data == "lmt:legacy":
         llm_client.apply_fallback_models()
-        answer_callback(
-            cb_id,
-            "已启用回退：管理=grok/grok/glm，访客=deepseek/deepseek/glm")
+        answer_callback(cb_id, "已把各槽位的回退模型切为主模型")
         _llm_refresh(chat_id, message_id)
         return
     if data == "lmt:reset":
         llm_client.reset_runtime_models()
-        answer_callback(cb_id, "已恢复主模型默认")
+        answer_callback(cb_id, "已恢复 12 个槽位的默认模型")
         _llm_refresh(chat_id, message_id)
         return
-    # lmt:<tier>:<idx>[:v]
+
     parts = data.split(":")
-    visitor = len(parts) >= 4 and parts[3] == "v"
-    try:
-        tier = parts[1]
-        idx = int(parts[2])
-    except (IndexError, ValueError):
-        answer_callback(cb_id, "参数错误")
+    # 打开子菜单：lms:<tier>:<a|v>:<p|f>
+    if data.startswith("lms:"):
+        if len(parts) < 4 or parts[1] not in config.LLM_TIER_MODELS \
+                or parts[2] not in ("a", "v") or parts[3] not in ("p", "f"):
+            answer_callback(cb_id, "参数错误")
+            return
+        tier, r, kind = parts[1], parts[2], parts[3]
+        role = "访客" if r == "v" else "管理员"
+        what = "回退模型" if kind == "f" else "主模型"
+        label = config.LLM_TIER_MODELS[tier]["label"]
+        answer_callback(cb_id, f"选 {label}·{role} 的{what}")
+        edit_text(chat_id, message_id,
+                  f"<b>🎚️ {label} · {role} · {what}</b>\n"
+                  f"✅=该模型已配密钥组，❌=缺密钥组（选了要先在 .env 补 key）",
+                  _llm_slot_keyboard(tier, r, kind))
         return
+
+    # 写值：lmv:<tier>:<a|v>:<p|f>:<i>
+    if data.startswith("lmv:"):
+        if len(parts) < 5 or parts[1] not in config.LLM_TIER_MODELS \
+                or parts[2] not in ("a", "v") or parts[3] not in ("p", "f"):
+            answer_callback(cb_id, "参数错误")
+            return
+        tier, r, kind, raw = parts[1], parts[2], parts[3], parts[4]
+        visitor = r == "v"
+        if kind == "f" and raw == "x":
+            model = ""
+        else:
+            pool = config.llm_tier_eligible_models(tier)
+            if not raw.isdigit() or int(raw) >= len(pool):
+                answer_callback(cb_id, "候选无效")
+                return
+            model = pool[int(raw)]
+        ok = (llm_client.set_fallback_model(tier, model, visitor=visitor)
+              if kind == "f"
+              else llm_client.set_tier_model(tier, model, visitor=visitor))
+        role = "访客" if visitor else "管理员"
+        what = "回退" if kind == "f" else "主"
+        label = config.LLM_TIER_MODELS[tier]["label"]
+        if not ok:
+            answer_callback(cb_id, "切换失败（模型不在该档可选池）")
+        elif not model:
+            answer_callback(cb_id, f"{label}·{role} 已清空回退")
+        elif llm_client.configured_count_for_model(model):
+            answer_callback(cb_id, f"{label}·{role}·{what} → {model}")
+        else:
+            answer_callback(cb_id, f"⚠️ 已设 {model}，但其密钥组未配置")
+        _llm_refresh(chat_id, message_id)
+        return
+
+    # 旧面板按钮 lmt:<tier>:<idx>[:v]：按新可选池取第 idx 个，越界则取首个。
+    visitor = len(parts) >= 4 and parts[3] == "v"
+    tier = parts[1] if len(parts) > 1 else ""
     if tier not in config.LLM_TIER_MODELS:
         answer_callback(cb_id, "档位无效")
         return
-    choices = config.llm_tier_choices(tier, visitor)
-    if not (0 <= idx < len(choices)):
-        answer_callback(cb_id, "候选无效")
+    pool = config.llm_tier_eligible_models(tier)
+    if not pool:
+        answer_callback(cb_id, "该档无可选模型")
         return
-    model = choices[idx]
+    try:
+        idx = int(parts[2])
+    except (IndexError, ValueError):
+        idx = 0
+    model = pool[idx % len(pool)]
     ok = llm_client.set_tier_model(tier, model, visitor=visitor)
     role = "访客" if visitor else "管理员"
     label = config.LLM_TIER_MODELS[tier]["label"]
@@ -3153,6 +3231,31 @@ def _llm_run_probe(chat_id: int, message_id: int, target: str,
              "both": "重档+轻档"}.get(which, which)
     lines = [f"<b>🧪 连通性测试结果（{title}）</b>"]
     lines += [_fmt_probe_line(r) for r in results]
+    lines.append("")
+    lines.append(_llm_panel_text())
+    edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
+
+
+def _llm_run_group_probe(chat_id: int, message_id: int, group: str) -> None:
+    """测试一个授权组的每条 key × 该组绑定模型，不向其他组发送请求。"""
+    if group not in config.LLM_ROUTE_GROUPS:
+        send(chat_id, "密钥组不存在。")
+        return
+    endpoints = llm_client.endpoints()
+    indices = [i for i, ep in enumerate(endpoints)
+               if ep["route_group"] == group]
+    models = config.llm_models_in_group(group)
+    if not indices or not models:
+        send(chat_id, f"密钥组 {group} 没有可测试的端点或模型。")
+        return
+    results = []
+    for idx in indices:
+        for model in models:
+            result = llm_client.probe_model(idx, model)
+            result["label"] = endpoints[idx]["label"]
+            results.append(result)
+    lines = [f"<b>🧪 密钥组测试：{group}</b>"]
+    lines += [_fmt_probe_line(result) for result in results]
     lines.append("")
     lines.append(_llm_panel_text())
     edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
@@ -3647,14 +3750,25 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
-    # ── /llm 管理面板回调（lt:测试 / lr:重置端点 / le:开关端点 / ls:改参数 / lm:刷新 /
-    #    lx:重置参数 / lmt:模型档位切换，仅管理员）──
-    if data.startswith(("lt:", "lte:", "lr:", "le:", "ls:", "lm:", "lx:", "lmt:")):
+    # ── /llm 管理面板回调（ltg:组测试 / lt:旧测试 / lr:重置 / le:开关 /
+    #    ls:改参数 / lm:刷新 / lx:重置参数 /
+    #    lms:开模型选择器 / lmv:写模型槽位 / lmt:旧档位按钮，仅管理员）──
+    if data.startswith((
+            "ltg:", "lt:", "lte:", "lr:", "le:", "ls:", "lm:", "lx:",
+            "lms:", "lmv:", "lmt:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可操作")
             return
-        if data.startswith("lmt:"):
+        if data.startswith(("lms:", "lmv:", "lmt:")):
             _handle_llm_model_callback(cb_id, data, chat_id, message_id)
+            return
+        if data.startswith("ltg:"):
+            group = data[4:]
+            if group not in config.LLM_ROUTE_GROUPS:
+                answer_callback(cb_id, "密钥组无效")
+                return
+            answer_callback(cb_id, f"正在测试 {group}…")
+            _submit_bg(_llm_run_group_probe, chat_id, message_id, group)
             return
         if data.startswith("lte:"):
             # lte:<i> 展开该端点测试行为 重/平衡/轻；lte:x 收起。仅重绘键盘，不测。
@@ -3970,6 +4084,14 @@ def run_polling(stop_flag=lambda: False) -> None:
     # 注入 LLM 告警钩子：熔断打开/自动恢复时经 alert_admins 只推管理员（访客无感知）。
     # 依赖注入而非 llm_client 直接 import tgbot，避免循环依赖。
     llm_client.set_alert_hook(alert_admins, clear_alert_dedup)
+    route_issues = llm_client.routing_issues()
+    if route_issues:
+        detail = "\n".join(f"· {item}" for item in route_issues)
+        log.error("LLM 密钥组配置问题：%s", "；".join(route_issues))
+        alert_admins(
+            "⚠️ LLM 密钥组配置需要处理：\n" + detail
+            + "\n请检查 .env 的 LLM_ROUTE_ENDPOINTS 后重启。",
+            dedup_key="llm-route-config")
     # 启动时打印实际读到的广播目标，便于排查 /publish 不弹通知按钮：
     # 若这里是 0 个，说明 .env 的 TELEGRAM_BROADCAST_TARGETS 没被读到（未配/格式错/未重启）。
     bt = config.TELEGRAM_BROADCAST_TARGETS

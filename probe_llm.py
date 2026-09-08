@@ -1,7 +1,7 @@
 """
-LLM 连通性探针 —— 实测 IKuncode chat/completions 能否打通
+LLM 连通性探针 —— 实测分组端点的 chat/completions
 
-用法（先在 .env 配好 LLM_BASE_URL / LLM_API_KEY）：
+用法（推荐先在 .env 配好 LLM_ROUTE_ENDPOINTS）：
   python probe_llm.py          # 发一个最小请求，确认通
   python probe_llm.py effort    # 逐档测 reasoning_effort（重点验 xhigh 是否被网关接受）
   python probe_llm.py full     # 用真实规则+一场比赛跑完整精算（耗 token）
@@ -25,61 +25,42 @@ from bot import analyzer, config
 
 
 def probe_minimal():
-    print("BASE:", analyzer.LLM_BASE_URL, "| MODEL:", config.LLM_MODEL)
-    print("key 已配:", bool(analyzer.LLM_API_KEY))
-    if not analyzer.available():
-        sys.exit("未配置 LLM_BASE_URL / LLM_API_KEY")
-    import requests
-    payload = {"model": config.LLM_MODEL,
-               "messages": [{"role": "user", "content": "回复两个字：通了"}],
-               "max_tokens": 50}
-    # User-Agent 同 llm_client：部分分组做客户端白名单，python-requests 会被 403
-    from bot import llm_client
-    r = requests.post(f"{analyzer.LLM_BASE_URL}/chat/completions",
-                      json=payload,
-                      headers={"Authorization": f"Bearer {analyzer.LLM_API_KEY}",
-                               "User-Agent": llm_client.LLM_USER_AGENT},
-                      timeout=60)
-    print("HTTP:", r.status_code)
-    print("响应前 500 字:", r.text[:500])
+    """按管理员重档的模型链，逐条测该模型所属密钥组的端点。"""
+    from bot import db, llm_client
+    db.init_db()
+    issues = llm_client.routing_issues()
+    if issues:
+        print("⚠️ 路由配置问题：")
+        for item in issues:
+            print("  ·", item)
+    chain = llm_client.resolve_model_chain("heavy", visitor=False)
+    if not chain:
+        sys.exit(llm_client.chain_error("heavy", visitor=False))
+    eps = llm_client.endpoints()
+    print("模型链（主>回退）:", ">".join(chain))
+    for model in chain:
+        groups = set(llm_client.route_groups_for_model(model))
+        print(f"\n[{model}] 密钥组 {'/'.join(sorted(groups))}")
+        for idx, ep in enumerate(eps):
+            if ep["route_group"] not in groups:
+                continue
+            result = llm_client.probe_model(idx, model)
+            status = "OK" if result["ok"] else result.get("error", "失败")
+            print(f"  [{idx}] {ep['label']} {status}")
 
 
 def probe_effort():
     """逐档发最小请求，验证网关是否接受 reasoning_effort（尤其 xhigh）。
     每档单独打一枪，区分「整体不支持该字段」与「仅某档（如 xhigh）不认」。"""
-    if not analyzer.available():
-        sys.exit("未配置 LLM_BASE_URL / LLM_API_KEY")
-    import requests
-    print("BASE:", analyzer.LLM_BASE_URL, "| MODEL:", config.LLM_MODEL)
-    print("待测档位:", list(config.LLM_EFFORT_LABELS))
-    print("=" * 50)
-    url = f"{analyzer.LLM_BASE_URL}/chat/completions"
-    # User-Agent 同 llm_client：部分分组做客户端白名单，python-requests 会被 403
-    from bot import llm_client
-    headers = {"Authorization": f"Bearer {analyzer.LLM_API_KEY}",
-               "User-Agent": llm_client.LLM_USER_AGENT}
+    from bot import db, llm_client
+    db.init_db()
+    print("按管理员重档的真实密钥组逐档测试 reasoning_effort：")
     for eff, label in config.LLM_EFFORT_LABELS.items():
-        payload = {"model": config.LLM_MODEL,
-                   "messages": [{"role": "user", "content": "回复两个字：通了"}],
-                   "max_tokens": 50,
-                   "reasoning_effort": eff}
-        try:
-            r = requests.post(url, json=payload, headers=headers, timeout=60)
-        except requests.exceptions.RequestException as e:
-            print(f"[{eff:<6} {label}] 网络错误: {e}")
-            continue
-        ok = "[OK 接受]" if r.status_code == 200 else f"[X HTTP {r.status_code}]"
-        body = ""
-        try:
-            data = r.json()
-            if r.status_code == 200:
-                body = (data.get("choices", [{}])[0]
-                        .get("message", {}).get("content", ""))[:60]
-            else:
-                body = str(data.get("error", data))[:200]
-        except Exception:
-            body = r.text[:200]
-        print(f"[{eff:<6} {label}] {ok}  {body}")
+        result = llm_client.chat(
+            "你是连通性探针。", "回复两个字：通了",
+            effort=eff, tier="heavy", timeout=60, max_tokens=50)
+        ok = not result.startswith(("LLM 请求失败", "LLM 超时", "LLM 网络错误"))
+        print(f"[{eff:<6} {label}] {'OK' if ok else '失败'}  {result[:120]}")
     print("=" * 50)
     print("提示：若某档报 HTTP 400 且错误提到 reasoning_effort / unsupported value，"
           "说明该网关/模型不认那一档——把它从 config.LLM_EFFORT_LABELS 移除即可。")
@@ -112,7 +93,7 @@ def probe_full():
 
 def probe_pool(which: str = "heavy"):
     """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 9 参数。
-    which ∈ heavy/balanced/light：测哪档（按该档运行时选定模型 + 端点映射解析真实模型名）。
+    which ∈ heavy/balanced/light：测哪档（按该档管理员选定的主模型）。
     需先 init_db（读 llm_settings）；未 init 时 llm_client 回退 config 默认。"""
     from bot import llm_client, db
     try:
@@ -123,11 +104,25 @@ def probe_pool(which: str = "heavy"):
     eps = llm_client.endpoints()
     print(f"解析到 {len(eps)} 个端点：")
     for i, ep in enumerate(eps):
-        mm = ep.get("model_map") or {}
-        mm_s = f"  映射 重→{mm.get('heavy','默认')} 轻→{mm.get('light','默认')}" if mm else "  （无映射，用默认模型）"
-        print(f"  [{i}] {ep['label']} → {ep['base_url']}{mm_s}")
+        models = config.llm_models_in_group(ep["route_group"])
+        print(f"  [{i}] [{ep['route_group']}] {ep['label']} → {ep['base_url']}"
+              f"  组内模型：{'、'.join(models) or '未绑定'}")
     if not eps:
-        sys.exit("未配置任何端点（.env 缺 LLM_BASE_URL / LLM_API_KEY）")
+        sys.exit("未配置任何端点（.env 缺 LLM_ROUTE_ENDPOINTS）")
+
+    issues = llm_client.routing_issues()
+    if issues:
+        print("\n⚠️ 路由配置问题：")
+        for item in issues:
+            print("  ·", item)
+
+    print("\n12 个模型槽位（主>回退；❌=缺密钥组）：")
+    for slot in llm_client.slot_snapshot():
+        role = "访客" if slot["role"] == "visitor" else "管理员"
+        p = ("✅" if slot["primary_ready"] else "❌") + slot["primary"]
+        f = (("✅" if slot["fallback_ready"] else "❌") + slot["fallback"]
+             if slot["fallback"] else "—未设")
+        print(f"  {slot['label']:<16} {role:<4} 主 {p:<22} 回退 {f}")
 
     print("\n当前 9 参数（DB llm_settings / 回退 config 默认）：")
     for k, v in llm_client.get_settings().items():
@@ -143,7 +138,8 @@ def probe_pool(which: str = "heavy"):
                   f"{r['latency_ms']}ms · 应答 {r.get('model', '')}")
         else:
             status = r["http_status"] if r["http_status"] is not None else "无响应"
-            icon = "❗" if r.get("http_status") == 200 else "❌"   # 200 假通 vs 真断
+            icon = ("⏭️" if r.get("skipped") else
+                    ("❗" if r.get("http_status") == 200 else "❌"))
             print(f"  {icon} [{r['label']}] {req} · {status} · {r['latency_ms']}ms · "
                   f"{r.get('error', '')}")
 

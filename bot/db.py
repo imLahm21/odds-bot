@@ -8,10 +8,13 @@ SQLite 数据层 —— 建表、批量插入、连接管理
 """
 
 import os
+import logging
 import sqlite3
 from datetime import datetime, timezone
 
 from . import config
+
+log = logging.getLogger("odds_bot.db")
 
 # ─── 建表 SQL ────────────────────────────────────────────────────────────────
 SCHEMA = """
@@ -95,7 +98,8 @@ CREATE TABLE IF NOT EXISTS llm_settings (
 
 -- LLM 端点手动开关：由 TG /llm 面板点开/关，llm_client 选路时跳过被停用的端点。
 -- 与熔断(自动隔离故障端点)是两个独立维度：这里是运维「只连哪个」的手动控制。
--- 端点 secret 不落库；这里只按签名(label|base_url)记录「哪些端点被手动停用」，
+-- 端点 secret 不落库；新格式按签名(group|label|base_url)记录，旧格式兼容
+-- label|base_url；表中只保存「哪些端点被手动停用」，
 -- 表中有记录且 disabled=1 即停用，无记录默认启用（新端点默认连通）。
 CREATE TABLE IF NOT EXISTS llm_endpoint_state (
     sig        TEXT PRIMARY KEY,             -- 端点签名 label|base_url（不含 key）
@@ -103,11 +107,11 @@ CREATE TABLE IF NOT EXISTS llm_endpoint_state (
     updated_at TEXT
 );
 
--- 三档模型运行时选定：key=model_heavy/model_balanced/model_light，value=模型名（字符串）。
--- 数值型 llm_settings 存不了模型名，故独立建表。默认由 config.LLM_TIER_MODELS 各档 default 灌。
--- /llm 面板切换、一键回退模型都写这里；缺行时 getter 回退 config 默认。
+-- 模型槽位运行时选定：12 个键 = 3 档 × 2 角色 × {主 model_*, 回退 fallback_*}，value=模型名。
+-- 数值型 llm_settings 存不了模型名，故独立建表。默认由 config.LLM_TIER_MODELS /
+-- LLM_FALLBACK_TIER_MODELS 灌。/llm 面板改主/回退模型都写这里；缺行时 getter 回退 config 默认。
 CREATE TABLE IF NOT EXISTS llm_runtime_state (
-    key        TEXT PRIMARY KEY,             -- 六个 model_* 键；另含模型方案版本标记
+    key        TEXT PRIMARY KEY,             -- 12 个 model_*/fallback_* 键；另含方案版本标记
     value      TEXT NOT NULL,                -- 选定的模型名或方案版本
     updated_at TEXT
 );
@@ -232,17 +236,22 @@ def seed_config(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO llm_settings (key, value, updated_at) "
         "VALUES (?,?,?)", llm_rows)
 
-    # 三档模型运行时选定默认值。每档两份：管理员 + 访客。
+    # 12 个模型槽位默认值：3 档 × 2 角色 × {主模型, 回退模型}。
     # INSERT OR IGNORE 保留现值；随后版本化迁移只改一次已知旧方案，不碰未知自定义值。
-    tier_rows = []
-    for tier in config.LLM_TIER_MODELS:
-        tier_rows.append((f"model_{tier}", config.llm_tier_default(tier, False), now))
-        tier_rows.append((f"model_{tier}_visitor",
-                          config.llm_tier_default(tier, True), now))
+    tier_rows = [(key, value, now)
+                 for key, value in _runtime_defaults().items()]
     conn.executemany(
         "INSERT OR IGNORE INTO llm_runtime_state (key, value, updated_at) "
         "VALUES (?,?,?)", tier_rows)
     _migrate_llm_tier_model_profile(conn, now)
+    # 版本化迁移之后只【报告】指向未登记模型的槽位，不改值——
+    # 用户可能故意把某槽位指到网关上的私有模型（见 set_llm_runtime_state 的
+    # allow_any 与「未知自定义值保持不动」契约）。已下线的旧模型名由
+    # LLM_TIER_MODEL_UPGRADE_MAP 显式改写，其余交给运行时告警 + /llm 面板标记。
+    stale = _unregistered_runtime_models(conn)
+    if stale:
+        log.warning("llm_runtime_state 有 %d 个槽位指向未登记模型（保留原值，"
+                    "请确认上游支持）：%s", len(stale), "、".join(stale))
     conn.commit()
 
 
@@ -294,6 +303,25 @@ def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:
         "updated_at=excluded.updated_at",
         (_LLM_MODEL_PROFILE_KEY, target_version, now))
     return len(updates)
+
+
+def _unregistered_runtime_models(conn: sqlite3.Connection) -> list[str]:
+    """只读扫描：哪些槽位当前值不在 config.LLM_MODELS 里，只报告不改写。
+
+    不在清单里分两种可能——已下线的旧名字（前缀推导会误判成「有 key 能用」，
+    实际请求 404），或用户故意指向的网关私有模型（合法，不该被抹掉）。
+    两者本地都分不清，故只报告、交给 /llm 面板显示 + 用户确认，不静默改值。
+    """
+    current = dict(conn.execute(
+        "SELECT key, value FROM llm_runtime_state").fetchall())
+    out = []
+    for key, default in _runtime_defaults().items():
+        value = str(current.get(key, default))
+        if key.startswith("fallback_") and value == "":
+            continue
+        if not config.llm_model_registered(value):
+            out.append(f"{key}={value}")
+    return out
 
 
 def _now_utc_iso() -> str:
@@ -481,59 +509,80 @@ def reset_llm_settings(conn: sqlite3.Connection) -> None:
 
 
 # ─── 三档模型运行时选定（TG /llm 面板读写，llm_client 按档位×角色读取）──────────
-# 每档两份：model_<tier>（管理员）+ model_<tier>_visitor（访客）。共 6 个键。
-def _parse_runtime_key(key: str) -> tuple[str, bool] | None:
-    """解析 runtime-state key → (tier, visitor)。非法返回 None。
-    model_heavy → ("heavy", False)；model_heavy_visitor → ("heavy", True)。"""
-    if not key.startswith("model_"):
+# 12 个键 = 3 档 × 2 角色 × {主模型, 回退模型}：
+#   model_<tier>[_visitor]     —— 该槽位的主模型
+#   fallback_<tier>[_visitor]  —— 该槽位的回退模型（空串 = 不设回退）
+# 主模型那组密钥全挂（熔断/停用/未配）时，llm_client 自动落到回退模型那组密钥。
+def _parse_runtime_key(key: str) -> tuple[str, bool, str] | None:
+    """解析 runtime-state key → (tier, visitor, kind)。非法返回 None。
+    model_heavy → ("heavy", False, "model")；
+    fallback_heavy_visitor → ("heavy", True, "fallback")。"""
+    for prefix, kind in (("model_", "model"), ("fallback_", "fallback")):
+        if not key.startswith(prefix):
+            continue
+        rest = key[len(prefix):]
+        visitor = rest.endswith("_visitor")
+        tier = rest[:-len("_visitor")] if visitor else rest
+        if tier in config.LLM_TIER_MODELS:
+            return (tier, visitor, kind)
         return None
-    rest = key[len("model_"):]
-    visitor = rest.endswith("_visitor")
-    tier = rest[:-len("_visitor")] if visitor else rest
-    return (tier, visitor) if tier in config.LLM_TIER_MODELS else None
+    return None
+
+
+def _runtime_defaults() -> dict[str, str]:
+    """12 个槽位的 config 默认值（主模型 + 回退模型）。"""
+    out: dict[str, str] = {}
+    for tier in config.LLM_TIER_MODELS:
+        out[f"model_{tier}"] = config.llm_tier_default(tier, False)
+        out[f"model_{tier}_visitor"] = config.llm_tier_default(tier, True)
+        out[f"fallback_{tier}"] = config.llm_tier_fallback(tier, False)
+        out[f"fallback_{tier}_visitor"] = config.llm_tier_fallback(tier, True)
+    return out
 
 
 def get_llm_runtime_state(conn: sqlite3.Connection) -> dict[str, str]:
-    """读六档选定模型 {model_<tier>[_visitor]: 模型名}。
-    以 config.LLM_TIER_MODELS 为准补齐缺失键（旧库首次加表未 seed 到的），回退各自 default，
-    确保调用方永远拿得到 6 个键。"""
+    """读 12 个槽位 {model_/fallback_<tier>[_visitor]: 模型名}。
+    以 config 为准补齐缺失键（旧库首次加表未 seed 到的），回退各自默认，
+    确保调用方永远拿得到 12 个键。"""
     rows = dict(conn.execute("SELECT key, value FROM llm_runtime_state").fetchall())
-    out: dict[str, str] = {}
-    for tier in config.LLM_TIER_MODELS:
-        out[f"model_{tier}"] = str(
-            rows.get(f"model_{tier}", config.llm_tier_default(tier, False)))
-        out[f"model_{tier}_visitor"] = str(
-            rows.get(f"model_{tier}_visitor", config.llm_tier_default(tier, True)))
-    return out
+    return {key: str(rows.get(key, default))
+            for key, default in _runtime_defaults().items()}
 
 
 def set_llm_runtime_state(conn: sqlite3.Connection, key: str, value: str,
                           allow_any: bool = False) -> bool:
-    """写单档单角色选定模型（UPSERT）。key ∈ model_<tier>[_visitor] 白名单；
-    默认校验 value ∈ 该档该角色 choices，allow_any=True 时豁免（一键回退模型用）。非法返回 False。"""
+    """写单个槽位（UPSERT）。key ∈ model_/fallback_<tier>[_visitor] 白名单；
+    默认校验 value ∈ 该档可选池（config.llm_tier_eligible_models），
+    allow_any=True 时豁免（一键回退等内部调用）。非法返回 False。
+
+    回退槽额外允许空串（= 清空回退，不做跨组逃生）。
+    ⚠️ 这里【不】校验「该模型的组有没有配密钥」——那是 .env 决定的运行时状态，
+    db 层不能 import llm_client（会与 llm_client → db 成环）。该校验在
+    llm_client / tgbot 调用前完成。
+    """
     parsed = _parse_runtime_key(key)
     if parsed is None:
         return False
-    tier, visitor = parsed
-    if not allow_any and value not in config.llm_tier_choices(tier, visitor):
-        return False
+    tier, _visitor, kind = parsed
+    value = str(value).strip()
+    if not allow_any:
+        if kind == "fallback" and value == "":
+            pass                      # 清空回退，合法
+        elif value not in config.llm_tier_eligible_models(tier):
+            return False
     conn.execute(
         "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
         "updated_at=excluded.updated_at",
-        (key, str(value), _now_utc_iso()))
+        (key, value, _now_utc_iso()))
     conn.commit()
     return True
 
 
 def reset_llm_runtime_state(conn: sqlite3.Connection) -> None:
-    """把六档模型恢复为 config 的 default/visitor_default（主模型默认）。"""
+    """把 12 个槽位（6 主 + 6 回退）全部恢复为 config 默认。"""
     now = _now_utc_iso()
-    rows = []
-    for tier in config.LLM_TIER_MODELS:
-        rows.append((f"model_{tier}", config.llm_tier_default(tier, False), now))
-        rows.append((f"model_{tier}_visitor",
-                     config.llm_tier_default(tier, True), now))
+    rows = [(key, value, now) for key, value in _runtime_defaults().items()]
     conn.executemany(
         "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "

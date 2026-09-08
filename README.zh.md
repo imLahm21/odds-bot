@@ -123,19 +123,29 @@ probe.py             # 阶段0 探针：实测 API 真实 JSON（开发用，部
   他即成访客——能选比赛跑 `/analyze`、`/review`、订阅走地，但碰不到你的联赛/庄家配置。
   注意：访客跑精算会消耗你的 LLM/API 额度；各人与 bot 的私聊互相独立、互不可见。
 
-### 三档模型与推理强度
+### 三档模型、密钥授权组与回退
 
-LLM 精算按**档位**（而非写死模型名）路由，运行时可在 `/llm` 面板随时切换、免重启：
+LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/访客两个角色，每个角色各有
+**主模型 + 回退模型**，共 12 个槽位，运行时可在 `/llm` 面板随时切换、免重启：
 
-| 档位 | 用途 | 管理员主模型 | 访客主模型 | 回退模型 |
-|------|------|--------------|------------|----------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review`）| `gpt-6-astra` | `deepseek-v4-flash` | 管理员 `grok-4.6`；访客 `deepseek-v4-flash` |
-| 平衡 balanced | 基本面预分析 + SEO/科普段 | `gpt-5.6-sol` | `deepseek-v4-flash` | 管理员 `grok-4.6`；访客 `deepseek-v4-flash` |
-| 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` | 双方 `glm-5.3-flash` |
+| 档位 | 用途 | 管理员主模型 | 访客主模型 |
+|------|------|--------------|------------|
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` | `deepseek-v4-flash` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-5.6-sol` | `deepseek-v4-flash` |
+| 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` |
+
+**密钥按授权组隔离**：不同模型家族（GPT/Grok/DeepSeek/GLM）通常需要不同的密钥——
+一条只授权 GPT 的密钥请求 Grok 必然 403。每个模型按名字前缀自动归到对应授权组
+（`ik_gpt`/`ik_grok`/`ik_deepseek`/`ik_glm`/`openai_gpt`），一条密钥只属于一个组，
+组内可配多条密钥轮转。缺组时该组模型在 `/llm` 面板标 ❌，可用回退模型顶上。
 
 - **推理强度**：`/analyze` 选完预设/自定义后再选一档（低/普通/高/极高/最高/超高）；访客仅限低/普通/高。
-- **多端点故障转移**：主端点 + 任意多个备用端点，一条不通自动切下一条；坏端点触发熔断后冷却自动恢复，熔断/恢复会 TG 告警管理员。
-- **一键回退**：主模型异常时，管理员在 `/llm` 点「🛟 启用回退模型」；点「✨ 恢复主模型默认」即可恢复。
+- **多端点故障转移**：同组内多条密钥自动轮转/切换；某模型所在组全部熔断/无密钥时，
+  自动升级到该槽位设定的回退模型（可能落到另一个密钥组）。坏端点触发熔断后冷却自动
+  恢复，熔断/恢复会 TG 告警管理员。
+- **面板操作**：管理员发 `/llm` 可按密钥组测试（🧪）、开关端点、调熔断参数，
+  并给 12 个槽位分别选主/回退模型（点「🎚️主」/「🛟退」进选择器）；
+  「🛟 一键切到回退模型」把当前回退值批量搬进主槽，「✨ 恢复模型默认」还原。
 
 ---
 
@@ -270,19 +280,14 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 # 可选：/publish 成功后可广播的群/频道，格式「标签|chat_id」逗号分隔（-100 开头）
 # TELEGRAM_BROADCAST_TARGETS=群聊|-1001111111,频道|-1002222222
 
-# OpenAI 官方主端点只承载 Luna
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=你的OpenAI官方密钥
-LLM_SUPPORTED_MODELS=gpt-5.6-luna
-# 可选：多端点故障转移。主端点=上面的 LLM_BASE_URL/LLM_API_KEY；这里追加备用，
-# 逗号或换行分隔、条数不限。每条格式：
-# key|base_url|标签|可选模型映射|支持模型列表
-#   - base_url 省略 → 复用主端点 URL；标签省略 → 自动编号
-#   - 第4段留空表示跟随 /llm 档位；第5段用冒号列出该端点支持的模型
-#   - 不支持的模型会直接跳过，不发请求、不计故障、不触发熔断
-# 一条不通自动切下一条，坏端点触发熔断后冷却自动恢复；熔断/恢复会 TG 告警管理员。
-# ⚠️ base_url 记得带 /v1（漏了会「HTTP200 假通」）。管理员发 /llm 可测连通性并实时改熔断参数。
-# LLM_ENDPOINTS=<IKUNCODE_KEY>|https://api.ikuncode.cc/v1|Codex||gpt-6-astra:gpt-5.6-sol:deepseek-v4-flash:grok-4.6:glm-5.3-flash
+# LLM 密钥按授权组配置；逗号分隔，格式：group|key|base_url|标签
+# 同一组可重复多条 key，bot 只在组内轮转；一条 key 不得重复放进多个组。
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+# 旧 LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS 已彻底不参与路由（无论是否设置这个新变量都一样）；
+# 留着不会报错，但 /llm 面板会提示删除，避免误以为它们仍生效。
+# 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。
+# 保存后先运行：./venv/bin/python -m bot.llm_client
+# 静态检查不会显示密钥；issues 应为空，五个 group_counts 都应至少为 1。
 
 # 可选：把精算报告一键发布到 Ghost 博客（/publish）
 # GHOST_ADMIN_API_KEY=id:secret     # Ghost 后台 Integrations 里生成

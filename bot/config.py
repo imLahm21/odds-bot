@@ -288,10 +288,8 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
                               # 外键，不随 CLEANUP_DAYS 的子查询一起清，需独立保留期
 
 # ─── LLM 精算 (/analyze) ─────────────────────────────────────────────────────
-# 多供应商 OpenAI 兼容端点，从 .env 读；当前主端点仅承载官方 Luna：
-#   LLM_BASE_URL=https://api.openai.com/v1
-#   LLM_API_KEY=sk-xxx
-#   LLM_SUPPORTED_MODELS=gpt-5.6-luna
+# 密钥按授权组从 .env 的 LLM_ROUTE_ENDPOINTS 读取；格式 group|key|url|label。
+# 模型先由档位×角色选定，再由 llm_route_groups_for_model 定位唯一密钥组。
 # LLM_MODEL 是【重档默认模型】的兼容常量：等于 LLM_TIER_MODELS["heavy"]["default"]。
 # 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 astra/grok），
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
@@ -318,53 +316,75 @@ LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
 # 默认强度：未显式选择时用（如旧入口直接调 analyze 不带 effort 则传空=不附带字段）
 LLM_EFFORT_DEFAULT = "high"
 
-# ─── 三档模型（重/平衡/轻）运行时可选（TG /llm 面板切换，落 db.llm_runtime_state）──
-# 用户要能在主模型和回退模型间随时切换免重启。这里是三档候选的
-# 【唯一真相源】：db seed 读 default 灌初值、TG 面板展示 choices 供轮换、set 时校验 val∈choices。
-#   heavy    —— 主 SOP 精算（/analyze /review）
-#   balanced —— 基本面预分析 + SEO/科普段
+# ─── 模型清单（/llm 面板可选池的唯一真相源）─────────────────────────────────
+# 加新模型只改这一处：登记模型名 + 中文标签 + 允许哪几档选它。
+# 密钥组不在这里写 —— 由 llm_route_groups_for_model 按模型名前缀推导（见下文）。
+#   tiers —— 允许该模型出现在哪些档位的可选池里。
+#            light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放快模型；
+#            放推理重档（astra/sol/grok）进去会让单次研判几十秒，拖住下一轮抓取。
+LLM_MODELS: dict[str, dict] = {
+    "gpt-6-astra":       {"label": "GPT-6 Astra",
+                          "tiers": ("heavy", "balanced")},
+    "gpt-5.6-sol":       {"label": "GPT-5.6 Sol",
+                          "tiers": ("heavy", "balanced")},
+    "gpt-5.6-luna":      {"label": "GPT-5.6 Luna",
+                          "tiers": ("balanced", "light")},
+    "grok-4.6":          {"label": "Grok 4.6",
+                          "tiers": ("heavy", "balanced")},
+    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash",
+                          "tiers": ("heavy", "balanced", "light")},
+    "glm-5.3-flash":     {"label": "GLM-5.3 Flash",
+                          "tiers": ("balanced", "light")},
+}
+
+
+def llm_model_label(model: str) -> str:
+    """模型中文标签；未登记模型原样返回模型名。"""
+    return (LLM_MODELS.get(model) or {}).get("label", model)
+
+
+def llm_tier_eligible_models(tier: str) -> list[str]:
+    """某档位允许选的全部模型（登记顺序）。不判断有没有配密钥——
+    那是运行时状态，由 llm_client 结合已配端点判定。"""
+    return [name for name, spec in LLM_MODELS.items()
+            if tier in spec.get("tiers", ())]
+
+
+# ─── 三档模型（重/平衡/轻）运行时选定（TG /llm 面板切换，落 db.llm_runtime_state）──
+#   heavy    —— 主 SOP 精算（/analyze /review /parlay）
+#   balanced —— 基本面预分析 + SEO/科普段 + 教训提炼
 #   light    —— 走地实时研判
-# visitor=True 时使用该档独立的访客模型配置。
-# 每档存两份运行时选定：管理员自己用的（default/choices）+ 访客用的（visitor_default/visitor_choices）。
-# 访客重档/平衡档固定走 deepseek-v4-flash；轻档双方默认走 OpenAI 官方 Luna。
-# 管理员重档可在 astra/grok 间切换，平衡档可在 sol/grok 间切换。
-#   choices          —— 管理员该档可选模型
-#   visitor_choices  —— 访客该档可选模型（省略则同 choices）
-#   default          —— 管理员该档初值
-#   visitor_default  —— 访客该档初值（省略则同 default）
+# 每档两个角色（管理员 / 访客 visitor=True）各存【主模型 + 回退模型】两个值，共 12 个槽位。
+# 本表只提供**初值**（db seed 与「恢复默认」读它）；可选池来自 llm_tier_eligible_models，
+# 运行时真值在 db.llm_runtime_state，用户可在 /llm 面板自由改，免重启。
 LLM_TIER_MODELS: dict[str, dict] = {
-    "heavy":    {"label": "重档·主精算", "choices": ["gpt-6-astra", "grok-4.6"],
+    "heavy":    {"label": "重档·主精算",
                  "default": "gpt-6-astra",
-                 "visitor_choices": ["deepseek-v4-flash"],
                  "visitor_default": "deepseek-v4-flash"},
-    "balanced": {"label": "平衡·基本面/SEO", "choices": ["gpt-5.6-sol", "grok-4.6"],
+    "balanced": {"label": "平衡·基本面/SEO",
                  "default": "gpt-5.6-sol",
-                 "visitor_choices": ["deepseek-v4-flash"],
                  "visitor_default": "deepseek-v4-flash"},
     "light":    {"label": "轻档·走地",
-                 "choices": ["gpt-5.6-luna", "glm-5.3-flash"],
                  "default": "gpt-5.6-luna",
-                 "visitor_choices": ["gpt-5.6-luna", "glm-5.3-flash"],
                  "visitor_default": "gpt-5.6-luna"},
 }
 
 
 def llm_tier_choices(tier: str, visitor: bool = False) -> list[str]:
-    """取某档某角色的可选模型列表。访客用 visitor_choices（缺则回退 choices）。"""
-    spec = LLM_TIER_MODELS.get(tier, {})
-    if visitor:
-        return spec.get("visitor_choices", spec.get("choices", []))
-    return spec.get("choices", [])
+    """某档可选模型池。两个角色同池——访客用哪个模型由管理员在 /llm 面板指定，
+    不再按角色写死候选（visitor 参数保留仅为兼容既有调用点）。"""
+    return llm_tier_eligible_models(tier)
 
 
 def llm_tier_default(tier: str, visitor: bool = False) -> str:
-    """取某档某角色的默认模型。访客用 visitor_default（缺则回退 default）。"""
+    """取某档某角色的默认主模型。访客用 visitor_default（缺则回退 default）。"""
     spec = LLM_TIER_MODELS.get(tier, {})
     if visitor:
         return spec.get("visitor_default", spec.get("default", ""))
     return spec.get("default", "")
-# 一键回退：管理员在 /llm 点「启用回退模型」，六档一次性切换。
-# 当前回退方案按角色分别配置，全部走 IKuncode。
+# 回退模型的【初值】：每档每角色一个。db seed 与「恢复默认」读它灌初值，
+# 之后用户在 /llm 面板可自由改成任意同档合法模型（真值在 db.llm_runtime_state）。
+# 「🛟 启用回退模型」= 把每个槽位当前的回退值写进主模型槽（回退槽本身不动，可反复点）。
 LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     "heavy": {
         "admin": "grok-4.6",
@@ -382,19 +402,86 @@ LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
 
 
 def llm_tier_fallback(tier: str, visitor: bool = False) -> str:
-    """取某档某角色的一键回退模型。"""
+    """取某档某角色的回退模型【初值】。运行时真值读 db.llm_runtime_state。"""
     spec = LLM_FALLBACK_TIER_MODELS.get(tier, {})
     return spec.get("visitor" if visitor else "admin", "")
 
 
-# 兼容旧外部脚本：旧常量只代表管理员侧；bot 内部使用 llm_tier_fallback。
-LLM_LEGACY_TIER_MODELS = {
-    tier: spec["admin"] for tier, spec in LLM_FALLBACK_TIER_MODELS.items()
+# ─── 模型 → 密钥授权分组（非 secret，唯一真相源）────────────────────────────
+# IKuncode 的 key 按模型家族授权：一条 key 只属于一个分组，一个分组只含一个系列的
+# 模型，所以绝不能把某条 key 当成万能端点（GPT 的 key 拿去请求 grok 必然 403）。
+# 组 ID 是稳定的内部路由名，真实 key/base_url 只放 .env 的 LLM_ROUTE_ENDPOINTS。
+#   provider —— 供应商（同一家族可能同时有中转与官方两个组）
+#   families —— 该组承载的模型家族（模型名第一个 '-' 前的段）
+LLM_ROUTE_GROUPS: dict[str, dict] = {
+    "ik_gpt": {"label": "IKuncode · GPT", "provider": "ikuncode",
+               "families": ("gpt",)},
+    "ik_grok": {"label": "IKuncode · Grok", "provider": "ikuncode",
+                "families": ("grok",)},
+    "ik_deepseek": {"label": "IKuncode · DeepSeek", "provider": "ikuncode",
+                    "families": ("deepseek",)},
+    "ik_glm": {"label": "IKuncode · GLM", "provider": "ikuncode",
+               "families": ("glm",)},
+    "openai_gpt": {"label": "OpenAI 官方 · GPT", "provider": "openai",
+                   "families": ("gpt",)},
 }
+
+# 家族 → 默认密钥组。IKuncode 是主供应商，故各家族默认落到对应 ik_* 组；
+# 新增同系列模型（如 grok-4.7）自动归组，无需改代码。
+LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
+    "gpt": "ik_gpt",
+    "grok": "ik_grok",
+    "deepseek": "ik_deepseek",
+    "glm": "ik_glm",
+}
+
+# 显式覆盖：走官方供应商而非中转的少数模型。只有这里需要手写。
+# gpt-5.6-luna 走 OpenAI 官方，家族推导会把它错归到 ik_gpt，故必须覆盖。
+LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "gpt-5.6-luna": ("openai_gpt",),
+}
+
+
+def llm_model_family(model: str) -> str:
+    """模型家族 = 模型名第一个 '-' 前的段（小写）。gpt-6-astra → gpt。"""
+    return (model or "").strip().lower().split("-", 1)[0]
+
+
+def llm_route_groups_for_model(model: str) -> tuple[str, ...]:
+    """返回模型允许使用的有序密钥组。
+
+    覆盖表优先；否则按家族查默认组。未知家族返回空元组，由路由层拒绝并报错
+    （不静默放行——那会让错组的 key 去请求模型、白撞 403）。
+
+    ⚠️ 这是【纯名字 → 组】的推导，不校验模型是否仍在服役：探针/诊断需要能对任意
+    名字问「它该走哪组」。「这个模型还能不能用」由 llm_model_registered 判定。
+    """
+    override = LLM_MODEL_GROUP_OVERRIDES.get(model)
+    if override:
+        return override
+    group = LLM_MODEL_FAMILY_GROUPS.get(llm_model_family(model))
+    return (group,) if group else ()
+
+
+def llm_model_registered(model: str) -> bool:
+    """模型是否在服役清单里。
+
+    前缀推导的副作用：**已下线的模型名也能推出一个组**（如 gpt-5.6-terra → ik_gpt，
+    而该组确实有 key），于是它会「看起来可路由」，实际请求必然 404 model_not_found。
+    所以选路前必须过这道注册闸——LLM_MODELS 才是「还能用哪些模型」的真相源。
+    """
+    return model in LLM_MODELS
+
+
+def llm_models_in_group(group: str) -> list[str]:
+    """反查该密钥组承载的已登记模型（面板「组内模型」展示用）。"""
+    return [name for name in LLM_MODELS
+            if group in llm_route_groups_for_model(name)]
+
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
 # 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
-LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-07-role-split-luna-v3"
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-08-group-split-fallback-v1"
 
 # 精确识别上一版方案，解决 deepseek-v4-flash 在上一版中同时可能表示主轻档或
 # 回退轻档的歧义：主方案升级到 Luna，回退方案升级到 GLM Flash。

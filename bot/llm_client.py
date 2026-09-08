@@ -4,10 +4,13 @@ LLM 端点池 —— 多端点故障转移 + 每端点熔断器 + 连通性探�
 analyzer.py 只负责构造 prompt，真正的 HTTP 调用、重试、失败隔离全在这里。
 设计对标 cc switch 的「多供应商 + 熔断」思路，落到本项目的既有模式：
 
-  - 多端点来自 .env（secret 不落库）：主 LLM_BASE_URL/LLM_API_KEY 为 0 号端点，
-    LLM_ENDPOINTS 追加更多；可声明支持模型，不支持的请求直接跳过且不污染熔断。
+  - 端点只来自 .env 的 LLM_ROUTE_ENDPOINTS（group|key|url|label），每条 key
+    只属于一个授权组（IKuncode 按模型家族授权，一条 key 覆盖不了别的家族）。
     多 key 轮换/标记坏点/切换的模式移植自 api_client.py 的 _switch_key/api_get。
-  - 每端点一个内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），9 个可调参数
+  - 每个槽位（档位×角色）有【主模型 + 回退模型】：先按主模型定组、组内轮转与故障转移；
+    该组端点全走完仍无成功（全熔断/全停用/组内无端点）才升级到回退模型那组密钥。
+  - 先按角色/档位选模型，再按模型选密钥组，只在组内轮转和故障转移；每端点一个
+    内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），9 个可调参数
     来自 db.llm_settings（TG /llm 面板实时改，免重启），缺库/缺键回退 config 默认。
   - chat()：阻塞，按端点顺序故障转移，跳过 OPEN 端点，全挂返回错误串（不抛异常，
     保持 analyzer 既有契约：失败返回以「LLM 请求失败/超时/网络错误…」开头的说明串）。
@@ -93,103 +96,75 @@ def clean_header_value(raw: str) -> str:
 
 
 # ─── 端点池（.env 解析，进程启动一次）───────────────────────────────────────
-def _parse_model_map(spec: str) -> dict:
-    """解析端点第 4 段模型映射 → {"heavy":..., "balanced":..., "light":...}（缺项不含）。
-    兼容 2 段（旧）与 3 段（新）：
-      - 空/缺省 → {}（该端点不映射，各档用运行时选定模型）
-      - 2 段「重:轻」（旧格式）→ {"heavy":重, "light":轻}（平衡档回退运行时选定，不破坏老配置）
-        例 "gpt-6-astra:gpt-5.6-luna"
-      - 3 段「重:平衡:轻」（新格式）→ {"heavy":重, "balanced":平衡, "light":轻}
-        例 "gpt-6-astra:gpt-5.6-sol:gpt-5.6-luna"
-      - 空段跳过：如 "gpt-6-astra::gpt-5.6-luna"=只映射重和轻
+def _legacy_env_present() -> list[str]:
+    """检测 .env 里还留着的旧路由变量名（已不参与路由，仅用于面板提示）。
+
+    这次故障的根因就是「新分组逻辑写好了，但 .env 只有旧变量，于是整套新逻辑被绕过
+    且无任何告警」。旧变量现已彻底不参与路由，这里只负责把它们的存在显式报出来。
     """
-    spec = (spec or "").strip()
-    if not spec:
-        return {}
-    parts = [p.strip() for p in spec.split(":")]
-    m: dict = {}
-    if len(parts) >= 3:
-        # 3 段：重:平衡:轻
-        if parts[0]:
-            m["heavy"] = parts[0]
-        if parts[1]:
-            m["balanced"] = parts[1]
-        if parts[2]:
-            m["light"] = parts[2]
-    else:
-        # 2 段（或 1 段）：重[:轻]，向后兼容旧配置
-        if parts[0]:
-            m["heavy"] = parts[0]
-        if len(parts) > 1 and parts[1]:
-            m["light"] = parts[1]
-    return m
+    return [name for name in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_ENDPOINTS",
+                              "LLM_SUPPORTED_MODELS")
+            if os.getenv(name, "").strip()]
 
 
-def _parse_supported_models(spec: str) -> set[str] | None:
-    """解析端点支持模型列表（冒号分隔）；空值或 * 表示不限制、兼容旧配置。"""
-    names = {name.strip() for name in (spec or "").split(":")
-             if name.strip()}
-    if not names or "*" in names:
-        return None
-    return names
+def _parse_route_endpoints(raw: str | None = None) -> list[dict]:
+    """解析新分组格式：group|key|base_url|label。
 
-
-def _parse_endpoints() -> list[dict]:
-    """主端点 = LLM_BASE_URL/LLM_API_KEY（0 号，向后兼容）。
-    追加端点 = LLM_ENDPOINTS，逗号或换行分隔，每条
-    `key|base_url|标签|模型映射|支持模型列表`：
-      - base_url 省略 → 复用主端点 URL（用户「通常同一 base_url」的场景）
-      - 标签省略 → 自动编号「端点N」
-      - 第 4 段（模型映射）省略 → 不映射，三档都用运行时选定模型
-      - 第 5 段（冒号分隔）声明该端点支持的模型；不在列表就直接跳过且不计故障
-    主端点用 LLM_SUPPORTED_MODELS 声明能力；空值保持旧行为（视为支持全部模型）。
-    条数不限（想加几条加几条）。按 (key, base_url) 去重，避免同一端点被重复探测/统计。
+    每条凭据只属于一个授权组；同一组可重复多条 key。未知组、缺 key/url、或同一
+    key+url 被分配到多个组时拒绝该条，日志永不输出 key。
     """
-    main_url = clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
-    main_key = clean_header_value(os.getenv("LLM_API_KEY", ""))
-    main_supported = _parse_supported_models(
-        os.getenv("LLM_SUPPORTED_MODELS", ""))
+    source = os.getenv("LLM_ROUTE_ENDPOINTS", "") if raw is None else raw
     eps: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-
-    def _add(key: str, url: str, label: str, model_map: dict,
-             supported_models: set[str] | None) -> None:
-        if not (key and url):
-            return
-        sig = (key, url)
-        if sig in seen:
-            return
-        seen.add(sig)
-        eps.append({"key": key, "base_url": url, "label": label,
-                    "model_map": model_map,
-                    "supported_models": supported_models})
-
-    if main_url and main_key:
-        _add(main_key, main_url, "主端点", {}, main_supported)
-
-    raw = os.getenv("LLM_ENDPOINTS", "")
-    for item in re.split(r"[,\n]", raw):
+    seen: dict[str, str] = {}
+    for item in re.split(r"[,\n]", source):
         item = item.strip()
         if not item:
             continue
-        parts = [p.strip() for p in item.split("|")]
-        key = clean_header_value(parts[0]) if parts and parts[0] else ""
-        url = (clean_header_value(parts[1]).rstrip("/")
-               if len(parts) > 1 and parts[1] else main_url)
-        label = parts[2] if len(parts) > 2 and parts[2] else f"端点{len(eps) + 1}"
-        model_map = _parse_model_map(parts[3]) if len(parts) > 3 else {}
-        supported_models = _parse_supported_models(
-            parts[4] if len(parts) > 4 else "")
-        _add(key, url, label, model_map, supported_models)
+        parts = [part.strip() for part in item.split("|")]
+        if len(parts) < 4:
+            log.error("LLM_ROUTE_ENDPOINTS 条目字段不足（需 group|key|url|label）")
+            continue
+        group = parts[0]
+        key = clean_header_value(parts[1])
+        url = clean_header_value(parts[2]).rstrip("/")
+        label = parts[3] or f"{group}-{len(eps) + 1}"
+        if group not in config.LLM_ROUTE_GROUPS:
+            log.error("LLM_ROUTE_ENDPOINTS 含未知分组：%s", group)
+            continue
+        if not (key and url):
+            log.error("LLM_ROUTE_ENDPOINTS 分组 %s 缺 key 或 base_url", group)
+            continue
+        previous_group = seen.get(key)
+        if previous_group is not None:
+            if previous_group != group:
+                log.error("同一 LLM 凭据被分配到多个组：%s / %s",
+                          previous_group, group)
+            continue
+        seen[key] = group
+        eps.append({
+            "key": key,
+            "base_url": url,
+            "label": label,
+            "route_group": group,
+        })
     return eps
 
 
-_ENDPOINTS: list[dict] = _parse_endpoints()
+_ENDPOINTS: list[dict] = _parse_route_endpoints()
 
 
 def _sig(ep: dict) -> str:
-    """端点签名（label|base_url，不含 key），作 DB 开关状态的稳定主键——
+    """端点签名 group|label|url（不含 key），作 DB 稳定主键——
     不依赖易变的数组下标，增删端点后仍能对上原来的开关记录。"""
+    return f"{ep['route_group']}|{ep['label']}|{ep['base_url']}"
+
+
+def _legacy_sig(ep: dict) -> str:
+    """分组改造前的端点签名 label|url。
+
+    只用于【继承 DB 里旧的面板开关记录】（与 .env 解析无关）：老库里停用记录存的是
+    label|url，删掉这层继承会让已停用端点在升级后静默复活。
+    """
     return f"{ep['label']}|{ep['base_url']}"
 
 
@@ -200,18 +175,21 @@ _runtime_models: dict[str, str] | None = None
 _runtime_lock = threading.Lock()
 
 
-def _rt_key(tier: str, visitor: bool) -> str:
-    """runtime-state 键：管理员 model_<tier>，访客 model_<tier>_visitor。"""
-    return f"model_{tier}_visitor" if visitor else f"model_{tier}"
+def _rt_key(tier: str, visitor: bool, kind: str = "model") -> str:
+    """runtime-state 键：kind='model' 取主模型槽、'fallback' 取回退模型槽；
+    管理员 <kind>_<tier>，访客 <kind>_<tier>_visitor。"""
+    return f"{kind}_{tier}_visitor" if visitor else f"{kind}_{tier}"
 
 
 def _load_runtime_models() -> dict[str, str]:
-    """从 db.llm_runtime_state 读六档选定模型 {model_<tier>[_visitor]: 模型名}；
+    """从 db.llm_runtime_state 读 12 个槽位（6 主 + 6 回退）；
     DB 异常回退 config 默认（管理员+访客各自）。"""
     defaults: dict[str, str] = {}
     for t in config.LLM_TIER_MODELS:
         defaults[f"model_{t}"] = config.llm_tier_default(t, False)
         defaults[f"model_{t}_visitor"] = config.llm_tier_default(t, True)
+        defaults[f"fallback_{t}"] = config.llm_tier_fallback(t, False)
+        defaults[f"fallback_{t}_visitor"] = config.llm_tier_fallback(t, True)
     try:
         conn = db.get_conn()
         try:
@@ -244,37 +222,67 @@ def reload_runtime_models() -> None:
         _runtime_models = None
 
 
-def set_tier_model(tier: str, model: str, visitor: bool = False) -> bool:
-    """切换某档某角色选定模型并落库、刷新缓存。校验 model ∈ 该档该角色 choices；非法返回 False。"""
+def get_fallback_model(tier: str, visitor: bool = False) -> str:
+    """取某档某角色当前选定的【回退模型】；空串 = 未设回退（不做跨组逃生）。"""
+    global _runtime_models
+    if _runtime_models is None:
+        with _runtime_lock:
+            if _runtime_models is None:
+                _runtime_models = _load_runtime_models()
+    return _runtime_models.get(_rt_key(tier, visitor, "fallback"),
+                               config.llm_tier_fallback(tier, visitor)) or ""
+
+
+def _set_slot(tier: str, model: str, visitor: bool, kind: str) -> bool:
+    """写单个槽位并刷新缓存。校验 tier 合法 + model ∈ 该档可选池（回退槽允许空串）。"""
     if tier not in config.LLM_TIER_MODELS:
         return False
     try:
         conn = db.get_conn()
         try:
-            ok = db.set_llm_runtime_state(conn, _rt_key(tier, visitor), model)
+            ok = db.set_llm_runtime_state(
+                conn, _rt_key(tier, visitor, kind), model)
         finally:
             conn.close()
     except Exception as e:
-        log.warning("写 llm_runtime_state 失败 tier=%s visitor=%s: %s", tier, visitor, e)
+        log.warning("写 llm_runtime_state 失败 tier=%s visitor=%s kind=%s: %s",
+                    tier, visitor, kind, e)
         return False
     if ok:
         reload_runtime_models()
     return ok
 
 
+def set_tier_model(tier: str, model: str, visitor: bool = False) -> bool:
+    """切换某档某角色的【主模型】并落库、刷新缓存。非法返回 False。"""
+    return _set_slot(tier, model, visitor, "model")
+
+
+def set_fallback_model(tier: str, model: str, visitor: bool = False) -> bool:
+    """切换某档某角色的【回退模型】并落库；model 传空串 = 清空回退。"""
+    return _set_slot(tier, model, visitor, "fallback")
+
+
 def apply_fallback_models() -> None:
-    """一键启用按角色配置的六档回退模型，免重启。"""
+    """一键回退：把每个槽位当前选定的【回退模型】写进【主模型】槽，免重启。
+
+    回退槽本身不动，故可反复点（幂等）。回退值为空或与主模型相同的槽位跳过。
+    模型由用户在 /llm 面板自选，这里不读 config 常量。
+    """
+    # 先失效缓存再读：本函数「读回退值 → 写进主模型槽」，若缓存是旧的（换过 DB
+    # 或别处刚改过值），会把过期的回退模型写进主槽。
+    reload_runtime_models()
     try:
         conn = db.get_conn()
         try:
-            for tier in config.LLM_FALLBACK_TIER_MODELS:
-                admin_model = config.llm_tier_fallback(tier, False)
-                visitor_model = config.llm_tier_fallback(tier, True)
-                db.set_llm_runtime_state(
-                    conn, f"model_{tier}", admin_model, allow_any=True)
-                db.set_llm_runtime_state(
-                    conn, f"model_{tier}_visitor", visitor_model,
-                    allow_any=True)
+            for tier in config.LLM_TIER_MODELS:
+                for visitor in (False, True):
+                    target = get_fallback_model(tier, visitor)
+                    if not target or target == get_tier_model(tier, visitor):
+                        continue
+                    db.set_llm_runtime_state(
+                        conn, _rt_key(tier, visitor, "model"), target,
+                        allow_any=True)
         finally:
             conn.close()
     except Exception as e:
@@ -282,13 +290,8 @@ def apply_fallback_models() -> None:
     reload_runtime_models()
 
 
-def apply_legacy_models() -> None:
-    """兼容旧调用名；行为等同 apply_fallback_models。"""
-    apply_fallback_models()
-
-
 def reset_runtime_models() -> None:
-    """恢复主模型默认（管理员 astra/sol/luna，访客 deepseek/deepseek/luna）。"""
+    """把 12 个槽位（6 主 + 6 回退）恢复为 config 默认。"""
     try:
         conn = db.get_conn()
         try:
@@ -300,22 +303,99 @@ def reset_runtime_models() -> None:
     reload_runtime_models()
 
 
-def _resolve_model(tier: str, ep: dict, visitor: bool = False) -> str:
-    """按【档位×角色】解析该端点该用的真实模型名：
-      - 端点有该档映射（.env 第4段）→ 用映射值（端点级覆盖最高，不分角色）。
-      - 否则用该档该角色运行时选定模型（/llm 面板可切、DB 持久化）。
-    彻底不再靠模型名猜档位，模型随便换都不影响路由。
-    """
-    mm = ep.get("model_map") or {}
-    if tier in mm:
-        return mm[tier]
-    return get_tier_model(tier, visitor)
-
-
 def _supports_model(ep: dict, model: str) -> bool:
-    """端点是否声明支持该模型；未声明时为向后兼容视为支持全部。"""
-    supported = ep.get("supported_models")
-    return supported is None or model in supported
+    """端点的授权组是否覆盖该模型。"""
+    return ep["route_group"] in config.llm_route_groups_for_model(model)
+
+
+def resolve_model_chain(tier: str, visitor: bool = False) -> list[str]:
+    """某槽位的模型尝试顺序：[主模型, 回退模型]。
+
+    去重去空后，丢掉「所在密钥组在 .env 里一条端点都没配」的模型——只买了 GPT 密钥时
+    访客重档默认的 deepseek 就属于这种，靠回退模型自动兜住。全丢完返回 []，
+    由调用方报出缺哪个组（**不静默替换成用户没选的模型**——静默替换正是这次故障
+    难以察觉的原因）。
+
+    链长封顶 2：一次请求最多升级一次，额度可预期。
+    """
+    chain: list[str] = []
+    for model in (get_tier_model(tier, visitor),
+                  get_fallback_model(tier, visitor)):
+        if not model or model in chain:
+            continue
+        if not configured_count_for_model(model):
+            continue
+        # 未登记模型照样入链（可能是用户指向网关的私有模型），但记一条告警：
+        # 前缀推导对已下线的名字也会推出「有 key」的组（gpt-5.6-terra → ik_gpt），
+        # 这类请求会 404 model_not_found，日志里要能一眼看出是模型名的问题。
+        if not config.llm_model_registered(model):
+            log.warning("槽位 tier=%s visitor=%s 的模型 %s 未登记于 "
+                        "config.LLM_MODELS，按前缀路由到 %s；若上游不认该名字会 404",
+                        tier, visitor, model,
+                        "/".join(config.llm_route_groups_for_model(model)))
+        chain.append(model)
+    return chain
+
+
+def chain_error(tier: str, visitor: bool = False) -> str:
+    """模型链为空时的精确错误串：点名每个候选模型缺哪个密钥组。"""
+    role = "访客" if visitor else "管理员"
+    label = (config.LLM_TIER_MODELS.get(tier) or {}).get("label", tier)
+    parts = []
+    for model in (get_tier_model(tier, visitor),
+                  get_fallback_model(tier, visitor)):
+        if not model:
+            continue
+        groups = config.llm_route_groups_for_model(model)
+        why = ("缺密钥组 " + "/".join(groups)) if groups else "未登记密钥组"
+        parts.append(f"{model}（{why}）")
+    detail = "；".join(parts) or "未选定任何模型"
+    return (f"LLM 请求失败（{label}·{role} 无可用模型：{detail}。"
+            "请在 .env 的 LLM_ROUTE_ENDPOINTS 补该组密钥，或用 /llm 面板改选模型）")
+
+
+def route_groups_for_model(model: str) -> tuple[str, ...]:
+    """公开模型的有序路由组，供面板与审计展示。"""
+    return config.llm_route_groups_for_model(model)
+
+
+def routing_issues() -> list[str]:
+    """逐个检查 12 个槽位当前选定的模型有没有已配密钥组；不读取或暴露 key。
+
+    同时把 .env 里残留的旧路由变量报出来——这次故障就是「旧变量在、新变量缺，
+    整套分组逻辑被静默绕过」，所以残留必须显式可见。
+    """
+    issues: list[str] = []
+    seen: set[str] = set()
+    for tier, spec in config.LLM_TIER_MODELS.items():
+        label = spec.get("label", tier)
+        for visitor in (False, True):
+            role = "访客" if visitor else "管理员"
+            for kind, model in (("主", get_tier_model(tier, visitor)),
+                                ("回退", get_fallback_model(tier, visitor))):
+                if not model:
+                    continue        # 回退可以不设，不算问题
+                groups = config.llm_route_groups_for_model(model)
+                if not groups:
+                    reason = f"模型 {model} 未登记密钥组"
+                elif not configured_count_for_model(model):
+                    reason = f"模型 {model} 缺密钥组：{'/'.join(groups)}"
+                elif not config.llm_model_registered(model):
+                    # 不算硬故障（可能是网关私有模型），但要提示无法本地校验。
+                    reason = (f"模型 {model} 不在 config.LLM_MODELS，"
+                              f"已按前缀路由到 {'/'.join(groups)}；"
+                              "若上游不认该名字会 404，请确认或改选")
+                else:
+                    continue
+                item = f"{label}·{role}·{kind}：{reason}"
+                if item not in seen:
+                    seen.add(item)
+                    issues.append(item)
+    leftovers = _legacy_env_present()
+    if leftovers:
+        issues.append(f"⚠️ .env 仍有旧变量 {'/'.join(leftovers)}，"
+                      "它们已不参与路由，可删除以免误判配置生效")
+    return issues
 
 
 def available() -> bool:
@@ -324,13 +404,15 @@ def available() -> bool:
 
 
 def endpoints() -> list[dict]:
-    """只读端点列表（含模型映射/能力，不含 key）供 TG 面板展示。"""
+    """只读端点列表（含授权组，不含 key）供 TG 面板展示。"""
     return [{"label": e["label"], "base_url": e["base_url"],
-             "model_map": e.get("model_map") or {},
-             "supported_models": (sorted(e["supported_models"])
-                                  if e.get("supported_models") is not None
-                                  else None)}
+             "route_group": e["route_group"]}
             for e in _ENDPOINTS]
+
+
+def configured_groups() -> set[str]:
+    """.env 里实际配了密钥的授权组集合。"""
+    return {ep["route_group"] for ep in _ENDPOINTS}
 
 
 # ─── 端点手动开关（DB 懒加载，TG 改后 reload_endpoint_state 失效）────────────
@@ -345,7 +427,12 @@ def _load_disabled() -> set[str]:
     try:
         conn = db.get_conn()
         try:
-            return db.get_disabled_endpoints(conn)
+            disabled = db.get_disabled_endpoints(conn)
+            # 新签名加入 group；若旧 label|url 曾被停用，先在内存继承该状态。
+            for ep in _ENDPOINTS:
+                if _legacy_sig(ep) in disabled:
+                    disabled.add(_sig(ep))
+            return disabled
         finally:
             conn.close()
     except Exception as e:
@@ -382,6 +469,17 @@ def enabled_count() -> int:
     return sum(1 for i in range(len(_ENDPOINTS)) if is_enabled(i))
 
 
+def configured_count_for_model(model: str) -> int:
+    """配置中可承载指定模型的端点数（含手动停用的）。"""
+    return sum(1 for ep in _ENDPOINTS if _supports_model(ep, model))
+
+
+def enabled_count_for_model(model: str) -> int:
+    """当前启用且可承载指定模型的端点数。"""
+    return sum(1 for i, ep in enumerate(_ENDPOINTS)
+               if _supports_model(ep, model) and is_enabled(i))
+
+
 def set_enabled(idx: int, enabled: bool) -> bool:
     """手动开/关指定端点并落库，刷新缓存。越界返回 False。"""
     if not (0 <= idx < len(_ENDPOINTS)):
@@ -390,6 +488,10 @@ def set_enabled(idx: int, enabled: bool) -> bool:
         conn = db.get_conn()
         try:
             db.set_endpoint_disabled(conn, _sig(_ENDPOINTS[idx]), not enabled)
+            # 用户重新启用时清掉旧签名，否则下次重启会再次继承为停用。
+            if enabled:
+                db.set_endpoint_disabled(
+                    conn, _legacy_sig(_ENDPOINTS[idx]), False)
         finally:
             conn.close()
     except Exception as e:
@@ -695,32 +797,32 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
 # 手动停用端点直接排除。返回按优先级排好序的 [(idx, ep)]，调用方仍需逐个 br.allow()。
 _STATE_PRIORITY = {"CLOSED": 0, "HALF_OPEN": 0, "OPEN": 1, "DEGRADED": 2}
 
-# 轮转计数器：把并发请求的【起始端点】错开，避免全压同一个 key 撞单 key TPM 限流。
+# 每个授权组独立轮转：把并发请求的【起始端点】错开，避免全压同一个 key。
 # 背景：中转商按令牌分组限流（各 key 129K~285K TPM），单次精算下行 15~28 万 token；
 # 几秒内连点多场若都从同一端点起头，瞬时 token 叠加必撞 429（实测 429 集中在容量最小的
 # 分组）。轮转让每场落到不同 key，各自远低于自身 TPM。
-# 对所有启用端点【一律平等】——故障是随机分布在各分组的，不做任何端点偏好/权重；
-# 不可用分组由运维在 /llm 面板手动停用（停用端点在上面就被过滤，不参与轮转）。
-_rr_counter = 0
+_rr_counters: dict[str, int] = {}
 _rr_lock = threading.Lock()
 
 
-def _endpoints_by_priority() -> list[tuple[int, dict]]:
-    """未手动停用的端点按选路优先级排序：正常/半开(0) < OPEN(1) < 降级(2)。
-    降级端点排最后——健康端点先跑，降级的只在健康端点都用不上时才轮到。
+def _endpoints_by_priority(model: str = "") -> list[tuple[int, dict]]:
+    """该模型可用的端点（已排除手动停用）按选路优先级排序：
+    正常/半开(0) < OPEN(1) < 降级(2)。降级端点排最后——健康端点先跑，
+    降级的只在健康端点都用不上时才轮到。
 
-    同优先级组内不再固定用 .env 原序，而是按请求【轮转起始位置】，使并发请求
-    分散到不同 key（见 _rr_counter 说明）。故障转移语义不变：仍"不行就试下一个"，
-    只是"第一个"换着来。单端点部署无影响（只有一个候选，旋转等于原序）。
+    先按 model 限定授权组，再只在该组内轮转：GPT 的 key 永远不会被拿去请求 grok。
     """
-    global _rr_counter
     disabled = _get_disabled()
+    groups = config.llm_route_groups_for_model(model)
+    group_set = set(groups)
     cands = [(i, ep) for i, ep in enumerate(_ENDPOINTS)
-             if _sig(ep) not in disabled]
+             if _sig(ep) not in disabled and ep["route_group"] in group_set]
+    route_key = "|".join(groups) or f"unmapped:{model}"
     if len(cands) > 1:
         with _rr_lock:
-            _rr_counter = (_rr_counter + 1) % len(cands)
-            shift = _rr_counter
+            current = (_rr_counters.get(route_key, -1) + 1) % len(cands)
+            _rr_counters[route_key] = current
+            shift = current
         cands = cands[shift:] + cands[:shift]   # 旋转起点
     # 稳定排序：组内保持上面旋转后的相对次序，仅按熔断状态分层
     return sorted(cands, key=lambda t: _STATE_PRIORITY.get(
@@ -737,51 +839,56 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     未显式传 timeout 时用 DB 的 non_stream_timeout。
     """
     if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
+        return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
     st = get_settings()
     read_to = int(timeout or st["non_stream_timeout"])
     max_retries = int(st["max_retries"])
     tok = max_tokens or config.LLM_MAX_TOKENS
 
+    chain = resolve_model_chain(tier, visitor)
+    if not chain:
+        return chain_error(tier, visitor)
+
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
     all_timeout = True            # 是否全部端点都是超时类失败
-    eligible_count = 0            # 声明支持本次真实模型的已启用端点数
-    requested_models: set[str] = set()
-    for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
-        # 先按档位×角色解析真实模型；端点未声明支持时直接跳过，不请求、不污染熔断。
-        model = _resolve_model(tier, ep, visitor)
-        requested_models.add(model)
-        if not _supports_model(ep, model):
-            continue
-        eligible_count += 1
-        br = _breakers[idx]
-        if not br.allow():
-            labeled.append(f"{ep['label']}熔断跳过")
-            all_timeout = False
-            continue
-        payload = _payload(model, system, user, tok, effort, False)
-        content, ok, err, was_to, rate_limited = _do_chat(
-            ep, payload, read_to, max_retries)
-        # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
-        # 暂时超 TPM 的 key 误熔断 90s，反而加剧其余 key 压力。5xx/超时仍照记。
-        if not rate_limited:
-            br.record(ok)
-        if ok:
-            return content
-        raw_errs.append(err)
-        labeled.append(f"{ep['label']}：{err}")
-        if not was_to:
-            all_timeout = False
+    for pos, model in enumerate(chain):
+        if pos:
+            log.warning("模型 %s 的密钥组全部不可用，升级到回退模型 %s",
+                        chain[pos - 1], model)
+        for idx, ep in _endpoints_by_priority(model):
+            br = _breakers[idx]
+            if not br.allow():
+                labeled.append(f"{ep['label']}熔断跳过")
+                all_timeout = False
+                continue
+            log.info("LLM路由 role=%s tier=%s model=%s group=%s endpoint=%s",
+                     "访客" if visitor else "管理员", tier, model,
+                     ep["route_group"], ep["label"])
+            payload = _payload(model, system, user, tok, effort, False)
+            content, ok, err, was_to, rate_limited = _do_chat(
+                ep, payload, read_to, max_retries)
+            # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
+            # 暂时超 TPM 的 key 误熔断 90s，反而加剧其余 key 压力。5xx/超时仍照记。
+            if not rate_limited:
+                br.record(ok)
+            if ok:
+                return content
+            raw_errs.append(err)
+            labeled.append(f"{ep['label']}({model})：{err}")
+            if not was_to:
+                all_timeout = False
 
     if not raw_errs:   # 无任何端点尝试：要么全被手动停用，要么全被熔断跳过
         if enabled_count() == 0:
             return ("LLM 请求失败（所有端点均被手动停用，请用 /llm 面板开启至少"
                     "一个端点）")
-        if eligible_count == 0:
-            models = "、".join(sorted(requested_models)) or "当前模型"
-            return (f"LLM 请求失败（已启用端点均未声明支持：{models}；"
-                    "请检查 .env 的支持模型列表）")
+        if not any(enabled_count_for_model(m) for m in chain):
+            groups = "/".join(sorted(
+                g for m in chain
+                for g in config.llm_route_groups_for_model(m)))
+            return (f"LLM 请求失败（模型 {'、'.join(chain)} 的密钥组 "
+                    f"{groups} 已全部手动停用）")
         return ("LLM 请求失败（所有端点均处于熔断中，暂无可用端点，"
                 "请稍后重试或用 /llm 重置熔断）")
     if len(_ENDPOINTS) == 1:
@@ -923,61 +1030,64 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     max_tokens 非默认时覆盖（基本面预处理传较小预算，使其也能流式跑、停止按钮低延迟生效）。
     """
     if not available():
-        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
+        yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
         return
     st = get_settings()
     first_byte_to = int(st["stream_first_byte_timeout"])
     idle_to = int(st["stream_idle_timeout"])
     tok = max_tokens or config.LLM_MAX_TOKENS
 
+    chain = resolve_model_chain(tier, visitor)
+    if not chain:
+        yield ("error", chain_error(tier, visitor))
+        return
+
     last_err = None
-    eligible_count = 0
-    requested_models: set[str] = set()
-    for idx, ep in _endpoints_by_priority():   # 正常端点先、降级端点后
-        model = _resolve_model(tier, ep, visitor)
-        requested_models.add(model)
-        if not _supports_model(ep, model):
-            continue
-        eligible_count += 1
-        br = _breakers[idx]
-        if not br.allow():
-            last_err = f"{ep['label']} 熔断中（已跳过）"
-            continue
-        payload = _payload(model, system, user, tok, effort, True)
-        produced = False        # 是否已向用户吐过正文 delta
-        failed_pre = False      # 首字节前失败 → 可切下一端点
-        for ev in _stream_one(ep, payload, first_byte_to, idle_to,
-                              int(st["max_retries"])):
-            if ev[0] == "delta":
-                produced = True
-                yield ev
-            elif ev[0] == "done":
-                br.record(True)
-                yield ev
-                return
-            elif ev[0] == "ratelimit":
-                # 限流(429)：不喂熔断器（健康 key 只是暂时超 TPM，误熔断会加剧其余 key
-                # 压力），直接换下一端点。ratelimit 只在首字节前产生，故不会重复输出。
-                last_err = ev[1]
-                failed_pre = True
-                break
-            elif ev[0] == "error":
-                br.record(False)
-                if produced:
-                    # 已吐正文再断：不能静默换端点重来（会重复可见输出），直接报错。
+    for pos, model in enumerate(chain):
+        if pos:
+            log.warning("模型 %s 的密钥组全部不可用，流式升级到回退模型 %s",
+                        chain[pos - 1], model)
+        for idx, ep in _endpoints_by_priority(model):
+            br = _breakers[idx]
+            if not br.allow():
+                last_err = f"{ep['label']} 熔断中（已跳过）"
+                continue
+            log.info("LLM流式路由 role=%s tier=%s model=%s group=%s endpoint=%s",
+                     "访客" if visitor else "管理员", tier, model,
+                     ep["route_group"], ep["label"])
+            payload = _payload(model, system, user, tok, effort, True)
+            produced = False        # 是否已向用户吐过正文 delta
+            for ev in _stream_one(ep, payload, first_byte_to, idle_to,
+                                  int(st["max_retries"])):
+                if ev[0] == "delta":
+                    produced = True
+                    yield ev
+                elif ev[0] == "done":
+                    br.record(True)
                     yield ev
                     return
-                last_err = ev[1]
-                failed_pre = True
-                break
-        if failed_pre:
-            continue   # 首字节前失败/限流，尝试下一端点
+                elif ev[0] == "ratelimit":
+                    # 限流(429)：不喂熔断器（健康 key 只是暂时超 TPM，误熔断会加剧其余
+                    # key 压力），直接换下一端点。ratelimit 只在首字节前产生。
+                    last_err = ev[1]
+                    break
+                elif ev[0] == "error":
+                    br.record(False)
+                    if produced:
+                        # 已吐正文再断：不能静默换端点/换模型重来（会重复可见输出），
+                        # 直接报错返回。
+                        yield ev
+                        return
+                    last_err = ev[1]
+                    break
     if last_err is None and enabled_count() == 0:
         yield ("error", "LLM 全部端点均被手动停用（请用 /llm 面板开启至少一个端点）")
         return
-    if last_err is None and eligible_count == 0:
-        models = "、".join(sorted(requested_models)) or "当前模型"
-        yield ("error", f"LLM 已启用端点均未声明支持：{models}（请检查 .env）")
+    if last_err is None:
+        groups = "/".join(sorted(
+            g for m in chain for g in config.llm_route_groups_for_model(m)))
+        yield ("error", f"模型 {'、'.join(chain)} 的密钥组 {groups} "
+                        "已全部手动停用")
         return
     yield ("error", last_err or "LLM 全部端点不可用（请用 /llm 测试/重置端点）")
 
@@ -1004,7 +1114,7 @@ def _save_probe(idx: int, res: dict) -> dict:
     return res
 
 
-def probe(idx: int, which: str = "heavy") -> dict:
+def probe(idx: int, which: str = "heavy", *, model: str = "") -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
     which ∈ heavy/balanced/light：测哪档——按该档运行时选定模型 + 端点映射解析真实模型名
     （端点有映射时测映射模型，否则测该角色当前档位模型）。
@@ -1016,14 +1126,14 @@ def probe(idx: int, which: str = "heavy") -> dict:
     有效结构）才判 ✅。200 但无 choices（如网关回错误体/无该模型权限/base_url 缺 /v1）
     → ok=False，标「200 但无补全内容」，让 Anyrouter 那种 53ms 假通当场露馅。
     """
-    if which not in config.LLM_TIER_MODELS:
+    if not model and which not in config.LLM_TIER_MODELS:
         which = "heavy"
     if not (0 <= idx < len(_ENDPOINTS)):
         return {"ok": False, "http_status": None, "latency_ms": 0,
                 "model": "", "req_model": "", "which": which,
                 "error": "端点序号越界", "breaker_state": "-"}
     ep = _ENDPOINTS[idx]
-    req_model = _resolve_model(which, ep)   # which 即档位
+    req_model = model or get_tier_model(which, False)
     bstate = _breakers[idx].state
     if not _supports_model(ep, req_model):
         return _save_probe(idx, {
@@ -1089,3 +1199,62 @@ def probe_all(which: str = "heavy") -> list[dict]:
         res["label"] = _ENDPOINTS[i]["label"]
         out.append(res)
     return out
+
+
+def probe_model(idx: int, model: str) -> dict:
+    """对指定端点测试明确模型，用于新密钥组面板；不经过当前档位选择。"""
+    return probe(idx, "model", model=model)
+
+
+def _slot_ready(model: str) -> bool:
+    """该模型此刻可派发：其密钥组已配端点。（是否在服役清单另有 *_retired 标记）"""
+    return bool(model and configured_count_for_model(model))
+
+
+def slot_snapshot() -> list[dict]:
+    """12 个槽位的模型链快照（不含 key），供面板/探针/测试展示。"""
+    out: list[dict] = []
+    for tier, spec in config.LLM_TIER_MODELS.items():
+        for visitor in (False, True):
+            primary = get_tier_model(tier, visitor)
+            fallback = get_fallback_model(tier, visitor)
+            out.append({
+                "tier": tier,
+                "label": spec.get("label", tier),
+                "role": "visitor" if visitor else "admin",
+                "primary": primary,
+                "primary_ready": _slot_ready(primary),
+                "primary_retired": bool(
+                    primary and not config.llm_model_registered(primary)),
+                "fallback": fallback,
+                "fallback_ready": _slot_ready(fallback),
+                "fallback_retired": bool(
+                    fallback and not config.llm_model_registered(fallback)),
+                "chain": resolve_model_chain(tier, visitor),
+            })
+    return out
+
+
+def routing_snapshot() -> dict:
+    """返回不含密钥的静态路由快照，供部署前检查和测试。"""
+    group_counts = {
+        group: sum(1 for ep in _ENDPOINTS if ep["route_group"] == group)
+        for group in config.LLM_ROUTE_GROUPS
+    }
+    model_routes = {
+        model: list(config.llm_route_groups_for_model(model))
+        for model in config.LLM_MODELS
+    }
+    return {
+        "issues": routing_issues(),
+        "group_counts": group_counts,
+        "model_routes": model_routes,
+        "slots": slot_snapshot(),
+        "endpoints": endpoints(),
+    }
+
+
+if __name__ == "__main__":
+    snapshot = routing_snapshot()
+    print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+    raise SystemExit(1 if snapshot["issues"] else 0)
