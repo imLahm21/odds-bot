@@ -144,12 +144,20 @@ def api_get(endpoint: str, params: dict | None = None,
 
 # ─── 业务端点封装 ────────────────────────────────────────────────────────────
 def fetch_fixtures(league_id: int, season: int,
-                   date_from: str, date_to: str) -> list:
-    """拉某联赛某赛季在日期区间内的赛程。"""
-    data = api_get("/fixtures", {
-        "league": league_id, "season": season,
-        "from": date_from, "to": date_to,
-    })
+                   date_from: str | None = None,
+                   date_to: str | None = None) -> list:
+    """拉某联赛某赛季的赛程；传入日期时才限制查询区间。
+
+    任务 A 使用完整赛季同步，避免上游把占位赛程移出原日期窗口后，本地记录因
+    再也收不到同一个 fixture_id 而永久保留旧开球时间。其他调用方仍可按需传
+    ``date_from`` / ``date_to`` 做区间查询。
+    """
+    params = {"league": league_id, "season": season}
+    if date_from:
+        params["from"] = date_from
+    if date_to:
+        params["to"] = date_to
+    data = api_get("/fixtures", params)
     return (data or {}).get("response", []) if data else []
 
 

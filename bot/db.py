@@ -387,8 +387,11 @@ def upsert_fixtures(conn: sqlite3.Connection, rows: list[dict]) -> int:
             home_team_id, away_team_id, commence_utc, status, updated_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(fixture_id) DO UPDATE SET
+             league_id=excluded.league_id,
              league_name=excluded.league_name,
              season=excluded.season,
+             home_team=excluded.home_team,
+             away_team=excluded.away_team,
              home_team_id=excluded.home_team_id,
              away_team_id=excluded.away_team_id,
              commence_utc=excluded.commence_utc,

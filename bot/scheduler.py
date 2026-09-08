@@ -29,16 +29,21 @@ def _iso(dt: datetime) -> str:
 
 # ─── 任务 A：赛程更新 ────────────────────────────────────────────────────────
 def task_a_update_fixtures() -> int:
-    """拉所有启用联赛未来 14 天赛程，写入 fixtures。返回写入场次。"""
+    """拉所有启用联赛的完整赛季赛程，写入 fixtures。返回写入场次。
+
+    不能只查未来 14 天：杯赛/欧战首次发布时可能把大量比赛挂在同一个占位日期，
+    随后再改到数月之后。若新日期已移出查询窗口，本地就永远收不到该 fixture_id
+    的更新，旧占位时间会持续污染 /fixtures 和盘口采样窗口。
+    """
     log.info("【任务A】开始更新赛程")
     conn = db.get_conn()
     total = 0
     try:
-        today = _utc_now().strftime("%Y-%m-%d")
-        end = (_utc_now() + timedelta(days=14)).strftime("%Y-%m-%d")
         leagues = db.get_enabled_leagues(conn)
         for league_id, (name, season) in leagues.items():
-            fixtures = api_client.fetch_fixtures(league_id, season, today, end)
+            # 请求数仍是每个联赛 1 次；只扩大单次响应范围，确保日期被大幅调整的
+            # 既有 fixture_id 也能再次进入 upsert，修正本地时间与队名。
+            fixtures = api_client.fetch_fixtures(league_id, season)
             rows = parser.parse_fixtures_response(fixtures, league_id, name, season)
             n = db.upsert_fixtures(conn, rows)
             total += n
