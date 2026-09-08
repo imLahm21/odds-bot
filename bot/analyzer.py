@@ -21,11 +21,6 @@ log = logging.getLogger("odds_bot.analyzer")
 # 请求头清洗迁至 llm_client.clean_header_value；此处保留别名兼容旧引用。
 _clean_header_value = llm_client.clean_header_value
 
-# 主端点别名：probe_llm.py 直接读 analyzer.LLM_BASE_URL / LLM_API_KEY，保留不破坏。
-# 真正的多端点池/故障转移/熔断在 llm_client；这里只是主端点的只读快照。
-LLM_BASE_URL = _clean_header_value(os.getenv("LLM_BASE_URL", "")).rstrip("/")
-LLM_API_KEY = _clean_header_value(os.getenv("LLM_API_KEY", ""))
-
 _live_rules_cache: str | None = None
 _live_rules_mtimes: dict | None = None
 _fund_rules_cache: dict[tuple, tuple[str, dict]] = {}
@@ -317,7 +312,7 @@ def analyze(csv_text: str, fundamentals: str,
             visitor: bool = False) -> str:
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。visitor 透传角色。"""
     if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。"
+        return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
     report = _call_llm(system, user, effort, tier="heavy", visitor=visitor)
@@ -439,7 +434,7 @@ def analyze_fundamentals_stream(raw_funds: str, home: str, away: str,
     visitor: 访客触发时用平衡档访客那份模型。
     """
     if not available():
-        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY")
+        yield ("error", "未配置 LLM_ROUTE_ENDPOINTS")
         return
     system, user = _fund_prompts(raw_funds, home, away, league)
     for kind, payload in llm_client.stream_chat(
@@ -464,7 +459,7 @@ def distill_lesson(review_report: str, home: str, away: str,
     调用方据此不落盘。用轻量模型 + 中等超时（这是复盘后的可选增值，不该拖慢）。
     """
     if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY", False
+        return "未配置 LLM_ROUTE_ENDPOINTS", False
     if not review_report.strip():
         return "复盘报告为空", False
     system = (
@@ -566,7 +561,7 @@ def route_lesson(review_report: str, home: str, away: str,
     import json
     import re as _re
     if not available():
-        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+        return None, "未配置 LLM_ROUTE_ENDPOINTS"
     if not review_report.strip():
         return None, "复盘报告为空"
     ctx = load_lesson_route_context()
@@ -634,7 +629,7 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
     import json
     import re as _re
     if not available():
-        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+        return None, "未配置 LLM_ROUTE_ENDPOINTS"
     home, away = meta.get("home", ""), meta.get("away", "")
     league = meta.get("league", "")
     date = (meta.get("kick_cst") or "")[:10]
@@ -878,7 +873,7 @@ def seo_summarize(free_body: str, home: str, away: str, league: str,
     import json
     import re as _re
     if not available():
-        return None, "未配置 LLM_BASE_URL / LLM_API_KEY"
+        return None, "未配置 LLM_ROUTE_ENDPOINTS"
     view = "赛后复盘" if is_review else "赛前预测"
     system = (
         "你是足球博客的中文编辑。根据用户给的一篇文章免费正文，生成用于搜索引擎与"
@@ -956,7 +951,7 @@ def analyze_stream(csv_text: str, fundamentals: str,
     """
     import re
     if not available():
-        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法分析。请在 .env 配置。")
+        yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
         return
     system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
                                     extra_instruction)
@@ -1074,7 +1069,7 @@ def review(csv_text: str, forecast_text: str, result_text: str,
            fund_brief: str = "", visitor: bool = False) -> str:
     """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。visitor 透传角色。"""
     if not available():
-        return "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。"
+        return "未配置 LLM_ROUTE_ENDPOINTS，无法复盘。请在 .env 配置。"
     system, user = _review_prompts(csv_text, forecast_text, result_text,
                                    home, away, league, fund_brief)
     return _call_llm(system, user, effort, tier="heavy", visitor=visitor)
@@ -1105,7 +1100,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
     """
     import re
     if not available():
-        yield ("error", "未配置 LLM_BASE_URL / LLM_API_KEY，无法复盘。请在 .env 配置。")
+        yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法复盘。请在 .env 配置。")
         return
     system, user = _review_prompts(csv_text, forecast_text, result_text,
                                    home, away, league, fund_brief)
@@ -1126,10 +1121,11 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
 
 
 # ─── 串关(/parlay)用：从单场精算报告抽出结构化投注决策 ──────────────────────
-def extract_decision(report: str, home: str = "", away: str = "") -> dict | None:
+def extract_decision(report: str, home: str = "", away: str = "",
+                     visitor: bool = False) -> dict | None:
     """从一份单场精算报告（含第 8 节投注决策）抽出结构化决策，供串关裁判用。
 
-    用轻量【平衡档】+ JSON emission 范式（同 compose_archive_plan），比正则解析
+    用调用者角色的【平衡档】+ JSON emission 范式（同 compose_archive_plan），比正则解析
     散文表格稳。返回 dict 或 None（LLM 未配置/返回非 JSON/缺关键字段）：
       {"play": 选中玩法, "odds": 十进制赔率, "edge": 小数(如 0.08),
        "p_final": 小数, "evidence": strong/medium/weak/none, "stake": 数或null,
@@ -1165,7 +1161,8 @@ def extract_decision(report: str, home: str = "", away: str = "") -> dict | None
                     effort=config.FUND_ANALYZE_EFFORT,
                     tier="balanced",
                     timeout=config.FUND_ANALYZE_TIMEOUT,
-                    max_tokens=800)
+                    max_tokens=800,
+                    visitor=visitor)
     if not raw or raw.startswith(_LLM_ERR_PREFIXES):
         log.warning("extract_decision LLM 失败：%s", (raw or "")[:120])
         return None

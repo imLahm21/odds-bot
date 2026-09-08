@@ -107,12 +107,16 @@ APIFOOTBALL_KEY=your-api-football-key
 TELEGRAM_BOT_TOKEN=token-from-@BotFather
 TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id,guest_chat_id
 TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
-# Official OpenAI endpoint used only for GPT-5.6 Luna
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=your-official-openai-key
-LLM_SUPPORTED_MODELS=gpt-5.6-luna
-# Other models stay on IKuncode; empty field 4 means no model-name mapping
-# LLM_ENDPOINTS=<key>|https://api.ikuncode.cc/v1|Codex||gpt-6-astra:gpt-5.6-sol:deepseek-v4-flash:grok-4.6:glm-5.3-flash
+# LLM credentials MUST be split by key group: group|key|base_url|label (comma-separated).
+# IKuncode authorizes each key to ONE model family only — a GPT-only key requesting
+# grok/deepseek/glm will 403. Add a line per group you actually bought a key for;
+# leave the rest out (that tier/role falls back to its configured fallback model,
+# or errors out naming the missing group — it will NOT silently mix keys).
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+# Legacy LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS are NOT read at all anymore (removed —
+# they were the root cause of a key being silently misrouted to unauthorized models).
+# Validate without printing keys: ./venv/bin/python -m bot.llm_client
+# The issues list must be empty and every group your models depend on must show count >= 1.
 EOF
 ```
 
