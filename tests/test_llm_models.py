@@ -48,23 +48,25 @@ from bot import analyzer, config, db, llm_client, tgbot   # noqa: E402
 
 PRIMARY = {
     "model_heavy": "gpt-6-astra",
-    "model_heavy_visitor": "deepseek-v4-flash",
-    "model_balanced": "gpt-5.6-sol",
+    "model_heavy_visitor": "deepseek-v4-pro",
+    "model_balanced": "gpt-5.6-terra",
     "model_balanced_visitor": "deepseek-v4-flash",
     "model_light": "gpt-5.6-luna",
     "model_light_visitor": "gpt-5.6-luna",
 }
 
+# 上一版（v1）的主模型方案，被 PROFILE_UPGRADES 第一条精确识别。
 OLD_PRIMARY = {
-    "model_heavy": "gpt-5.6-sol",
-    "model_heavy_visitor": "gpt-5.6-terra",
-    "model_balanced": "gpt-5.6-terra",
-    "model_balanced_visitor": "gpt-5.6-terra",
-    "model_light": "gpt-5.6-luna",
-    "model_light_visitor": "gpt-5.6-luna",
+    "model_heavy": "gpt-6-astra",
+    "model_heavy_visitor": "grok-4.6",
+    "model_balanced": "gpt-5.6-sol",
+    "model_balanced_visitor": "grok-4.6",
+    "model_light": "deepseek-v4-flash",
+    "model_light_visitor": "deepseek-v4-flash",
 }
 
-OLD_FALLBACK = {
+# 已彻底下线的旧模型名（不在 LLM_MODELS 里），由 UPGRADE_MAP 单值改写。
+RETIRED_VALUES = {
     "model_heavy": "gpt-5.5",
     "model_heavy_visitor": "gpt-5.5",
     "model_balanced": "gpt-5.4-mini",
@@ -73,39 +75,44 @@ OLD_FALLBACK = {
     "model_light_visitor": "gpt-5.4-mini",
 }
 
-FALLBACK = {
+# RETIRED_VALUES 经单值映射后应得到的主模型值。
+RETIRED_UPGRADED = {
     "model_heavy": "grok-4.6",
-    "model_heavy_visitor": "deepseek-v4-flash",
-    "model_balanced": "grok-4.6",
+    "model_heavy_visitor": "deepseek-v4-pro",
+    "model_balanced": "grok-4.5",
     "model_balanced_visitor": "deepseek-v4-flash",
-    "model_light": "glm-5.3-flash",
-    "model_light_visitor": "glm-5.3-flash",
+    "model_light": "gpt-5.6-luna",
+    "model_light_visitor": "gpt-5.6-luna",
 }
 
-V1_PRIMARY = {
-    **PRIMARY,
+# 上一版（v1）的回退方案，被 PROFILE_UPGRADES 第二条精确识别。
+V1_FALLBACK_PROFILE = {
+    "model_heavy": "grok-4.6",
     "model_heavy_visitor": "grok-4.6",
+    "model_balanced": "grok-4.6",
     "model_balanced_visitor": "grok-4.6",
     "model_light": "deepseek-v4-flash",
     "model_light_visitor": "deepseek-v4-flash",
 }
 
-V1_FALLBACK = {
-    **FALLBACK,
-    "model_heavy_visitor": "grok-4.6",
-    "model_balanced_visitor": "grok-4.6",
-    "model_light": "deepseek-v4-flash",
-    "model_light_visitor": "deepseek-v4-flash",
+V1_FALLBACK_UPGRADED = {
+    "model_heavy": "grok-4.6",
+    "model_heavy_visitor": "deepseek-v4-pro",
+    "model_balanced": "grok-4.5",
+    "model_balanced_visitor": "deepseek-v4-flash",
+    "model_light": "gpt-5.6-luna",
+    "model_light_visitor": "gpt-5.6-luna",
 }
 
 # 回退槽（fallback_*）的 seed 默认值。db 现在存 12 个键 = 6 主 + 6 回退。
+# 轻型池只有 luna 一个模型，故轻档无同档回退可选，初值为空串。
 FALLBACK_SLOTS = {
     "fallback_heavy": "grok-4.6",
-    "fallback_heavy_visitor": "deepseek-v4-flash",
-    "fallback_balanced": "grok-4.6",
-    "fallback_balanced_visitor": "deepseek-v4-flash",
-    "fallback_light": "glm-5.3-flash",
-    "fallback_light_visitor": "glm-5.3-flash",
+    "fallback_heavy_visitor": "glm-5.3",
+    "fallback_balanced": "grok-4.5",
+    "fallback_balanced_visitor": "glm-5.3-flash",
+    "fallback_light": "",
+    "fallback_light_visitor": "",
 }
 
 
@@ -149,9 +156,9 @@ class TestModelProfile(unittest.TestCase):
             actual[f"model_{tier}_visitor"] = config.llm_tier_default(tier, True)
         self.assertEqual(actual, PRIMARY)
         self.assertEqual(config.LLM_FALLBACK_TIER_MODELS, {
-            "heavy": {"admin": "grok-4.6", "visitor": "deepseek-v4-flash"},
-            "balanced": {"admin": "grok-4.6", "visitor": "deepseek-v4-flash"},
-            "light": {"admin": "glm-5.3-flash", "visitor": "glm-5.3-flash"},
+            "heavy": {"admin": "grok-4.6", "visitor": "glm-5.3"},
+            "balanced": {"admin": "grok-4.5", "visitor": "glm-5.3-flash"},
+            "light": {"admin": "", "visitor": ""},
         })
         self.assertEqual(config.LLM_MODEL, "gpt-6-astra")
         self.assertEqual(
@@ -160,10 +167,14 @@ class TestModelProfile(unittest.TestCase):
             {
                 "gpt-6-astra": ("ik_gpt",),
                 "gpt-5.6-sol": ("ik_gpt",),
-                "gpt-5.6-luna": ("openai_gpt",),
+                "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
+                "deepseek-v4-pro": ("ik_deepseek",),
+                "gpt-5.6-terra": ("ik_gpt",),
                 "deepseek-v4-flash": ("ik_deepseek",),
                 "glm-5.3-flash": ("ik_glm",),
+                "grok-4.5": ("ik_grok",),
+                "gpt-5.6-luna": ("openai_gpt",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -183,18 +194,27 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(config.llm_route_groups_for_model("llama-4"), ())
         self.assertEqual(config.llm_route_groups_for_model(""), ())
         self.assertTrue(config.llm_model_registered("gpt-6-astra"))
-        self.assertFalse(config.llm_model_registered("gpt-5.6-terra"))
+        # gpt-5.6-terra 已重新登记为中型池成员（用户方案），不再算「下线」
+        self.assertTrue(config.llm_model_registered("gpt-5.6-terra"))
+        # gpt-5.5 才是彻底下线的名字：前缀仍能推出组，但 registered 为 False——
+        # 这正是「能推出组 ≠ 仍在服役」的场景。
+        self.assertFalse(config.llm_model_registered("gpt-5.5"))
         self.assertEqual(
-            config.llm_route_groups_for_model("gpt-5.6-terra"), ("ik_gpt",))
+            config.llm_route_groups_for_model("gpt-5.5"), ("ik_gpt",))
 
-    def test_light_tier_pool_excludes_heavy_reasoning_models(self):
-        """走地 1min 循环受不了重档推理，轻档池必须只有快模型。"""
-        light = config.llm_tier_eligible_models("light")
-        for slow in ("gpt-6-astra", "gpt-5.6-sol", "grok-4.6"):
-            self.assertNotIn(slow, light)
-        self.assertIn("gpt-5.6-luna", light)
-        self.assertIn("glm-5.3-flash", light)
-        self.assertIn("gpt-6-astra", config.llm_tier_eligible_models("heavy"))
+    def test_tier_pools_are_strictly_partitioned(self):
+        """三池严格分区：每个模型只属于一个档位，不会跨档出现在可选池里。"""
+        heavy = set(config.llm_tier_eligible_models("heavy"))
+        balanced = set(config.llm_tier_eligible_models("balanced"))
+        light = set(config.llm_tier_eligible_models("light"))
+        self.assertEqual(heavy, {"gpt-6-astra", "gpt-5.6-sol", "glm-5.3",
+                                 "grok-4.6", "deepseek-v4-pro"})
+        self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4-flash",
+                                    "glm-5.3-flash", "grok-4.5"})
+        self.assertEqual(light, {"gpt-5.6-luna"})
+        self.assertEqual(heavy & balanced, set())
+        self.assertEqual(heavy & light, set())
+        self.assertEqual(balanced & light, set())
 
     def test_grouped_endpoint_parser_separates_each_credential_family(self):
         raw = (
@@ -297,12 +317,14 @@ class TestModelProfile(unittest.TestCase):
             patch.object(llm_client, "_legacy_env_present", return_value=[]),
         ):
             issues = llm_client.routing_issues()
-        # 缺 ik_glm，命中的是轻档两个角色的【回退】槽（glm-5.3-flash）
+        # 缺 ik_glm → 命中两个回退槽：重档访客回退 glm-5.3、平衡访客回退 glm-5.3-flash
         self.assertEqual(len(issues), 2)
         for item in issues:
-            self.assertIn("glm-5.3-flash", item)
             self.assertIn("ik_glm", item)
             self.assertIn("回退", item)
+        joined = "\n".join(issues)
+        self.assertIn("glm-5.3", joined)
+        self.assertIn("glm-5.3-flash", joined)
 
     def test_routing_issues_flags_leftover_legacy_env(self):
         with (
@@ -316,9 +338,26 @@ class TestModelProfile(unittest.TestCase):
         self.assertIn("LLM_API_KEY", issues[0])
         self.assertIn("已不参与路由", issues[0])
 
+    def test_routing_issues_flags_fallback_equal_to_primary(self):
+        """回退与主模型相同 = 没有回退（同组同挂），必须报出来但不静默改值。"""
+        runtime = dict(RUNTIME_MODELS)
+        runtime["fallback_heavy"] = runtime["model_heavy"]
+        with (
+            patch.object(llm_client, "_ENDPOINTS", self._all_group_endpoints()),
+            patch.object(llm_client, "_runtime_models", runtime),
+            patch.object(llm_client, "_legacy_env_present", return_value=[]),
+        ):
+            issues = llm_client.routing_issues()
+            fallback = llm_client.get_fallback_model("heavy", visitor=False)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("等于没有回退", issues[0])
+        self.assertIn(runtime["model_heavy"], issues[0])
+        # 只报告，不改值
+        self.assertEqual(fallback, runtime["model_heavy"])
+
     def test_routing_issues_flags_unregistered_model_without_blocking(self):
         runtime = dict(RUNTIME_MODELS)
-        runtime["model_heavy"] = "gpt-5.6-terra"      # 已下线的旧名字
+        runtime["model_heavy"] = "gpt-5.5"      # 已彻底下线的旧名字
         with (
             patch.object(llm_client, "_ENDPOINTS", self._all_group_endpoints()),
             patch.object(llm_client, "_runtime_models", runtime),
@@ -329,12 +368,12 @@ class TestModelProfile(unittest.TestCase):
                         for s in llm_client.slot_snapshot()}
             chain = llm_client.resolve_model_chain("heavy", visitor=False)
         self.assertEqual(len(issues), 1)
-        self.assertIn("gpt-5.6-terra", issues[0])
+        self.assertIn("gpt-5.5", issues[0])
         self.assertIn("404", issues[0])
         slot = snapshot[("heavy", "admin")]
         self.assertTrue(slot["primary_ready"])
         self.assertTrue(slot["primary_retired"])
-        self.assertEqual(chain[0], "gpt-5.6-terra")
+        self.assertEqual(chain[0], "gpt-5.5")
 
     def test_group_signature_prevents_cross_group_switch_collision(self):
         left = self._group_endpoint("Shared", "ik_gpt")
@@ -425,10 +464,15 @@ class TestModelProfile(unittest.TestCase):
         ):
             tgbot._llm_run_group_probe(1, 2, "ik_gpt")
 
-        expected_models = {"gpt-6-astra", "gpt-5.6-sol"}
+        # ik_gpt 组承载的全部已登记模型（跨档位：重档两个 + 中型 terra）
+        expected_models = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"}
         self.assertEqual({model for _, model in calls}, expected_models)
         self.assertEqual({idx for idx, _ in calls}, {0, 1})
-        self.assertNotIn("grok-4.6", {model for _, model in calls})
+        # 别组的模型一个都不该被拿去测（拿 GPT key 测 grok 必然 403）
+        probed = {model for _, model in calls}
+        self.assertNotIn("grok-4.6", probed)
+        self.assertNotIn("glm-5.3", probed)
+        self.assertNotIn("gpt-5.6-luna", probed)   # 走官方组，不属 ik_gpt
         edit.assert_called_once()
 
     def test_resolve_model_chain_drops_model_with_no_configured_group(self):
@@ -642,27 +686,50 @@ class TestModelProfile(unittest.TestCase):
                 list(rows.items()))
             db.seed_config(conn)
             state = db.get_llm_runtime_state(conn)
+            # 未登记的私有模型原样保留（不因档位校验被抹掉）
             self.assertEqual(state["model_heavy"], "custom-private-model")
-            self.assertEqual(state["model_balanced"], "gpt-5.6-sol")
+            # 同批里已登记但跨档的值（gpt-5.6-sol 现属重档）被拉回本档默认
+            self.assertEqual(state["model_balanced"], "gpt-5.6-terra")
         finally:
             conn.close()
 
-    def test_old_fallback_values_migrate_to_new_fallback(self):
+    def test_retired_model_names_upgrade_by_single_value_map(self):
+        """已彻底下线的旧名字按单值映射改写到当前档位的合法模型。"""
         conn = sqlite3.connect(":memory:")
         try:
             conn.executescript(db.SCHEMA)
             conn.executemany(
                 "INSERT INTO llm_runtime_state (key, value) VALUES (?,?)",
-                list(OLD_FALLBACK.items()))
+                list(RETIRED_VALUES.items()))
             db.seed_config(conn)
             self.assertEqual(
-                db.get_llm_runtime_state(conn), full_state(FALLBACK))
+                db.get_llm_runtime_state(conn), full_state(RETIRED_UPGRADED))
+        finally:
+            conn.close()
+
+    def test_cross_tier_value_is_pulled_back_to_tier_default(self):
+        """模型换档后的自愈：库里存着「已登记但不属于该档」的值时重置为本档默认。
+        面板产生不了这种组合，只可能来自配置演进，故重置不会覆盖有效的人工选择。"""
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(db.SCHEMA)
+            db.seed_config(conn)
+            # 绕过校验直接塞一个跨档值：luna 是轻档模型，塞进重档主槽
+            conn.execute("UPDATE llm_runtime_state SET value='gpt-5.6-luna' "
+                         "WHERE key='model_heavy'")
+            conn.commit()
+            db.seed_config(conn)
+            self.assertEqual(
+                db.get_llm_runtime_state(conn)["model_heavy"], "gpt-6-astra")
         finally:
             conn.close()
 
     def test_previous_primary_and_fallback_profiles_resolve_luna_ambiguity(self):
+        """两条完整旧方案各自被精确识别（解决 deepseek-v4-flash 同时可能表示
+        主轻档或回退轻档的歧义），分别迁到主方案 / 回退方案的新值。"""
         for old_profile, expected in (
-                (V1_PRIMARY, PRIMARY), (V1_FALLBACK, FALLBACK)):
+                (OLD_PRIMARY, PRIMARY),
+                (V1_FALLBACK_PROFILE, V1_FALLBACK_UPGRADED)):
             with self.subTest(old_profile=old_profile):
                 conn = sqlite3.connect(":memory:")
                 try:
@@ -690,7 +757,8 @@ class TestModelProfile(unittest.TestCase):
             conn.close()
 
     def test_fallback_button_backend_and_reset(self):
-        """「一键切到回退模型」把 6 个回退值写进主槽；恢复默认把 12 槽位复原。"""
+        """「一键切到回退模型」把 6 个回退值写进主槽；恢复默认把 12 槽位复原。
+        轻档回退留空（池内无第二模型），不做主/回退切换。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "odds.db")
             db.init_db(path)
@@ -698,22 +766,30 @@ class TestModelProfile(unittest.TestCase):
                 llm_client.apply_fallback_models()
                 self.assertEqual(llm_client.get_tier_model("heavy"), "grok-4.6")
                 self.assertEqual(
-                    llm_client.get_tier_model("balanced", visitor=True),
-                    "deepseek-v4-flash")
+                    llm_client.get_tier_model("heavy", visitor=True), "glm-5.3")
                 self.assertEqual(
-                    llm_client.get_tier_model("light"), "glm-5.3-flash")
+                    llm_client.get_tier_model("balanced"), "grok-4.5")
+                self.assertEqual(
+                    llm_client.get_tier_model("balanced", visitor=True),
+                    "glm-5.3-flash")
+                # 轻档回退为空，apply_fallback 仍写入但写的是空串，
+                # get_tier_model 空串等价于未设置、返回档位默认 luna
+                self.assertEqual(
+                    llm_client.get_tier_model("light"), "gpt-5.6-luna")
                 # 回退槽本身不动（幂等，可反复点）
                 self.assertEqual(
                     llm_client.get_fallback_model("heavy"), "grok-4.6")
+                self.assertEqual(
+                    llm_client.get_fallback_model("light"), "")
 
                 llm_client.reset_runtime_models()
                 self.assertEqual(
                     llm_client.get_tier_model("heavy"), "gpt-6-astra")
                 self.assertEqual(
                     llm_client.get_tier_model("heavy", visitor=True),
-                    "deepseek-v4-flash")
+                    "deepseek-v4-pro")
                 self.assertEqual(
-                    llm_client.get_tier_model("balanced"), "gpt-5.6-sol")
+                    llm_client.get_tier_model("balanced"), "gpt-5.6-terra")
                 self.assertEqual(
                     llm_client.get_tier_model("light"), "gpt-5.6-luna")
                 self.assertEqual(

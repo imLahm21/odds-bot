@@ -320,21 +320,23 @@ LLM_EFFORT_DEFAULT = "high"
 # 加新模型只改这一处：登记模型名 + 中文标签 + 允许哪几档选它。
 # 密钥组不在这里写 —— 由 llm_route_groups_for_model 按模型名前缀推导（见下文）。
 #   tiers —— 允许该模型出现在哪些档位的可选池里。
-#            light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放快模型；
-#            放推理重档（astra/sol/grok）进去会让单次研判几十秒，拖住下一轮抓取。
+# 三池【严格分区】：每个模型只属于一个档位，按用户指定的能力分级登记。
+# light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放最快的模型——
+# 放推理重档进去会让单次研判几十秒，拖住下一轮抓取。
 LLM_MODELS: dict[str, dict] = {
-    "gpt-6-astra":       {"label": "GPT-6 Astra",
-                          "tiers": ("heavy", "balanced")},
-    "gpt-5.6-sol":       {"label": "GPT-5.6 Sol",
-                          "tiers": ("heavy", "balanced")},
-    "gpt-5.6-luna":      {"label": "GPT-5.6 Luna",
-                          "tiers": ("balanced", "light")},
-    "grok-4.6":          {"label": "Grok 4.6",
-                          "tiers": ("heavy", "balanced")},
-    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash",
-                          "tiers": ("heavy", "balanced", "light")},
-    "glm-5.3-flash":     {"label": "GLM-5.3 Flash",
-                          "tiers": ("balanced", "light")},
+    # ── 重档池：推理能力优先，跑主 SOP 精算 ──
+    "gpt-6-astra":       {"label": "GPT-6 Astra",       "tiers": ("heavy",)},
+    "gpt-5.6-sol":       {"label": "GPT-5.6 Sol",       "tiers": ("heavy",)},
+    "glm-5.3":           {"label": "GLM-5.3",           "tiers": ("heavy",)},
+    "grok-4.6":          {"label": "Grok 4.6",          "tiers": ("heavy",)},
+    "deepseek-v4-pro":   {"label": "DeepSeek V4 Pro",   "tiers": ("heavy",)},
+    # ── 中型池：基本面预分析 + SEO/科普 + 教训提炼 ──
+    "gpt-5.6-terra":     {"label": "GPT-5.6 Terra",     "tiers": ("balanced",)},
+    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash", "tiers": ("balanced",)},
+    "glm-5.3-flash":     {"label": "GLM-5.3 Flash",     "tiers": ("balanced",)},
+    "grok-4.5":          {"label": "Grok 4.5",          "tiers": ("balanced",)},
+    # ── 轻型池：走地实时研判 ──
+    "gpt-5.6-luna":      {"label": "GPT-5.6 Luna",      "tiers": ("light",)},
 }
 
 
@@ -357,12 +359,14 @@ def llm_tier_eligible_models(tier: str) -> list[str]:
 # 每档两个角色（管理员 / 访客 visitor=True）各存【主模型 + 回退模型】两个值，共 12 个槽位。
 # 本表只提供**初值**（db seed 与「恢复默认」读它）；可选池来自 llm_tier_eligible_models，
 # 运行时真值在 db.llm_runtime_state，用户可在 /llm 面板自由改，免重启。
+# ⚠️ 每个 default/visitor_default 必须落在该档的 LLM_MODELS 池内（三池严格分区，
+#    跨档取值会被 db 的档位校验拒掉、并被 _sanitize 拉回本档默认）。
 LLM_TIER_MODELS: dict[str, dict] = {
     "heavy":    {"label": "重档·主精算",
                  "default": "gpt-6-astra",
-                 "visitor_default": "deepseek-v4-flash"},
+                 "visitor_default": "deepseek-v4-pro"},
     "balanced": {"label": "平衡·基本面/SEO",
-                 "default": "gpt-5.6-sol",
+                 "default": "gpt-5.6-terra",
                  "visitor_default": "deepseek-v4-flash"},
     "light":    {"label": "轻档·走地",
                  "default": "gpt-5.6-luna",
@@ -385,18 +389,22 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
 # 回退模型的【初值】：每档每角色一个。db seed 与「恢复默认」读它灌初值，
 # 之后用户在 /llm 面板可自由改成任意同档合法模型（真值在 db.llm_runtime_state）。
 # 「🛟 启用回退模型」= 把每个槽位当前的回退值写进主模型槽（回退槽本身不动，可反复点）。
+# ⚠️ 回退模型同样必须落在【本档】池内——回退是「换模型不换档」，
+#    跨档回退会让走地档跑起重档推理（几十秒）或让主精算掉到轻档模型。
+#    刻意选与主模型【不同密钥组】的模型：主组整组挂掉（限流/密钥失效）时才有逃生价值。
+# 轻型池只有 gpt-5.6-luna 一个模型，故轻档无同档回退可选，留空 = 不做跨组逃生。
 LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     "heavy": {
-        "admin": "grok-4.6",
-        "visitor": "deepseek-v4-flash",
+        "admin": "grok-4.6",        # 主 astra 走 ik_gpt → 回退落 ik_grok
+        "visitor": "glm-5.3",       # 主 deepseek-v4-pro → 回退落 ik_glm
     },
     "balanced": {
-        "admin": "grok-4.6",
-        "visitor": "deepseek-v4-flash",
+        "admin": "grok-4.5",        # 主 terra 走 ik_gpt → 回退落 ik_grok
+        "visitor": "glm-5.3-flash",  # 主 deepseek-v4-flash → 回退落 ik_glm
     },
     "light": {
-        "admin": "glm-5.3-flash",
-        "visitor": "glm-5.3-flash",
+        "admin": "",
+        "visitor": "",
     },
 }
 
@@ -481,7 +489,7 @@ def llm_models_in_group(group: str) -> list[str]:
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
 # 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
-LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-08-group-split-fallback-v1"
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-08-tier-pools-partitioned-v2"
 
 # 精确识别上一版方案，解决 deepseek-v4-flash 在上一版中同时可能表示主轻档或
 # 回退轻档的歧义：主方案升级到 Luna，回退方案升级到 GLM Flash。
@@ -498,8 +506,8 @@ LLM_TIER_MODEL_PROFILE_UPGRADES: list[
         },
         {
             "model_heavy": "gpt-6-astra",
-            "model_heavy_visitor": "deepseek-v4-flash",
-            "model_balanced": "gpt-5.6-sol",
+            "model_heavy_visitor": "deepseek-v4-pro",
+            "model_balanced": "gpt-5.6-terra",
             "model_balanced_visitor": "deepseek-v4-flash",
             "model_light": "gpt-5.6-luna",
             "model_light_visitor": "gpt-5.6-luna",
@@ -516,40 +524,40 @@ LLM_TIER_MODEL_PROFILE_UPGRADES: list[
         },
         {
             "model_heavy": "grok-4.6",
-            "model_heavy_visitor": "deepseek-v4-flash",
-            "model_balanced": "grok-4.6",
+            "model_heavy_visitor": "deepseek-v4-pro",
+            "model_balanced": "grok-4.5",
             "model_balanced_visitor": "deepseek-v4-flash",
-            "model_light": "glm-5.3-flash",
-            "model_light_visitor": "glm-5.3-flash",
+            "model_light": "gpt-5.6-luna",
+            "model_light_visitor": "gpt-5.6-luna",
         },
     ),
 ]
 
+# 单值映射：只处理**已彻底下线**的旧模型名（这些名字不在 LLM_MODELS 里，
+# 上游已不认，留着必然 404）。
+# ⚠️ 不要把「仍在服役、只是换了档位」的模型写进来——那类值由 db 的
+#    _sanitize_llm_runtime_models 按档位池自动拉回本档默认，写在这里会与用户
+#    在 /llm 面板的手动选择打架。
+#    例：gpt-5.6-terra 曾被当作下线名字改写掉，现已重新登记为中型池成员，故移除。
 LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
     "model_heavy": {
-        "gpt-5.6-sol": "gpt-6-astra",
         "gpt-5.5": "grok-4.6",
     },
     "model_heavy_visitor": {
-        "gpt-5.6-terra": "deepseek-v4-flash",
-        "gpt-5.5": "deepseek-v4-flash",
-        "gpt-5.4-mini": "deepseek-v4-flash",
-        "grok-4.6": "deepseek-v4-flash",
+        "gpt-5.5": "deepseek-v4-pro",
+        "gpt-5.4-mini": "deepseek-v4-pro",
     },
     "model_balanced": {
-        "gpt-5.6-terra": "gpt-5.6-sol",
-        "gpt-5.4-mini": "grok-4.6",
+        "gpt-5.4-mini": "grok-4.5",
     },
     "model_balanced_visitor": {
-        "gpt-5.6-terra": "deepseek-v4-flash",
         "gpt-5.4-mini": "deepseek-v4-flash",
-        "grok-4.6": "deepseek-v4-flash",
     },
     "model_light": {
-        "gpt-5.4-mini": "glm-5.3-flash",
+        "gpt-5.4-mini": "gpt-5.6-luna",
     },
     "model_light_visitor": {
-        "gpt-5.4-mini": "glm-5.3-flash",
+        "gpt-5.4-mini": "gpt-5.6-luna",
     },
 }
 
@@ -611,7 +619,7 @@ LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 Luna 的少量�
 # 用轻量模型先把 build_fundamentals 的原始数据（近况/交锋/赛程/积分榜）依据
 # 国家队/赛事情境/大小球方法论规则，分析成一份「基本面研判」，再喂给主 SOP 精算。
 # 好处：平衡档专注读数据出研判，重档专注盘口精算，职责分离。
-FUND_ANALYZE_MODEL = "gpt-5.6-sol"  # 【平衡档默认模型】兼容常量；基本面/SEO 用（运行时可切）
+FUND_ANALYZE_MODEL = "gpt-5.6-terra"  # 【平衡档默认模型】兼容常量；基本面/SEO 用（运行时可切）
 FUND_ANALYZE_EFFORT = "medium"        # 基本面研判要点判断，比走地 low 略高
 FUND_ANALYZE_TIMEOUT = 90             # 秒，比走地 30 长（研判内容多），比主精算 300 短
 FUND_ANALYZE_MAX_TOKENS = 4000        # 研判输出上限（走地 1200 太小，主精算 32000 太大）

@@ -391,6 +391,14 @@ def routing_issues() -> list[str]:
                 if item not in seen:
                     seen.add(item)
                     issues.append(item)
+            # 回退 == 主模型 → 逃生毫无意义（同模型同组，主组挂了回退必然也挂）。
+            # 不静默改值（可能是用户刻意为之），但必须报出来。
+            primary = get_tier_model(tier, visitor)
+            fallback = get_fallback_model(tier, visitor)
+            if fallback and fallback == primary:
+                issues.append(f"{label}·{role}：回退模型与主模型同为 {primary}，"
+                              "主组挂掉时回退也必然挂，等于没有回退——"
+                              "请在 /llm 面板改选同档其它模型")
     leftovers = _legacy_env_present()
     if leftovers:
         issues.append(f"⚠️ .env 仍有旧变量 {'/'.join(leftovers)}，"

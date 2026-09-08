@@ -252,6 +252,11 @@ def seed_config(conn: sqlite3.Connection) -> None:
     if stale:
         log.warning("llm_runtime_state 有 %d 个槽位指向未登记模型（保留原值，"
                     "请确认上游支持）：%s", len(stale), "、".join(stale))
+    # 再把「已登记但档位不对」的值拉回本档默认（模型换档后的自愈）。
+    moved = _sanitize_llm_runtime_models(conn, now)
+    if moved:
+        log.warning("llm_runtime_state 有 %d 个槽位的模型已不属于该档位，"
+                    "已重置为本档默认：%s", len(moved), "、".join(moved))
     conn.commit()
 
 
@@ -322,6 +327,43 @@ def _unregistered_runtime_models(conn: sqlite3.Connection) -> list[str]:
         if not config.llm_model_registered(value):
             out.append(f"{key}={value}")
     return out
+
+
+def _sanitize_llm_runtime_models(conn: sqlite3.Connection,
+                                 now: str) -> list[str]:
+    """把「已登记但不属于该档位」的槽位值拉回本档默认，返回被改写的键。
+
+    与 _unregistered_runtime_models 的分工（两者缺一不可）：
+      · 未登记值 → 只报告不改（可能是用户的网关私有模型，本地无从判断）；
+      · 已登记但跨档值 → **必须改**。这类值只可能来自「模型换了档位」的配置演进
+        （如 gpt-5.6-sol 从平衡档移入重档），面板本身产生不了这种组合
+        （子菜单只列本档池、db 写入也按档校验），所以重置不会覆盖任何有效的
+        人工选择，只是补上配置迁移的欠账。
+
+    留空的回退槽合法（= 不做跨组逃生），跳过。
+    """
+    current = dict(conn.execute(
+        "SELECT key, value FROM llm_runtime_state").fetchall())
+    fixed, updates = [], []
+    for key, default in _runtime_defaults().items():
+        parsed = _parse_runtime_key(key)
+        if parsed is None:
+            continue
+        tier, _visitor, kind = parsed
+        value = str(current.get(key, default))
+        if kind == "fallback" and value == "":
+            continue
+        if not config.llm_model_registered(value):
+            continue                    # 交给 _unregistered_runtime_models 报告
+        if value in config.llm_tier_eligible_models(tier):
+            continue                    # 档位合法，不动
+        fixed.append(f"{key}={value}→{default}")
+        updates.append((default, now, key))
+    if updates:
+        conn.executemany(
+            "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=?",
+            updates)
+    return fixed
 
 
 def _now_utc_iso() -> str:
