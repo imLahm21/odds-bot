@@ -741,8 +741,91 @@ def fan_fundamentals_brief(free_md: str, home: str, away: str,
     return out.strip()
 
 
+def _remove_json_trailing_commas(text: str) -> str:
+    """移除 JSON 对象/数组结束符前的尾逗号，不触碰字符串内的逗号。"""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "}]":
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _parse_wx_article_json(raw: str) -> tuple[dict | None, str]:
+    """解析 LLM 文章 JSON，并容忍围栏、前后说明、原始换行和尾逗号。"""
+    import json
+    import re as _re
+
+    text = (raw or "").strip()
+    if not text:
+        return None, "LLM 返回空内容"
+    text = _re.sub(r"^```(?:json)?\s*", "", text,
+                   flags=_re.IGNORECASE).strip()
+    text = _re.sub(r"\s*```$", "", text).strip()
+
+    candidates = [text]
+    without_trailing_commas = _remove_json_trailing_commas(text)
+    if without_trailing_commas != text:
+        candidates.append(without_trailing_commas)
+
+    first_brace = text.find("{")
+    if first_brace >= 0:
+        object_text = text[first_brace:]
+        if object_text not in candidates:
+            candidates.append(object_text)
+        repaired_object_text = _remove_json_trailing_commas(object_text)
+        if repaired_object_text not in candidates:
+            candidates.append(repaired_object_text)
+
+    last_error = "无法找到 JSON 对象"
+    decoder = json.JSONDecoder(strict=False)
+    for candidate in candidates:
+        try:
+            obj, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = (f"{exc.msg}（第{exc.lineno}行第{exc.colno}列，"
+                          f"字符{exc.pos}）")
+            continue
+        if not isinstance(obj, dict):
+            last_error = "JSON 顶层不是对象"
+            continue
+        return obj, ""
+    return None, last_error
+
+
+def _record_wx_article_error(error_out: list[str] | None, reason: str) -> None:
+    if error_out is not None:
+        error_out.append(reason)
+
+
 def wx_compliant_article(free_md: str, home: str, away: str,
-                         league: str) -> dict | None:
+                         league: str, *,
+                         error_out: list[str] | None = None) -> dict | None:
     """微信公众号发布：把报告免费正文改写成【合规叙事文章】（花式排版数据源）。
 
     产出结构化 dict，供 wechat_publish 渲染成杂志感排版：
@@ -754,9 +837,13 @@ def wx_compliant_article(free_md: str, home: str, away: str,
         绝不放 XX% 胜负概率；
       - prediction 给一个具体比分预测 + 一句理由（球评常见，允许）；
       - 【硬红线】不得出现赔率/盘口/亚盘/凯利/让球/大小球/水位/下注/庄家名/胜负概率百分比。
-    失败/未配置返回 None（调用方据此不存草稿，报错）。
+    失败/未配置返回 None；error_out 可接收适合显示给用户的准确失败原因。
     """
-    if not available() or not free_md.strip():
+    if not available():
+        _record_wx_article_error(error_out, "未配置 LLM_ROUTE_ENDPOINTS")
+        return None
+    if not free_md.strip():
+        _record_wx_article_error(error_out, "报告中没有可用于改写的正文")
         return None
     system = (
         "你是一位资深足球公众号主笔，也是一名足球裁判员，文风叙事、有历史纵深、专业克制"
@@ -785,7 +872,9 @@ def wx_compliant_article(free_md: str, home: str, away: str,
         "水位、凯利、让球、受让、大小球、上盘、下盘、诱盘、下注、投注、串关、庄家、返还率、"
         "以及任何庄家名（365/Pinnacle/威廉/SBO 等）、任何「胜负概率百分比」（如「法国方向52%」）；\n"
         "只讲报告里【实际有】的信息，缺的直接略过、不要写「报告未提供」、不要编造；\n"
-        "全中文，直接输出 JSON，不要 markdown 代码块、不要多余文字。"
+        "全中文，直接输出 JSON，不要 markdown 代码块、不要多余文字。必须输出严格可被 "
+        "json.loads 解析的完整 JSON：字符串内换行写成 \\n，内部双引号正确转义，"
+        "禁止尾逗号，并确保所有引号、方括号和花括号闭合。"
     )
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
@@ -795,29 +884,46 @@ def wx_compliant_article(free_md: str, home: str, away: str,
                     effort=config.FUND_ANALYZE_EFFORT,
                     tier="balanced",
                     timeout=max(config.FUND_ANALYZE_TIMEOUT, 150),
-                    # 长文（1200~1800字）+ JSON 结构，token 预算加大避免截断致解析失败
-                    max_tokens=max(config.FUND_ANALYZE_MAX_TOKENS, 8000))
+                    # 长文 + JSON + 推理 token 留足预算，降低尾部截断概率。
+                    max_tokens=max(config.FUND_ANALYZE_MAX_TOKENS, 12000))
     if not out or out.startswith(_LLM_ERR_PREFIXES):
-        log.warning("微信合规文章生成失败: %s", (out or "")[:120])
+        reason = (out or "LLM 返回空内容")[:300]
+        log.warning("微信合规文章生成请求失败: %s", reason)
+        _record_wx_article_error(error_out, reason)
         return None
-    import json
-    import re as _re
-    s = out.strip()
-    # 剥可能的 ```json ``` 代码块围栏
-    s = _re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip(), flags=_re.MULTILINE).strip()
-    try:
-        obj = json.loads(s)
-    except Exception:
-        # 容错：尝试抓第一个 {...} 块
-        mm = _re.search(r"\{.*\}", s, _re.DOTALL)
-        if not mm:
-            log.warning("微信合规文章 JSON 解析失败: %s", s[:120])
+    obj, parse_error = _parse_wx_article_json(out)
+    if obj is None:
+        log.warning(
+            "微信合规文章 JSON 解析失败，尝试自动修复：%s｜长度=%d｜尾部=%r",
+            parse_error, len(out), out[-160:])
+        repair_system = (
+            "你是 JSON 语法修复器。只输出一个完整、合法的 JSON 对象，不要代码围栏、"
+            "不要解释。保留原文的字段、事实和措辞，不新增任何事实；若原文尾部截断，"
+            "只补齐语法必需的引号、方括号和花括号，不续写内容。字符串中的换行必须写成"
+            "\\n，字符串内部的双引号必须转义，删除对象或数组末项后的尾逗号。"
+        )
+        repair_user = "修复下面这份微信公众号文章 JSON：\n\n" + out
+        repaired = _call_llm(
+            repair_system, repair_user, effort="low", tier="balanced",
+            timeout=max(config.FUND_ANALYZE_TIMEOUT, 120),
+            max_tokens=max(config.FUND_ANALYZE_MAX_TOKENS, 12000))
+        if not repaired or repaired.startswith(_LLM_ERR_PREFIXES):
+            repair_reason = (repaired or "LLM 返回空内容")[:300]
+            reason = (f"LLM 返回的文章 JSON 格式不合法（{parse_error}），"
+                      f"且自动修复请求失败：{repair_reason}")
+            log.warning("微信合规文章 JSON 自动修复请求失败: %s", reason)
+            _record_wx_article_error(error_out, reason)
             return None
-        try:
-            obj = json.loads(mm.group(0))
-        except Exception:
-            log.warning("微信合规文章 JSON 二次解析失败: %s", s[:120])
+        obj, repair_error = _parse_wx_article_json(repaired)
+        if obj is None:
+            reason = (f"LLM 返回的文章 JSON 格式不合法（{parse_error}）；"
+                      f"自动修复后仍无法解析（{repair_error}）")
+            log.warning(
+                "微信合规文章 JSON 自动修复仍失败: %s｜长度=%d｜尾部=%r",
+                reason, len(repaired), repaired[-160:])
+            _record_wx_article_error(error_out, reason)
             return None
+        log.info("微信合规文章 JSON 自动修复成功")
     title = str(obj.get("title", "")).strip()
     # body 现为分节数组 [{"heading","text"}]；兼容旧的纯字符串。
     sections = []
@@ -832,6 +938,9 @@ def wx_compliant_article(free_md: str, home: str, away: str,
     elif isinstance(raw_body, str) and raw_body.strip():
         sections.append({"heading": "", "text": raw_body.strip()})
     if not title or not sections:
+        reason = "LLM 返回的文章 JSON 缺少有效 title 或 body"
+        log.warning("微信合规文章结构不完整: %s", reason)
+        _record_wx_article_error(error_out, reason)
         return None
     # 结构化字段容错：缺字段给默认，类型不符则丢弃，保证渲染不炸。
     subtitle = str(obj.get("subtitle", "")).strip()

@@ -326,10 +326,14 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     if km:
         kick = km.group(1).strip()
 
-    result = analyzer.wx_compliant_article(free_md, home or "主队",
-                                           away or "客队", league or "足球")
+    generation_errors: list[str] = []
+    result = analyzer.wx_compliant_article(
+        free_md, home or "主队", away or "客队", league or "足球",
+        error_out=generation_errors)
     if not result:
-        raise WechatError("合规文章生成失败（LLM 未配置或返回空），未存草稿。")
+        detail = (generation_errors[-1] if generation_errors else
+                  "LLM 未返回可用文章")
+        raise WechatError(f"合规文章生成失败：{detail.rstrip('。')}。未存草稿。")
     title = result.get("title", "").strip()
     sections = result.get("sections") or []
     if not title or not sections:

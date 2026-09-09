@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot import wechat_publish as wp   # noqa: E402
+from bot import analyzer   # noqa: E402
 
 
 class TestComplianceScan(unittest.TestCase):
@@ -60,6 +61,58 @@ class TestComplianceScan(unittest.TestCase):
         self.assertIn("正文第2节内容 第2行第5-6字：平博", warning)
 
 
+class TestWechatArticleJson(unittest.TestCase):
+    @staticmethod
+    def _valid_json() -> str:
+        return (
+            '{"title":"测试文章","subtitle":"副标题","lead":"导语",'
+            '"body":[{"heading":"比赛看点","text":"第一段\\n\\n第二段"}],'
+            '"compare":[],"highlights":[],'
+            '"prediction":{"score":"1-0","note":"主队状态更稳"}}')
+
+    def test_parser_repairs_raw_newline_trailing_commas_and_extra_text(self):
+        raw = (
+            "以下是结果：\n```json\n"
+            '{"title":"测试文章","body":[{"heading":"看点",'
+            '"text":"第一段\n第二段",}],}\n```\n完成')
+        obj, error = analyzer._parse_wx_article_json(raw)
+        self.assertEqual(error, "")
+        self.assertEqual(obj["title"], "测试文章")
+        self.assertEqual(obj["body"][0]["text"], "第一段\n第二段")
+
+    def test_invalid_json_is_repaired_once_by_llm(self):
+        malformed = '{"title":"测试文章","body":[{"text":"未闭合'
+        errors = []
+        with (
+            patch.object(analyzer, "available", return_value=True),
+            patch.object(analyzer, "_call_llm",
+                         side_effect=[malformed, self._valid_json()]) as call_llm,
+        ):
+            result = analyzer.wx_compliant_article(
+                "基本面正文", "主队", "客队", "测试联赛",
+                error_out=errors)
+        self.assertEqual(call_llm.call_count, 2)
+        self.assertEqual(errors, [])
+        self.assertEqual(result["title"], "测试文章")
+        self.assertEqual(result["sections"][0]["text"], "第一段\n\n第二段")
+
+    def test_repair_failure_returns_precise_reason(self):
+        malformed = '{"title":"测试文章","body":['
+        errors = []
+        with (
+            patch.object(analyzer, "available", return_value=True),
+            patch.object(analyzer, "_call_llm",
+                         side_effect=[malformed, "仍然不是 JSON"]),
+        ):
+            result = analyzer.wx_compliant_article(
+                "基本面正文", "主队", "客队", "测试联赛",
+                error_out=errors)
+        self.assertIsNone(result)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("JSON 格式不合法", errors[0])
+        self.assertIn("自动修复后仍无法解析", errors[0])
+
+
 class TestGeneratedArticleRecovery(unittest.TestCase):
     @staticmethod
     def _result(title: str, body: str) -> dict:
@@ -97,6 +150,22 @@ class TestGeneratedArticleRecovery(unittest.TestCase):
         self.assertIn("正文第1节内容",
                       {item["location"] for item in findings})
         self.assertIn("盘口", {item["term"] for item in findings})
+
+    def test_generation_error_uses_precise_analyzer_reason(self):
+        def failed_generation(*_args, error_out=None, **_kwargs):
+            error_out.append(
+                "LLM 返回的文章 JSON 格式不合法；自动修复后仍无法解析")
+            return None
+
+        with patch("bot.analyzer.wx_compliant_article",
+                   side_effect=failed_generation):
+            with self.assertRaises(wp.WechatError) as ctx:
+                wp.report_to_wx_article(
+                    "基本面正文", "主队", "客队", "测试联赛")
+        message = str(ctx.exception)
+        self.assertIn("JSON 格式不合法", message)
+        self.assertIn("自动修复后仍无法解析", message)
+        self.assertNotIn("未配置或返回空", message)
 
     def test_editable_source_is_versioned_and_utf8(self):
         with tempfile.TemporaryDirectory() as tmp:
