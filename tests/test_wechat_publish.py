@@ -1,4 +1,4 @@
-"""微信公众号合规扫描与源稿保留的纯逻辑回归测试。
+"""微信公众号合规提示与源稿保留的纯逻辑回归测试。
 
 运行：python -m unittest tests.test_wechat_publish -v
 """
@@ -27,9 +27,9 @@ class TestComplianceScan(unittest.TestCase):
         ]
         for text in samples:
             with self.subTest(text=text):
-                wp._compliance_scan(text)
+                self.assertEqual(wp._compliance_scan(text), [])
 
-    def test_real_market_context_is_still_blocked(self):
+    def test_real_market_context_is_reported_without_exception(self):
         samples = [
             "主让一球",
             "一球盘低水",
@@ -41,8 +41,23 @@ class TestComplianceScan(unittest.TestCase):
         ]
         for text in samples:
             with self.subTest(text=text):
-                with self.assertRaises(wp.ComplianceError):
-                    wp._compliance_scan(text)
+                findings = wp._compliance_scan(("正文第1节内容", text))
+                self.assertTrue(findings)
+                self.assertEqual(findings[0]["location"], "正文第1节内容")
+                self.assertGreaterEqual(findings[0]["column"], 1)
+
+    def test_scan_returns_term_line_column_and_context(self):
+        findings = wp._compliance_scan(
+            ("正文第2节内容", "首行正常\n随后提到平博赔率变化"))
+        self.assertEqual(
+            [(item["term"], item["line"], item["column"])
+             for item in findings],
+            [("平博", 2, 5), ("赔率", 2, 7)])
+        self.assertTrue(all("平博赔率" in item["context"] for item in findings))
+
+        warning = wp.compliance_warning_text(findings)
+        self.assertIn("不拦截，草稿已保存", warning)
+        self.assertIn("正文第2节内容 第2行第5-6字：平博", warning)
 
 
 class TestGeneratedArticleRecovery(unittest.TestCase):
@@ -60,20 +75,28 @@ class TestGeneratedArticleRecovery(unittest.TestCase):
 
     def test_one_goal_article_can_be_rendered(self):
         result = self._result("一球之差", "主队可能凭借一球小胜。")
+        findings = []
         with patch("bot.analyzer.wx_compliant_article", return_value=result):
             title, content = wp.report_to_wx_article(
-                "基本面正文", "主队", "客队", "测试联赛")
+                "基本面正文", "主队", "客队", "测试联赛",
+                compliance_findings=findings)
         self.assertEqual(title, "一球之差")
         self.assertIn("一球小胜", content)
+        self.assertEqual(findings, [])
 
-    def test_blocked_article_is_attached_to_error(self):
+    def test_flagged_article_is_returned_for_draft_with_findings(self):
         result = self._result("盘口变化", "正文已经生成，但含有明确盘口术语。")
+        findings = []
         with patch("bot.analyzer.wx_compliant_article", return_value=result):
-            with self.assertRaises(wp.ComplianceError) as ctx:
-                wp.report_to_wx_article(
-                    "基本面正文", "主队", "客队", "测试联赛")
-        self.assertEqual(ctx.exception.title, "盘口变化")
-        self.assertIn("正文已经生成", ctx.exception.content_html)
+            title, content = wp.report_to_wx_article(
+                "基本面正文", "主队", "客队", "测试联赛",
+                compliance_findings=findings)
+        self.assertEqual(title, "盘口变化")
+        self.assertIn("正文已经生成", content)
+        self.assertIn("标题", {item["location"] for item in findings})
+        self.assertIn("正文第1节内容",
+                      {item["location"] for item in findings})
+        self.assertIn("盘口", {item["term"] for item in findings})
 
     def test_editable_source_is_versioned_and_utf8(self):
         with tempfile.TemporaryDirectory() as tmp:

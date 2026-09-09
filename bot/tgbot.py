@@ -25,6 +25,7 @@ import uuid
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from html import escape as _html_escape
 
 import requests
 from dotenv import load_dotenv
@@ -571,7 +572,7 @@ _HELP_ADMIN_EXTRA = (
     "/remove &lt;id&gt; — 删联赛\n"
     "/publish — 把 report/ 历史归档报告发布到 Ghost 博客（选日期→选报告→标题→可见性）\n"
     "/wxpublish — 把报告改写成合规基本面文章（纯基本面+结尾猜测，不涉博彩）存微信公众号草稿"
-    "（选日期→选报告，自动生成+合规扫描+存草稿，人工后台确认后发）\n"
+    "（选日期→选报告，自动生成+合规提示+存草稿，人工后台确认后发）\n"
     "/lesson — 把 report/ 历史复盘（_review）蒸馏归档为实战教训（选日期→选报告）\n"
     "/llm — LLM 端点连通性测试 + 故障转移/熔断参数面板（测试延迟、改重试/超时/熔断阈值）\n"
 )
@@ -1977,7 +1978,7 @@ def _send_wx_source(chat_id: int, source: dict | None, caption: str) -> None:
 
 
 def _wxpublish_do(chat_id: int, message_id: int, path: str) -> None:
-    """读报告 → LLM 合规改写 → 合规扫描 → 存草稿 → 回执。全程只存草稿不直发。"""
+    """读报告 → LLM 改写 → 合规提示 → 存草稿 → 回执。全程只存草稿不直发。"""
     try:
         with open(path, encoding="utf-8") as f:
             md = f.read()
@@ -1988,41 +1989,49 @@ def _wxpublish_do(chat_id: int, message_id: int, path: str) -> None:
     title = ""
     html = ""
     source = None
+    compliance_findings: list[dict[str, str | int]] = []
     try:
         home, away, league = wechat_publish.parse_meta(md)
-        title, html = wechat_publish.report_to_wx_article(md, home, away, league)
+        title, html = wechat_publish.report_to_wx_article(
+            md, home, away, league,
+            compliance_findings=compliance_findings)
         # 微信网络请求之前先落一份版本化源稿：后续任何接口错误都不会丢文案。
         source = _preserve_wx_source(path, title, html)
         digest = f"{home} vs {away} 赛前基本面导读" if home and away else ""
         media_id = wechat_publish.add_draft(title, html, digest=digest)
-    except wechat_publish.ComplianceError as e:
-        source = _preserve_wx_source(path, e.title, e.content_html)
-        edit_text(chat_id, message_id,
-                  f"❌ 存草稿失败：{e}\n\n"
-                  "生成内容没有丢失：已另存并发送可编辑 HTML 源稿，"
-                  "修改命中词后可在公众号后台继续编辑。")
-        _send_wx_source(
-            chat_id, source,
-            "合规扫描拦截，未进入公众号草稿箱；这是可编辑源稿。")
-        return
     except wechat_publish.WechatError as e:
-        edit_text(chat_id, message_id, f"❌ 存草稿失败：{e}")
+        compliance_warning = wechat_publish.compliance_warning_text(
+            compliance_findings, draft_saved=False)
+        warning_suffix = (f"\n\n{_html_escape(compliance_warning)}"
+                          if compliance_warning else "")
+        edit_text(chat_id, message_id,
+                  f"❌ 存草稿失败：{_html_escape(str(e))}{warning_suffix}")
         _send_wx_source(
             chat_id, source,
             "微信存草稿失败，但生成内容已保留；这是可编辑源稿。")
         return
     except Exception as e:
         log.exception("wxpublish 异常")
-        edit_text(chat_id, message_id, f"❌ 存草稿异常：{e}")
+        compliance_warning = wechat_publish.compliance_warning_text(
+            compliance_findings, draft_saved=False)
+        warning_suffix = (f"\n\n{_html_escape(compliance_warning)}"
+                          if compliance_warning else "")
+        edit_text(chat_id, message_id,
+                  f"❌ 存草稿异常：{_html_escape(str(e))}{warning_suffix}")
         _send_wx_source(
             chat_id, source,
             "存草稿发生异常，但生成内容已保留；这是可编辑源稿。")
         return
-    edit_text(chat_id, message_id,
-              f"✅ 已存入公众号草稿箱：《{title}》\n"
-              f"（草稿 id: {media_id[:16]}…）\n"
-              "去 mp.weixin.qq.com 后台「草稿箱」核对内容后手动发布。\n"
-              "可编辑 HTML 源稿也已另存并发送。")
+    compliance_warning = wechat_publish.compliance_warning_text(
+        compliance_findings)
+    success_text = (
+        f"✅ 已存入公众号草稿箱：《{_html_escape(title)}》\n"
+        f"（草稿 id: {media_id[:16]}…）\n"
+        "去 mp.weixin.qq.com 后台「草稿箱」核对内容后手动发布。\n"
+        "可编辑 HTML 源稿也已另存并发送。")
+    if compliance_warning:
+        success_text += f"\n\n{_html_escape(compliance_warning)}"
+    edit_text(chat_id, message_id, success_text)
     _send_wx_source(chat_id, source, "微信公众号草稿的可编辑 HTML 源稿备份。")
 
 

@@ -3,13 +3,13 @@
 
 自包含模块（仿 ghost_publish.py 结构）：access_token 换取与缓存、默认封面上传成
 永久素材、报告 md → 合规基本面文章（纯基本面 + 结尾白话猜测，无任何博彩术语）、
-关键词黑名单合规扫描、draft/add 存草稿。
+关键词合规提示、draft/add 存草稿。
 
 设计要点（符合中国大陆法规）：
   - 只存草稿（draft/add），不直接群发/发布，由人工在公众号后台确认后再发；
   - 正文只取报告【免费正文】的基本面段（近况/交锋/赛程），绝不含盘口/结论；
-  - 合规双闸：LLM 生成层（analyzer.wx_compliant_article 的 prompt 硬规则）+
-    本模块 _compliance_scan 正则黑名单，命中即拦截不存草稿。
+  - LLM 生成层仍要求输出纯基本面文章；本模块 _compliance_scan 只返回疑似术语
+    的具体位置供人工复核，不再阻止内容存入草稿箱。
 
 配置（.env）：
   WECHAT_APPID          公众号 AppID（设置与开发→基本配置）
@@ -43,7 +43,7 @@ _MATCH_RE = re.compile(r"^\#\#\s*比赛[：:]\s*(.+?)\s+vs\s+(.+?)\s*$", re.MULT
 _EVENT_RE = re.compile(r"^\#\#\s*赛事[：:]\s*(.+?)\s*$", re.MULTILINE)
 _ARCHIVE_LINE_RE = re.compile(r"(?m)^\s*>?\s*归档路径[：:].*$\n?")
 
-# ── 合规黑名单：任何博彩/操盘术语命中即拦截，不存草稿 ──
+# ── 合规提示词：命中后提示人工复核，但不阻止存草稿 ──
 # 面向大陆法规——公众号文章只能是纯基本面 + 球迷观点，不得涉赌。
 # 高置信术语可直接匹配；「一球/两球/大球/上盘」等同时可能出现在正常足球叙述
 # 中的词，必须连同盘口语境匹配，避免误杀「一球小胜」「加拿大球员」「场上盘带」。
@@ -84,22 +84,7 @@ _CONTEXTUAL_BANNED_RE = re.compile(
 
 
 class WechatError(Exception):
-    """微信接口业务错误或合规拦截，message 已是可读文案。"""
-
-
-class ComplianceError(WechatError):
-    """合规扫描错误；生成已完成时同时携带可恢复的标题和 HTML 源稿。"""
-
-    def __init__(self, hits: list[str] | tuple[str, ...], *, title: str = "",
-                 content_html: str = ""):
-        self.hits = tuple(sorted(set(hits)))
-        self.title = title
-        self.content_html = content_html
-        shown = ", ".join(self.hits[:12])
-        suffix = " 等" if len(self.hits) > 12 else ""
-        super().__init__(
-            "合规扫描拦截：正文/标题命中疑似博彩术语 "
-            f"{shown}{suffix}。已阻止存草稿。")
+    """微信接口业务错误，message 已是可读文案。"""
 
 
 def available() -> bool:
@@ -185,16 +170,68 @@ def _clean_team(name: str) -> str:
     return re.sub(r"[（(].*?[）)]", "", name).strip()
 
 
-def _compliance_scan(*texts: str) -> None:
-    """合规扫描：任一文本命中博彩术语黑名单则抛 WechatError，拦截存草稿。
-    这是发到公众号前的最后一道闸，防 LLM 偶尔漏词把涉赌内容发出去。"""
-    hits: list[str] = []
-    for t in texts:
+def _compliance_scan(
+        *texts: str | tuple[str, str]) -> list[dict[str, str | int]]:
+    """返回疑似术语及其位置，仅供人工复核，不抛异常、不阻止存草稿。
+
+    每项可传纯文本，或 ``(字段名, 文本)``。返回项包含字段名、命中词、原文本
+    的 1-based 行列位置和短上下文，供 Telegram 回执直接说明具体位置。
+    """
+    findings: list[dict[str, str | int]] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for index, item in enumerate(texts, start=1):
+        if isinstance(item, tuple):
+            location, text = item
+        else:
+            location, text = f"文本{index}", item
+        text = text or ""
         for pattern in (_BANNED_RE, _CONTEXTUAL_BANNED_RE):
-            for m in pattern.finditer(t or ""):
-                hits.append(m.group(0))
-    if hits:
-        raise ComplianceError(hits)
+            for match in pattern.finditer(text):
+                key = (location, match.start(), match.end(), match.group(0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                line = text.count("\n", 0, match.start()) + 1
+                column = match.start() - line_start + 1
+                context_start = max(line_start, match.start() - 12)
+                next_newline = text.find("\n", match.end())
+                line_end = len(text) if next_newline < 0 else next_newline
+                context_end = min(line_end, match.end() + 12)
+                context = re.sub(
+                    r"\s+", " ", text[context_start:context_end]).strip()
+                findings.append({
+                    "location": location,
+                    "term": match.group(0),
+                    "line": line,
+                    "column": column,
+                    "end_column": column + len(match.group(0)) - 1,
+                    "context": context,
+                })
+    return findings
+
+
+def compliance_warning_text(
+        findings: list[dict[str, str | int]], limit: int = 12, *,
+        draft_saved: bool = True) -> str:
+    """把扫描结果整理为适合 Telegram 回执的简短纯文本。"""
+    if not findings:
+        return ""
+    status = ("不拦截，草稿已保存，请人工复核" if draft_saved else
+              "本地扫描未拦截；以下位置请人工复核")
+    lines = [f"⚠️ 合规扫描提示（{status}）："]
+    for finding in findings[:limit]:
+        line = int(finding["line"])
+        column = int(finding["column"])
+        end_column = int(finding["end_column"])
+        position = (f"第{line}行第{column}-{end_column}字"
+                    if line > 1 else f"第{column}-{end_column}字")
+        lines.append(
+            f"• {finding['location']} {position}：{finding['term']}"
+            f"（上下文：{finding['context']}）")
+    if len(findings) > limit:
+        lines.append(f"• 另有 {len(findings) - limit} 处命中，请在草稿中继续复核。")
+    return "\n".join(lines)
 
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -262,12 +299,14 @@ def save_editable_source(report_path: str, title: str,
 
 
 def report_to_wx_article(report_md: str, home: str, away: str,
-                         league: str) -> tuple[str, str]:
+                         league: str, *,
+                         compliance_findings: list[dict[str, str | int]] | None = None
+                         ) -> tuple[str, str]:
     """精算报告 markdown → (title, wx_html)。
 
     只取报告【免费正文】的基本面段，经 analyzer.wx_compliant_article 改写成
     纯基本面文章 + 结尾白话猜测（无盘口/结论/术语），再转微信内联 HTML。
-    生成后过 _compliance_scan；命中术语则抛 WechatError。
+    生成后过 _compliance_scan；命中术语只写入 compliance_findings 供人工复核。
     LLM 不可用/失败则抛 WechatError（合规内容无法保证，不降级发原文）。
     """
     from . import analyzer
@@ -302,27 +341,41 @@ def report_to_wx_article(report_md: str, home: str, away: str,
     highlights = result.get("highlights") or []
     prediction = result.get("prediction") or {}
 
-    # 先渲染无副作用的 HTML。若合规扫描拦截，把生成结果附在异常上，调用方仍可
-    # 保存/回传源稿供人工编辑；这里只阻止进微信草稿箱，不再销毁生成成果。
+    # 先渲染无副作用的 HTML，排版与原发布流程保持一致。
     wx_html = _build_article_html(
         title, subtitle, lead, sections, compare, highlights, prediction,
         home or "主队", away or "客队", league or "足球", kick)
 
-    # 合规双闸：正则黑名单扫描所有 LLM 产出文本
-    scan_texts = [title, subtitle, lead,
-                  prediction.get("score", ""), prediction.get("note", "")]
-    for sec in sections:
-        scan_texts += [sec.get("heading", ""), sec.get("text", "")]
-    for row in compare:
-        scan_texts += [row.get("item", ""), row.get("home", ""), row.get("away", "")]
-    for h in highlights:
-        scan_texts += [h.get("label", ""), h.get("value", "")]
-    try:
-        _compliance_scan(*scan_texts)
-    except ComplianceError as e:
-        e.title = title[:64]
-        e.content_html = wx_html
-        raise
+    # 扫描所有 LLM 产出文本，只回传具体命中位置，不拦截后续 draft/add。
+    scan_texts: list[tuple[str, str]] = [
+        ("标题", title),
+        ("副标题", subtitle),
+        ("导语", lead),
+        ("个人预判·比分", prediction.get("score", "")),
+        ("个人预判·说明", prediction.get("note", "")),
+    ]
+    for index, sec in enumerate(sections, start=1):
+        scan_texts += [
+            (f"正文第{index}节标题", sec.get("heading", "")),
+            (f"正文第{index}节内容", sec.get("text", "")),
+        ]
+    for index, row in enumerate(compare, start=1):
+        scan_texts += [
+            (f"对比表第{index}行项目", row.get("item", "")),
+            (f"对比表第{index}行主队", row.get("home", "")),
+            (f"对比表第{index}行客队", row.get("away", "")),
+        ]
+    for index, highlight in enumerate(highlights, start=1):
+        scan_texts += [
+            (f"看点第{index}项标签", highlight.get("label", "")),
+            (f"看点第{index}项内容", highlight.get("value", "")),
+        ]
+    findings = _compliance_scan(*scan_texts)
+    if compliance_findings is not None:
+        compliance_findings.extend(findings)
+    if findings:
+        log.warning("微信公众号草稿内容命中 %d 处疑似术语，继续存草稿并提示人工复核",
+                    len(findings))
     return title[:64], wx_html
 
 
