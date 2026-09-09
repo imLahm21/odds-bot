@@ -433,7 +433,7 @@ def _build_article_html(title: str, subtitle: str, lead: str, sections: list,
     # 两队数据对比表（放在导语后、正文前，先给读者一个数据全景，打破文字墙）
     if compare:
         rows = [
-            '<tr style="background:#d0342c;color:#fff">'
+            '<tr style="background:#d0342c;color:#1a1a1a">'
             '<th style="padding:9px 8px;font-size:13px;text-align:left;'
             'font-weight:600">对比项</th>'
             f'<th style="padding:9px 8px;font-size:13px;font-weight:600">{home}</th>'
