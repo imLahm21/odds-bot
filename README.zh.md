@@ -128,31 +128,33 @@ probe.py             # 阶段0 探针：实测 API 真实 JSON（开发用，部
 LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/访客两个角色，每个角色各有
 **主模型 + 回退模型**，共 12 个槽位，运行时可在 `/llm` 面板随时切换、免重启：
 
-| 档位 | 用途 | 可选模型池（严格分区） | 管理员主模型 | 访客主模型 |
+| 档位 | 用途 | 可选模型池 | 管理员主模型 | 访客主模型 |
 |------|------|------------------------|--------------|------------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-5.6-sol` `glm-5.3` `grok-4.6` `deepseek-v4-pro` | `gpt-6-astra` | `deepseek-v4-pro` |
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-5.6-sol` `gemini-3.8-flash` `glm-5.3` `grok-4.6` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
 | 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-5.6-terra` `deepseek-v4-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4-flash` |
 | 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
 
-**三池严格分区**：每个模型只属于一个档位——`/llm` 面板的模型选择器只列本档池内的模型，
-所以切换是「换模型不换档」，不会把重档推理模型塞进走地 1min 循环（会拖住抓取），
-也不会让主精算掉到轻档小模型。加新模型 / 调整分档只改 `bot/config.py` 的
+**按用途分池**：`/llm` 面板的模型选择器只列目标档允许的模型。为保留现有 balanced
+默认/回退，`gpt-5.6-terra` 与 `glm-5.3-flash` 同时开放给 heavy 和 balanced；light
+仍严格隔离，不会把重档推理模型塞进走地 1min 循环。加新模型 / 调整分档只改 `bot/config.py` 的
 `LLM_MODELS`（改完需重启一次；之后面板内切换免重启）。
 
-**密钥按授权组隔离**：不同模型家族（GPT/Grok/DeepSeek/GLM）通常需要不同的密钥——
+**密钥按授权组隔离**：不同模型家族（GPT/Grok/DeepSeek/GLM/Gemini）通常需要不同的密钥——
 一条只授权 GPT 的密钥请求 Grok 必然 403。每个模型按名字前缀自动归到对应授权组
-（`ik_gpt`/`ik_grok`/`ik_deepseek`/`ik_glm`/`openai_gpt`），一条密钥只属于一个组，
+（`ik_gpt`/`ik_grok`/`ik_deepseek`/`ik_glm`/`ik_gemini`/`openai_gpt`），一条密钥只属于一个组，
 组内可配多条密钥轮转。缺组时该组模型在 `/llm` 面板标 ❌，可用回退模型顶上。
 
 **回退模型**默认刻意选与主模型**不同密钥组**的同档模型（如重档管理员主 `gpt-6-astra`
 走 `ik_gpt`、回退 `grok-4.6` 走 `ik_grok`），这样主组整组挂掉（限流/密钥失效/熔断）
 时才有逃生价值。轻型池只有一个模型，故轻档回退默认留空（不做跨档逃生）。
 
-- **推理强度**：`/analyze` 选完预设/自定义后再选一档（低/普通/高/极高/最高/超高）；访客仅限低/普通/高。
+- **推理强度**：按钮采用“中文 / API 原值”，并按当前重档主模型能力过滤；访客最多可见
+  `低 / low`、`普通 / medium`、`高 / high`。
 - **多端点故障转移**：同组内多条密钥自动轮转/切换；某模型所在组全部熔断/无密钥时，
   自动升级到该槽位设定的回退模型（可能落到另一个密钥组）。坏端点触发熔断后冷却自动
   恢复，熔断/恢复会 TG 告警管理员。
-- **面板操作**：管理员发 `/llm` 可按密钥组测试（🧪）、开关端点、调熔断参数，
+- **面板操作**：管理员发 `/llm` 可先选密钥组、再选一个模型测试（每条 key 一次最小请求），
+  也可开关端点、调熔断参数，
   并给 12 个槽位分别选主/回退模型（点「🎚️主」/「🛟退」进选择器）；
   「🛟 一键切到回退模型」把当前回退值批量搬进主槽，「✨ 恢复模型默认」还原。
 
@@ -209,7 +211,7 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
    - **✍️ 自定义侧重**：点完后 bot 会等你**回复一句**侧重要求
      （比如「重点看临场异动」「忽略基本面只看盘口」），然后按你的要求跑。不想跑了就回 `取消`。
 
-   选完再选一档**推理强度**（低/普通/高），点了 AI 就开始推理，约 **1~3 分钟**，
+   选完再按当前模型选择一档**推理强度**（中文 / API 原值），点了 AI 就开始推理，约 **1~3 分钟**，
    期间会原地显示步骤进度条。跑完发来一份完整精算报告（盘口定性、资金流向、操盘手法、
    风控验证、最终结论与置信度、投注决策）。
 
@@ -291,12 +293,12 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 
 # LLM 密钥按授权组配置；逗号分隔，格式：group|key|base_url|标签
 # 同一组可重复多条 key，bot 只在组内轮转；一条 key 不得重复放进多个组。
-LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
 # 旧 LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS 已彻底不参与路由（无论是否设置这个新变量都一样）；
 # 留着不会报错，但 /llm 面板会提示删除，避免误以为它们仍生效。
 # 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。
 # 保存后先运行：./venv/bin/python -m bot.llm_client
-# 静态检查不会显示密钥；issues 应为空，五个 group_counts 都应至少为 1。
+# 静态检查不会显示密钥；issues 应为空，需要使用的 group_counts 都应至少为 1。
 
 # 可选：把精算报告一键发布到 Ghost 博客（/publish）
 # GHOST_ADMIN_API_KEY=id:secret     # Ghost 后台 Integrations 里生成

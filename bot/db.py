@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS parlay_usage (
 );
 
 -- LLM 故障转移/熔断可调参数：由 TG /llm 面板实时改，llm_client 读取（免重启）。
--- 只存 9 个数值参数（非 secret）；端点密钥仍在 .env、不落库。key 白名单见
+-- 只存 10 个数值参数（非 secret）；端点密钥仍在 .env、不落库。key 白名单见
 -- config.LLM_SETTING_SPECS，seed_config 灌默认值。
 CREATE TABLE IF NOT EXISTS llm_settings (
     key        TEXT PRIMARY KEY,
@@ -520,7 +520,7 @@ def incr_parlay_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:
 def get_llm_settings(conn: sqlite3.Connection) -> dict[str, float]:
     """读全部 LLM 参数为 {key: value}。以 config.LLM_SETTING_SPECS 为准补齐缺失键
     （旧库首次加表、或新增参数时未 seed 到的键，回退该键的默认值），确保调用方
-    永远拿得到 9 个键的完整字典。"""
+    永远拿得到 10 个键的完整字典。"""
     rows = dict(conn.execute("SELECT key, value FROM llm_settings").fetchall())
     return {k: float(rows.get(k, spec["default"]))
             for k, spec in config.LLM_SETTING_SPECS.items()}

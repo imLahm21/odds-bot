@@ -10,7 +10,7 @@ analyzer.py 只负责构造 prompt，真正的 HTTP 调用、重试、失败隔�
   - 每个槽位（档位×角色）有【主模型 + 回退模型】：先按主模型定组、组内轮转与故障转移；
     该组端点全走完仍无成功（全熔断/全停用/组内无端点）才升级到回退模型那组密钥。
   - 先按角色/档位选模型，再按模型选密钥组，只在组内轮转和故障转移；每端点一个
-    内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），9 个可调参数
+    内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），10 个可调参数
     来自 db.llm_settings（TG /llm 面板实时改，免重启），缺库/缺键回退 config 默认。
   - chat()：阻塞，按端点顺序故障转移，跳过 OPEN 端点，全挂返回错误串（不抛异常，
     保持 analyzer 既有契约：失败返回以「LLM 请求失败/超时/网络错误…」开头的说明串）。
@@ -509,13 +509,13 @@ def set_enabled(idx: int, enabled: bool) -> bool:
     return True
 
 
-# ─── 9 个可调参数缓存（DB 懒加载，TG 改后 reload_settings 失效）──────────────
+# ─── 10 个可调参数缓存（DB 懒加载，TG 改后 reload_settings 失效）─────────────
 _settings_cache: dict[str, float] | None = None
 _settings_lock = threading.Lock()
 
 
 def _load_settings() -> dict[str, float]:
-    """从 db.llm_settings 读 9 参数；DB 未初始化/异常时回退 config 默认，
+    """从 db.llm_settings 读 10 参数；DB 未初始化/异常时回退 config 默认，
     保证 llm_client 在任何环境（含未 init_db 的探针）都能拿到完整参数。"""
     try:
         conn = db.get_conn()
@@ -530,7 +530,7 @@ def _load_settings() -> dict[str, float]:
 
 
 def get_settings() -> dict[str, float]:
-    """取 9 参数（进程内缓存，首次访问懒加载）。走地 1min 循环高频调用，走缓存。"""
+    """取 10 参数（进程内缓存，首次访问懒加载）。走地 1min 循环高频调用，走缓存。"""
     global _settings_cache
     if _settings_cache is None:
         with _settings_lock:
@@ -699,18 +699,41 @@ def reset_breaker(idx: int) -> bool:
 
 
 # ─── 载荷与请求头 ────────────────────────────────────────────────────────────
+def _token_limit_field(route_group: str) -> str:
+    """按供应商选择 Chat Completions 的输出 token 参数名。
+
+    OpenAI 官方已用 max_completion_tokens 取代 max_tokens；IKuncode 当前仍接受
+    max_tokens。按端点所属 provider 判断，避免只凭 gpt-* 模型名前缀误伤中转端点。
+    """
+    provider = (config.LLM_ROUTE_GROUPS.get(route_group) or {}).get("provider")
+    return "max_completion_tokens" if provider == "openai" else "max_tokens"
+
+
+def _apply_completion_options(payload: dict, model: str, route_group: str,
+                              max_tokens: int, effort: str = "") -> dict:
+    """给普通请求与探针统一加入 token 上限，并按模型能力安全附加推理强度。"""
+    payload[_token_limit_field(route_group)] = max_tokens
+    if effort:
+        if config.llm_model_supports_effort(model, effort):
+            payload["reasoning_effort"] = effort
+        else:
+            # 主模型切到能力不同的回退模型时，保留请求但让回退模型使用自身默认强度，
+            # 避免一个不支持的 reasoning_effort 令整条逃生链再次 400。
+            log.warning("模型 %s 不支持 reasoning_effort=%s，已省略并使用模型默认强度",
+                        model, effort)
+    return payload
+
+
 def _payload(model: str, system: str, user: str, max_tokens: int,
-             effort: str, stream: bool) -> dict:
+             effort: str, stream: bool, route_group: str) -> dict:
     p = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "max_tokens": max_tokens,
     }
-    if effort:
-        p["reasoning_effort"] = effort
+    _apply_completion_options(p, model, route_group, max_tokens, effort)
     if stream:
         p["stream"] = True
     return p
@@ -873,7 +896,8 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
             log.info("LLM路由 role=%s tier=%s model=%s group=%s endpoint=%s",
                      "访客" if visitor else "管理员", tier, model,
                      ep["route_group"], ep["label"])
-            payload = _payload(model, system, user, tok, effort, False)
+            payload = _payload(model, system, user, tok, effort, False,
+                               ep["route_group"])
             content, ok, err, was_to, rate_limited = _do_chat(
                 ep, payload, read_to, max_retries)
             # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
@@ -1015,12 +1039,12 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
                   finish_reason, usage, len(reasoning_acc))
         hint = ""
         if finish_reason == "length":
-            hint = ("（finish_reason=length：推理把 max_tokens 吃光了，正文没产出。"
+            hint = ("（finish_reason=length：推理把输出 token 上限吃光了，正文没产出。"
                     "已建议调高 LLM_MAX_TOKENS 或缩短规则。）")
         elif finish_reason == "content_filter":
             hint = "（finish_reason=content_filter：被内容审查拦截。）"
         elif reasoning_acc.strip():
-            hint = ("（只产出了推理内容、无正文，可能 max_tokens 不足或网关吞了"
+            hint = ("（只产出了推理内容、无正文，可能输出 token 上限不足或网关吞了"
                     " content 字段。）")
         elif finish_reason:
             hint = f"（finish_reason={finish_reason}）"
@@ -1063,7 +1087,8 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
             log.info("LLM流式路由 role=%s tier=%s model=%s group=%s endpoint=%s",
                      "访客" if visitor else "管理员", tier, model,
                      ep["route_group"], ep["label"])
-            payload = _payload(model, system, user, tok, effort, True)
+            payload = _payload(model, system, user, tok, effort, True,
+                               ep["route_group"])
             produced = False        # 是否已向用户吐过正文 delta
             for ev in _stream_one(ep, payload, first_byte_to, idle_to,
                                   int(st["max_retries"])):
@@ -1154,8 +1179,8 @@ def probe(idx: int, which: str = "heavy", *, model: str = "") -> dict:
     st = get_settings()
     probe_to = min(30, int(st["non_stream_timeout"]))   # 探针用短超时，不等满
     payload = {"model": req_model,
-               "messages": [{"role": "user", "content": "ping"}],
-               "max_tokens": 16}
+               "messages": [{"role": "user", "content": "ping"}]}
+    _apply_completion_options(payload, req_model, ep["route_group"], 16)
     t0 = monotonic()
     try:
         r = requests.post(f"{ep['base_url']}/chat/completions",

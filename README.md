@@ -109,10 +109,10 @@ TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id,guest_chat_id
 TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
 # LLM credentials MUST be split by key group: group|key|base_url|label (comma-separated).
 # IKuncode authorizes each key to ONE model family only — a GPT-only key requesting
-# grok/deepseek/glm will 403. Add a line per group you actually bought a key for;
+# grok/deepseek/glm/gemini will 403. Add a line per group you actually bought a key for;
 # leave the rest out (that tier/role falls back to its configured fallback model,
 # or errors out naming the missing group — it will NOT silently mix keys).
-LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
 # Legacy LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS are NOT read at all anymore (removed —
 # they were the root cause of a key being silently misrouted to unauthorized models).
 # Validate without printing keys: ./venv/bin/python -m bot.llm_client

@@ -167,9 +167,11 @@ class TestModelProfile(unittest.TestCase):
             {
                 "gpt-6-astra": ("ik_gpt",),
                 "gpt-5.6-sol": ("ik_gpt",),
+                "gemini-3.8-flash": ("ik_gemini",),
                 "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
                 "deepseek-v4-pro": ("ik_deepseek",),
+                "deepseek-v4.1-flash": ("ik_deepseek",),
                 "gpt-5.6-terra": ("ik_gpt",),
                 "deepseek-v4-flash": ("ik_deepseek",),
                 "glm-5.3-flash": ("ik_glm",),
@@ -187,6 +189,9 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(
             config.llm_route_groups_for_model("glm-6"), ("ik_glm",))
         self.assertEqual(
+            config.llm_route_groups_for_model("gemini-4-flash"),
+            ("ik_gemini",))
+        self.assertEqual(
             config.llm_route_groups_for_model("gpt-7-nova"), ("ik_gpt",))
         self.assertEqual(
             config.llm_route_groups_for_model("gpt-5.6-luna"),
@@ -202,19 +207,87 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(
             config.llm_route_groups_for_model("gpt-5.5"), ("ik_gpt",))
 
-    def test_tier_pools_are_strictly_partitioned(self):
-        """三池严格分区：每个模型只属于一个档位，不会跨档出现在可选池里。"""
+    def test_tier_pools_keep_light_isolated_and_allow_intentional_overlap(self):
+        """Terra/GLM Flash 跨 heavy+balanced；走地 light 仍与重任务隔离。"""
         heavy = set(config.llm_tier_eligible_models("heavy"))
         balanced = set(config.llm_tier_eligible_models("balanced"))
         light = set(config.llm_tier_eligible_models("light"))
-        self.assertEqual(heavy, {"gpt-6-astra", "gpt-5.6-sol", "glm-5.3",
-                                 "grok-4.6", "deepseek-v4-pro"})
+        self.assertEqual(heavy, {
+            "gpt-6-astra", "gpt-5.6-sol", "gemini-3.8-flash", "glm-5.3",
+            "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
+            "gpt-5.6-terra", "glm-5.3-flash",
+        })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4-flash",
                                     "glm-5.3-flash", "grok-4.5"})
         self.assertEqual(light, {"gpt-5.6-luna"})
-        self.assertEqual(heavy & balanced, set())
+        self.assertEqual(heavy & balanced,
+                         {"gpt-5.6-terra", "glm-5.3-flash"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
+
+    def test_effort_labels_and_per_model_capabilities(self):
+        self.assertEqual(config.LLM_EFFORT_LABELS, {
+            "low": "低 / low", "medium": "普通 / medium", "high": "高 / high",
+            "xhigh": "极高 / xhigh", "max": "最高 / max", "ultra": "超高 / ultra",
+        })
+        self.assertEqual(config.llm_model_efforts("gemini-3.8-flash"),
+                         ("low", "medium", "high"))
+        self.assertIn("ultra", config.llm_model_efforts("gpt-5.6-terra"))
+        self.assertNotIn("ultra", config.llm_model_efforts("gpt-5.6-luna"))
+        # 未登记私有模型无法本地判断，保持升级前的全部可选行为。
+        self.assertEqual(config.llm_model_efforts("custom-private-model"),
+                         tuple(config.LLM_EFFORT_LABELS))
+
+    def test_effort_keyboard_filters_by_current_model_and_visitor_role(self):
+        def callbacks(keyboard):
+            return [button["callback_data"]
+                    for row in keyboard["inline_keyboard"] for button in row]
+
+        with (
+            patch.object(tgbot, "_is_admin", return_value=True),
+            patch.object(llm_client, "get_tier_model",
+                         return_value="gemini-3.8-flash"),
+        ):
+            admin_core = callbacks(tgbot._effort_keyboard(1, "p", 99))
+        self.assertEqual(admin_core, ["ae:p:99:low", "ae:p:99:medium",
+                                      "ae:p:99:high"])
+
+        with (
+            patch.object(tgbot, "_is_admin", return_value=True),
+            patch.object(llm_client, "get_tier_model",
+                         return_value="gpt-6-astra"),
+        ):
+            admin_extended = callbacks(tgbot._effort_keyboard(1, "p", 99))
+        self.assertEqual(len(admin_extended), 6)
+
+        with (
+            patch.object(tgbot, "_is_admin", return_value=False),
+            patch.object(llm_client, "get_tier_model",
+                         return_value="gpt-6-astra"),
+        ):
+            visitor = callbacks(tgbot._effort_keyboard(1, "p", 99))
+        self.assertEqual(visitor, ["ae:p:99:low", "ae:p:99:medium",
+                                   "ae:p:99:high"])
+
+    def test_payload_uses_provider_token_field_and_filters_effort(self):
+        ik = llm_client._payload(
+            "gpt-6-astra", "system", "user", 50, "xhigh", False, "ik_gpt")
+        self.assertEqual(ik["max_tokens"], 50)
+        self.assertNotIn("max_completion_tokens", ik)
+        self.assertEqual(ik["reasoning_effort"], "xhigh")
+
+        official = llm_client._payload(
+            "gpt-5.6-luna", "system", "user", 50, "high", True,
+            "openai_gpt")
+        self.assertEqual(official["max_completion_tokens"], 50)
+        self.assertNotIn("max_tokens", official)
+        self.assertTrue(official["stream"])
+
+        with self.assertLogs("odds_bot.llm", level="WARNING"):
+            filtered = llm_client._payload(
+                "gemini-3.8-flash", "system", "user", 50, "xhigh", False,
+                "ik_gemini")
+        self.assertNotIn("reasoning_effort", filtered)
 
     def test_grouped_endpoint_parser_separates_each_credential_family(self):
         raw = (
@@ -223,10 +296,11 @@ class TestModelProfile(unittest.TestCase):
             "ik_grok|key-grok|https://api.ikuncode.cc/v1|IK-Grok,"
             "ik_deepseek|key-deepseek|https://api.ikuncode.cc/v1|IK-DeepSeek,"
             "ik_glm|key-glm|https://api.ikuncode.cc/v1|IK-GLM,"
+            "ik_gemini|key-gemini|https://api.ikuncode.cc/v1|IK-Gemini,"
             "openai_gpt|key-openai|https://api.openai.com/v1|OpenAI-Luna"
         )
         endpoints = llm_client._parse_route_endpoints(raw)
-        self.assertEqual(len(endpoints), 6)
+        self.assertEqual(len(endpoints), 7)
         self.assertEqual(
             [ep["route_group"] for ep in endpoints].count("ik_gpt"), 2)
         self.assertEqual(
@@ -438,7 +512,7 @@ class TestModelProfile(unittest.TestCase):
         self.assertTrue(any(cb.startswith("lms:") for cb in callbacks))
         self.assertNotIn("lt:all:heavy", callbacks)
 
-    def test_group_probe_tests_only_models_bound_to_that_group(self):
+    def test_group_probe_tests_only_selected_model_on_each_group_endpoint(self):
         endpoints = [
             {"label": "GPT-1", "route_group": "ik_gpt"},
             {"label": "GPT-2", "route_group": "ik_gpt"},
@@ -462,18 +536,22 @@ class TestModelProfile(unittest.TestCase):
                          return_value={"inline_keyboard": []}),
             patch.object(tgbot, "edit_text") as edit,
         ):
-            tgbot._llm_run_group_probe(1, 2, "ik_gpt")
+            tgbot._llm_run_group_probe(1, 2, "ik_gpt", "gpt-5.6-terra")
 
-        # ik_gpt 组承载的全部已登记模型（跨档位：重档两个 + 中型 terra）
-        expected_models = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"}
-        self.assertEqual({model for _, model in calls}, expected_models)
+        self.assertEqual({model for _, model in calls}, {"gpt-5.6-terra"})
         self.assertEqual({idx for idx, _ in calls}, {0, 1})
-        # 别组的模型一个都不该被拿去测（拿 GPT key 测 grok 必然 403）
-        probed = {model for _, model in calls}
-        self.assertNotIn("grok-4.6", probed)
-        self.assertNotIn("glm-5.3", probed)
-        self.assertNotIn("gpt-5.6-luna", probed)   # 走官方组，不属 ik_gpt
         edit.assert_called_once()
+
+    def test_group_probe_keyboard_requires_one_model_choice(self):
+        keyboard = tgbot._llm_group_probe_keyboard("ik_gpt")
+        callbacks = [button["callback_data"]
+                     for row in keyboard["inline_keyboard"] for button in row]
+        model_callbacks = [cb for cb in callbacks if cb.startswith("ltgm:ik_gpt:")]
+        self.assertEqual(len(model_callbacks),
+                         len(config.llm_models_in_group("ik_gpt")))
+        self.assertIn("ltgm:ik_gpt:gpt-6-astra", model_callbacks)
+        self.assertTrue(all(len(cb.encode("utf-8")) <= 64 for cb in callbacks))
+        self.assertIn("lm:", callbacks)
 
     def test_resolve_model_chain_drops_model_with_no_configured_group(self):
         """访客重档默认 deepseek，只买了 GPT 密钥时——链应该跳过它、退到回退模型，
@@ -616,6 +694,33 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(result["req_model"], "gpt-6-astra")
         post.assert_not_called()
         self.assertEqual(breaker.records, [])
+
+    def test_official_probe_uses_max_completion_tokens(self):
+        official = self._group_endpoint("OpenAI", "openai_gpt")
+        breaker = _FakeBreaker()
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"model": "gpt-5.6-luna",
+                        "choices": [{"message": {"content": "pong"}}]}
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", [official]),
+            patch.object(llm_client, "_breakers", [breaker]),
+            patch.object(llm_client, "get_settings",
+                         return_value={"non_stream_timeout": 180}),
+            patch.object(llm_client.requests, "post",
+                         return_value=Response()) as post,
+        ):
+            result = llm_client.probe_model(0, "gpt-5.6-luna")
+        self.assertTrue(result["ok"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["max_completion_tokens"], 16)
+        self.assertNotIn("max_tokens", payload)
 
     def test_chain_error_names_missing_groups_for_every_candidate(self):
         runtime = dict(RUNTIME_MODELS)

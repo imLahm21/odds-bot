@@ -5,7 +5,7 @@ LLM 连通性探针 —— 实测分组端点的 chat/completions
   python probe_llm.py          # 发一个最小请求，确认通
   python probe_llm.py effort    # 逐档测 reasoning_effort（重点验 xhigh 是否被网关接受）
   python probe_llm.py full     # 用真实规则+一场比赛跑完整精算（耗 token）
-  python probe_llm.py pool      # 端点池：解析 .env 端点、逐条探针、打印熔断态与 9 参数
+  python probe_llm.py pool      # 端点池：解析 .env 端点、逐条探针、打印熔断态与 10 参数
 
 先跑无参数版确认连通和返回结构，再决定要不要 effort / full / pool。
 """
@@ -50,12 +50,13 @@ def probe_minimal():
 
 
 def probe_effort():
-    """逐档发最小请求，验证网关是否接受 reasoning_effort（尤其 xhigh）。
-    每档单独打一枪，区分「整体不支持该字段」与「仅某档（如 xhigh）不认」。"""
+    """按当前管理员重档模型声明的能力逐档验证 reasoning_effort。"""
     from bot import db, llm_client
     db.init_db()
-    print("按管理员重档的真实密钥组逐档测试 reasoning_effort：")
-    for eff, label in config.LLM_EFFORT_LABELS.items():
+    model = llm_client.get_tier_model("heavy", visitor=False)
+    print(f"按管理员重档模型 {model} 的声明能力逐档测试 reasoning_effort：")
+    for eff in config.llm_model_efforts(model):
+        label = config.LLM_EFFORT_LABELS[eff]
         result = llm_client.chat(
             "你是连通性探针。", "回复两个字：通了",
             effort=eff, tier="heavy", timeout=60, max_tokens=50)
@@ -92,7 +93,7 @@ def probe_full():
 
 
 def probe_pool(which: str = "heavy"):
-    """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 9 参数。
+    """端点池验证：解析 .env 端点、对每条跑最小 chat 探针、打印熔断态 + 10 参数。
     which ∈ heavy/balanced/light：测哪档（按该档管理员选定的主模型）。
     需先 init_db（读 llm_settings）；未 init 时 llm_client 回退 config 默认。"""
     from bot import llm_client, db
@@ -124,7 +125,7 @@ def probe_pool(which: str = "heavy"):
              if slot["fallback"] else "—未设")
         print(f"  {slot['label']:<16} {role:<4} 主 {p:<22} 回退 {f}")
 
-    print("\n当前 9 参数（DB llm_settings / 回退 config 默认）：")
+    print("\n当前 10 参数（DB llm_settings / 回退 config 默认）：")
     for k, v in llm_client.get_settings().items():
         print(f"  {k:<28} = {v}")
 

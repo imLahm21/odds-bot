@@ -2200,23 +2200,37 @@ def _tier_model_label(chat_id: int, tier: str = "heavy") -> str:
 
 
 def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
-    """构造推理强度选择键盘（2行×3档）。mode='p'(预设)/'c'(自定义)。
-    管理员显示全部 6 档（低/普通/高 | 极高/最高/超高）；访客仅 config.LLM_EFFORT_VISITOR_ALLOWED（低/普通/高）。
+    """按当前重档主模型能力构造推理强度键盘。mode='p'(预设)/'c'(自定义)。
+
+    管理员可见该模型声明的全部档位；访客再与 LLM_EFFORT_VISITOR_ALLOWED 取交集。
     回调格式 ae:<mode>:<fid>:<effort>。
     """
     admin = _is_admin(chat_id)
+    model = llm_client.get_tier_model("heavy", visitor=not admin)
+    model_efforts = set(config.llm_model_efforts(model))
     row1, row2 = [], []
     for eff, label in config.LLM_EFFORT_LABELS.items():
+        if eff not in model_efforts:
+            continue
         if not admin and eff not in config.LLM_EFFORT_VISITOR_ALLOWED:
             continue
         btn = {"text": label, "callback_data": f"ae:{mode}:{fid}:{eff}"}
-        # 低/普通/高 → 第1行；极高/最高/超高 → 第2行
+        # low/medium/high → 第1行；扩展档 → 第2行
         if eff in ("low", "medium", "high"):
             row1.append(btn)
         else:
             row2.append(btn)
-    # 访客只有 3 档(row1)，管理员有 6 档(row1+row2)
     return {"inline_keyboard": [row1] + ([row2] if row2 else [])}
+
+
+def _effort_prompt(chat_id: int) -> str:
+    """当前身份重档主模型及其可选强度，供三个入口统一展示。"""
+    visitor = not _is_admin(chat_id)
+    model = llm_client.get_tier_model("heavy", visitor=visitor)
+    labels = [config.LLM_EFFORT_LABELS[eff]
+              for eff in config.llm_model_efforts(model)
+              if not visitor or eff in config.LLM_EFFORT_VISITOR_ALLOWED]
+    return f"当前模型：{config.llm_model_label(model)}\n可选强度：{'、'.join(labels)}"
 
 
 def _cmd_analyze(chat_id: int, args: list[str]) -> None:
@@ -2263,7 +2277,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
                   "🎯 预设精算 = 跳过预分析，直接按标准 SOP 跑结果预测；\n"
                   "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求"
                   "（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
-                  "🎯/✍️ 选完后再选推理强度（低/中/高/超高）。\n"
+                  "🎯/✍️ 选完后再按当前重档模型选择可用的中英双语推理强度。\n"
                   "（预分析不影响精算质量——主 SOP 本就会自行研判原始基本面）", kb)
 
 
@@ -3002,7 +3016,7 @@ def _llm_panel_text() -> str:
 
 
 def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
-    """面板内联键盘：测试按钮 + 每端点重置 + 9 参数改值 + 刷新/重置全部。
+    """面板内联键盘：测试按钮 + 每端点重置 + 10 参数改值 + 刷新/重置全部。
     expand_test=i 时，第 i 条端点的「测试」行展开为 重/平衡/轻 子按钮(仅测该端点)。"""
     if not llm_client.available():
         return {"inline_keyboard": []}
@@ -3245,8 +3259,21 @@ def _llm_run_probe(chat_id: int, message_id: int, target: str,
     edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
 
 
-def _llm_run_group_probe(chat_id: int, message_id: int, group: str) -> None:
-    """测试一个授权组的每条 key × 该组绑定模型，不向其他组发送请求。"""
+def _llm_group_probe_keyboard(group: str) -> dict:
+    """授权组探针的模型选择器；一次只测一个模型，避免端点×模型请求爆炸。"""
+    rows = []
+    for model in config.llm_models_in_group(group):
+        rows.append([{
+            "text": config.llm_model_label(model),
+            "callback_data": f"ltgm:{group}:{model}",
+        }])
+    rows.append([{"text": "↩️ 返回 LLM 面板", "callback_data": "lm:"}])
+    return {"inline_keyboard": rows}
+
+
+def _llm_run_group_probe(chat_id: int, message_id: int, group: str,
+                         model: str) -> None:
+    """测试一个授权组的每条 key × 用户选定模型，不向其他组发送请求。"""
     if group not in config.LLM_ROUTE_GROUPS:
         send(chat_id, "密钥组不存在。")
         return
@@ -3254,16 +3281,15 @@ def _llm_run_group_probe(chat_id: int, message_id: int, group: str) -> None:
     indices = [i for i, ep in enumerate(endpoints)
                if ep["route_group"] == group]
     models = config.llm_models_in_group(group)
-    if not indices or not models:
+    if not indices or model not in models:
         send(chat_id, f"密钥组 {group} 没有可测试的端点或模型。")
         return
     results = []
     for idx in indices:
-        for model in models:
-            result = llm_client.probe_model(idx, model)
-            result["label"] = endpoints[idx]["label"]
-            results.append(result)
-    lines = [f"<b>🧪 密钥组测试：{group}</b>"]
+        result = llm_client.probe_model(idx, model)
+        result["label"] = endpoints[idx]["label"]
+        results.append(result)
+    lines = [f"<b>🧪 密钥组测试：{group} · {model}</b>"]
     lines += [_fmt_probe_line(result) for result in results]
     lines.append("")
     lines.append(_llm_panel_text())
@@ -3759,11 +3785,11 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, _broadcast_keyboard(token))
         return
 
-    # ── /llm 管理面板回调（ltg:组测试 / lt:旧测试 / lr:重置 / le:开关 /
+    # ── /llm 管理面板回调（ltg:组选模型 / ltgm:执行组测试 / lt:旧测试 / lr:重置 / le:开关 /
     #    ls:改参数 / lm:刷新 / lx:重置参数 /
     #    lms:开模型选择器 / lmv:写模型槽位 / lmt:旧档位按钮，仅管理员）──
     if data.startswith((
-            "ltg:", "lt:", "lte:", "lr:", "le:", "ls:", "lm:", "lx:",
+            "ltg:", "ltgm:", "lt:", "lte:", "lr:", "le:", "ls:", "lm:", "lx:",
             "lms:", "lmv:", "lmt:")):
         if not _is_admin(chat_id):
             answer_callback(cb_id, "仅管理员可操作")
@@ -3771,13 +3797,33 @@ def handle_callback(cb: dict) -> None:
         if data.startswith(("lms:", "lmv:", "lmt:")):
             _handle_llm_model_callback(cb_id, data, chat_id, message_id)
             return
+        if data.startswith("ltgm:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in config.LLM_ROUTE_GROUPS:
+                answer_callback(cb_id, "测试参数无效")
+                return
+            group, model = parts[1], parts[2]
+            models = config.llm_models_in_group(group)
+            if model not in models:
+                answer_callback(cb_id, "模型候选已变化，请重新选择")
+                return
+            answer_callback(cb_id, f"正在测试 {model}…")
+            _submit_bg(_llm_run_group_probe, chat_id, message_id, group, model)
+            return
         if data.startswith("ltg:"):
             group = data[4:]
             if group not in config.LLM_ROUTE_GROUPS:
                 answer_callback(cb_id, "密钥组无效")
                 return
-            answer_callback(cb_id, f"正在测试 {group}…")
-            _submit_bg(_llm_run_group_probe, chat_id, message_id, group)
+            models = config.llm_models_in_group(group)
+            if not models:
+                answer_callback(cb_id, "该组没有已注册模型")
+                return
+            answer_callback(cb_id, f"请选择 {group} 的测试模型")
+            edit_text(chat_id, message_id,
+                      f"<b>🧪 {group}：请选择测试模型</b>\n"
+                      "将使用该组每条 key 各发送一次最小请求。",
+                      _llm_group_probe_keyboard(group))
             return
         if data.startswith("lte:"):
             # lte:<i> 展开该端点测试行为 重/平衡/轻；lte:x 收起。仅重绘键盘，不测。
@@ -3930,7 +3976,8 @@ def handle_callback(cb: dict) -> None:
         answer_callback(cb_id, "请选择推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
         send(chat_id, "🎯 预设精算：请选择推理强度\n"
-                      "低/中=快、省额度；高/超高=更慢更深（超高约数分钟）。",
+                      f"{_effort_prompt(chat_id)}\n"
+                      "低档更快省额度，高档通常更慢更深。",
              _effort_keyboard(chat_id, "p", fid))
         return
 
@@ -3939,7 +3986,8 @@ def handle_callback(cb: dict) -> None:
         fid = int(data[3:])
         answer_callback(cb_id, "请选择推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
-        send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再发你的侧重要求。",
+        send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再发你的侧重要求。\n"
+                      f"{_effort_prompt(chat_id)}",
              _effort_keyboard(chat_id, "c", fid))
         return
 
@@ -3958,7 +4006,8 @@ def handle_callback(cb: dict) -> None:
         answer_callback(cb_id, f"复盘方式：{label}，请选推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
         send(chat_id, f"🔬 复盘【{label}】：请选择推理强度\n"
-                      "低/中=快、省额度；高/超高=更慢更深。",
+                      f"{_effort_prompt(chat_id)}\n"
+                      "低档更快省额度，高档通常更慢更深。",
              _effort_keyboard(chat_id, f"r{sub}", fid))
         return
 
@@ -3973,10 +4022,13 @@ def handle_callback(cb: dict) -> None:
             answer_callback(cb_id, "参数错误")
             return
         # 权限校验：访客不能选超出白名单的高强度（防伪造回调）
-        if eff not in config.LLM_EFFORT_LABELS or (
+        current_model = llm_client.get_tier_model(
+            "heavy", visitor=not _is_admin(chat_id))
+        if eff not in config.LLM_EFFORT_LABELS \
+                or not config.llm_model_supports_effort(current_model, eff) or (
                 not _is_admin(chat_id)
                 and eff not in config.LLM_EFFORT_VISITOR_ALLOWED):
-            answer_callback(cb_id, "该强度不可用")
+            answer_callback(cb_id, f"当前模型 {current_model} 不支持该强度")
             return
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
         eff_label = config.LLM_EFFORT_LABELS[eff]

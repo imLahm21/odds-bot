@@ -300,15 +300,14 @@ LLM_MAX_TOKENS = 32000        # 报告输出上限。重档模型会先消耗大
                               # 7万字符，上限太低（曾设8000）会在推理阶段就被吃光、
                               # 正文为空 → "LLM 返回空内容"。放宽到 32000 留足空间。
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
-# key = 传给 LLM 的 reasoning_effort 值（OpenAI 兼容字段），value = TG 按钮中文标签。
-# Astra/Codex 系支持 xhigh（超高）扩展档；IKuncode 网关透传。
+# key = 传给 API 的原始 reasoning_effort 值；value = TG 中英双语按钮标签。
 LLM_EFFORT_LABELS: dict[str, str] = {
-    "low":    "低",
-    "medium": "普通",
-    "high":   "高",
-    "xhigh":  "极高",
-    "max":    "最高",
-    "ultra":  "超高",
+    "low":    "低 / low",
+    "medium": "普通 / medium",
+    "high":   "高 / high",
+    "xhigh":  "极高 / xhigh",
+    "max":    "最高 / max",
+    "ultra":  "超高 / ultra",
 }
 # 访客可选档位（管理员不受限，可用全部 LLM_EFFORT_LABELS）。
 # 新增的极高/最高/超高为实验档，仅管理员可用（新档不稳定时只影响管理员自己）。
@@ -317,26 +316,51 @@ LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
 LLM_EFFORT_DEFAULT = "high"
 
 # ─── 模型清单（/llm 面板可选池的唯一真相源）─────────────────────────────────
-# 加新模型只改这一处：登记模型名 + 中文标签 + 允许哪几档选它。
+# 加新模型只改这一处：登记模型名 + 中文标签 + 允许哪几档选它 + 支持的推理强度。
 # 密钥组不在这里写 —— 由 llm_route_groups_for_model 按模型名前缀推导（见下文）。
 #   tiers —— 允许该模型出现在哪些档位的可选池里。
-# 三池【严格分区】：每个模型只属于一个档位，按用户指定的能力分级登记。
+#   efforts —— 该模型接受的 reasoning_effort 原始值；TG 只显示这些选项，请求层再兜底过滤。
+# 默认/回退槽不因增加候选而改变。Terra 与 GLM Flash 为保留现有 balanced 默认/回退，
+# 同时开放给 heavy；light 仍严格隔离，防止重模型进入走地 1min 循环。
 # light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放最快的模型——
 # 放推理重档进去会让单次研判几十秒，拖住下一轮抓取。
+_EFFORT_CORE = ("low", "medium", "high")
+_EFFORT_EXTENDED = ("low", "medium", "high", "xhigh", "max", "ultra")
+_EFFORT_OPENAI_LIGHT = ("low", "medium", "high", "xhigh", "max")
+
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
-    "gpt-6-astra":       {"label": "GPT-6 Astra",       "tiers": ("heavy",)},
-    "gpt-5.6-sol":       {"label": "GPT-5.6 Sol",       "tiers": ("heavy",)},
-    "glm-5.3":           {"label": "GLM-5.3",           "tiers": ("heavy",)},
-    "grok-4.6":          {"label": "Grok 4.6",          "tiers": ("heavy",)},
-    "deepseek-v4-pro":   {"label": "DeepSeek V4 Pro",   "tiers": ("heavy",)},
+    # 既有五个模型保持原顺序，兼容部署前已发出的索引型旧面板按钮。
+    "gpt-6-astra":      {"label": "GPT-6 Astra", "tiers": ("heavy",),
+                           "efforts": _EFFORT_EXTENDED},
+    "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": ("heavy",),
+                           "efforts": _EFFORT_EXTENDED},
+    "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
+                           "efforts": _EFFORT_CORE},
+    "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy",),
+                           "efforts": _EFFORT_CORE},
+    "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
+                           "efforts": _EFFORT_CORE},
+    "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy",),
+                           "efforts": _EFFORT_CORE},
+    "deepseek-v4.1-flash": {
+        "label": "DeepSeek V4.1 Flash", "tiers": ("heavy",),
+        "efforts": _EFFORT_CORE,
+    },
     # ── 中型池：基本面预分析 + SEO/科普 + 教训提炼 ──
-    "gpt-5.6-terra":     {"label": "GPT-5.6 Terra",     "tiers": ("balanced",)},
-    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash", "tiers": ("balanced",)},
-    "glm-5.3-flash":     {"label": "GLM-5.3 Flash",     "tiers": ("balanced",)},
-    "grok-4.5":          {"label": "Grok 4.5",          "tiers": ("balanced",)},
+    "gpt-5.6-terra":    {"label": "GPT-5.6 Terra",
+                           "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_EXTENDED},
+    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash", "tiers": ("balanced",),
+                             "efforts": _EFFORT_CORE},
+    "glm-5.3-flash":    {"label": "GLM-5.3 Flash",
+                           "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_CORE},
+    "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
+                           "efforts": _EFFORT_CORE},
     # ── 轻型池：走地实时研判 ──
-    "gpt-5.6-luna":      {"label": "GPT-5.6 Luna",      "tiers": ("light",)},
+    "gpt-5.6-luna":     {"label": "GPT-5.6 Luna", "tiers": ("light",),
+                           "efforts": _EFFORT_OPENAI_LIGHT},
 }
 
 
@@ -352,6 +376,20 @@ def llm_tier_eligible_models(tier: str) -> list[str]:
             if tier in spec.get("tiers", ())]
 
 
+def llm_model_efforts(model: str) -> tuple[str, ...]:
+    """模型允许的 reasoning_effort；未知私有模型保留旧行为（显示/透传全部）。"""
+    spec = LLM_MODELS.get(model)
+    if spec is None:
+        return tuple(LLM_EFFORT_LABELS)
+    allowed = spec.get("efforts", tuple(LLM_EFFORT_LABELS))
+    return tuple(eff for eff in allowed if eff in LLM_EFFORT_LABELS)
+
+
+def llm_model_supports_effort(model: str, effort: str) -> bool:
+    """空强度表示不发送该参数；非空值必须属于该模型声明的能力集。"""
+    return not effort or effort in llm_model_efforts(model)
+
+
 # ─── 三档模型（重/平衡/轻）运行时选定（TG /llm 面板切换，落 db.llm_runtime_state）──
 #   heavy    —— 主 SOP 精算（/analyze /review /parlay）
 #   balanced —— 基本面预分析 + SEO/科普段 + 教训提炼
@@ -359,8 +397,8 @@ def llm_tier_eligible_models(tier: str) -> list[str]:
 # 每档两个角色（管理员 / 访客 visitor=True）各存【主模型 + 回退模型】两个值，共 12 个槽位。
 # 本表只提供**初值**（db seed 与「恢复默认」读它）；可选池来自 llm_tier_eligible_models，
 # 运行时真值在 db.llm_runtime_state，用户可在 /llm 面板自由改，免重启。
-# ⚠️ 每个 default/visitor_default 必须落在该档的 LLM_MODELS 池内（三池严格分区，
-#    跨档取值会被 db 的档位校验拒掉、并被 _sanitize 拉回本档默认）。
+# ⚠️ 每个 default/visitor_default 必须落在该档的 LLM_MODELS 池内；不属于目标档的
+#    取值会被 db 的档位校验拒掉、并被 _sanitize 拉回本档默认。
 LLM_TIER_MODELS: dict[str, dict] = {
     "heavy":    {"label": "重档·主精算",
                  "default": "gpt-6-astra",
@@ -430,6 +468,8 @@ LLM_ROUTE_GROUPS: dict[str, dict] = {
                     "families": ("deepseek",)},
     "ik_glm": {"label": "IKuncode · GLM", "provider": "ikuncode",
                "families": ("glm",)},
+    "ik_gemini": {"label": "IKuncode · Gemini", "provider": "ikuncode",
+                  "families": ("gemini",)},
     "openai_gpt": {"label": "OpenAI 官方 · GPT", "provider": "openai",
                    "families": ("gpt",)},
 }
@@ -441,6 +481,7 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
     "grok": "ik_grok",
     "deepseek": "ik_deepseek",
     "glm": "ik_glm",
+    "gemini": "ik_gemini",
 }
 
 # 显式覆盖：走官方供应商而非中转的少数模型。只有这里需要手写。
@@ -562,7 +603,7 @@ LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
 }
 
 # ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
-# 这里是这 9 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、
+# 这里是这 10 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、
 # llm_client 无 DB 值时兜底也读它。修改默认/范围只改这一处。
 #   key   —— 存 db.llm_settings 的主键，也是 TG 回调 ls:<key> 的标识
 #   default/min/max —— 默认值与合法闭区间（TG 改值越界即拒）
