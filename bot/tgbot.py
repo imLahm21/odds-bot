@@ -2448,6 +2448,8 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
                 edit_text(chat_id, msg_id, progress_text(n, name), stop_kb)
         elif ev[0] == "done":
             report = ev[1]
+        elif ev[0] == "warning":
+            send(chat_id, ev[1])
         elif ev[0] == "error":
             if msg_id:
                 edit_text(chat_id, msg_id, f"❌ 精算失败：{ev[1]}", _NO_KB)
@@ -2527,6 +2529,8 @@ def _analyze_leg(chat_id: int, fid: int, effort: str,
             progress_cb(ev[1], ev[2])
         elif ev[0] == "done":
             report = ev[1]
+        elif ev[0] == "warning":
+            send(chat_id, f"串关腿 {fid}：{ev[1]}")
         elif ev[0] == "error":
             log.warning("串关腿 %s 精算出错: %s", fid, ev[1])
             return None, meta
@@ -2768,6 +2772,8 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
                     edit_text(chat_id, msg_a, blind_progress(ev[1], ev[2]), stop_kb)
             elif ev[0] == "done":
                 forecast = ev[1]
+            elif ev[0] == "warning":
+                send(chat_id, ev[1])
             elif ev[0] == "error":
                 if msg_a:
                     edit_text(chat_id, msg_a, f"❌ 盲推失败：{ev[1]}", _NO_KB)
@@ -2852,6 +2858,8 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
                 edit_text(chat_id, msg_id, progress_text(ev[1]), stop_kb)
         elif ev[0] == "done":
             report = ev[1]
+        elif ev[0] == "warning":
+            send(chat_id, ev[1])
         elif ev[0] == "error":
             if msg_id:
                 edit_text(chat_id, msg_id, f"❌ 对照复盘失败：{ev[1]}", _NO_KB)

@@ -235,7 +235,7 @@ def available() -> bool:
 
 def _call_llm(system: str, user: str, effort: str = "",
               tier: str = "heavy", timeout: int = 0, max_tokens: int = 0,
-              visitor: bool = False) -> str:
+              visitor: bool = False, input_metrics: dict | None = None) -> str:
     """薄委托 llm_client.chat（端点池 + 故障转移 + 熔断）。
     effort 非空附带 reasoning_effort；tier 决定用哪档运行时选定模型（heavy/balanced/light）；
     visitor=True 用该档访客那份模型（访客触发的任务）；
@@ -243,25 +243,29 @@ def _call_llm(system: str, user: str, effort: str = "",
     失败返回错误说明串（不抛异常），前缀沿用旧格式（见 _LLM_ERR_PREFIXES）。
     """
     return llm_client.chat(system, user, effort=effort, tier=tier,
-                           timeout=timeout, max_tokens=max_tokens, visitor=visitor)
+                           timeout=timeout, max_tokens=max_tokens, visitor=visitor,
+                           input_metrics=input_metrics)
 
 
 def _stream_llm(system: str, user: str, effort: str = "",
-                tier: str = "heavy", max_tokens: int = 0, visitor: bool = False):
-    """薄委托 llm_client.stream_chat。yield 事件契约不变：
-    ('delta', 累积全文) / ('done', 全文) / ('error', 错误串)。
+                tier: str = "heavy", max_tokens: int = 0, visitor: bool = False,
+                input_metrics: dict | None = None):
+    """薄委托 llm_client.stream_chat。yield 事件契约：
+    ('warning', 输入规模预警) / ('delta', 累积全文) / ('done', 全文) / ('error', 错误串)。
     tier 决定用哪档运行时选定模型（主 SOP=heavy、基本面=balanced）；
     visitor=True 用该档访客那份模型。
     流式超时用 DB 的 stream_first_byte_timeout + stream_idle_timeout；
     仅在首字节前跨端点故障转移（见 llm_client.stream_chat）。
     """
     yield from llm_client.stream_chat(system, user, effort=effort, tier=tier,
-                                      max_tokens=max_tokens, visitor=visitor)
+                                      max_tokens=max_tokens, visitor=visitor,
+                                      input_metrics=input_metrics)
 
 
 def _analyze_prompts(csv_text: str, fundamentals: str,
                      home: str, away: str, league: str,
-                     extra_instruction: str = "") -> tuple[str, str]:
+                     extra_instruction: str = "",
+                     input_metrics: dict | None = None) -> tuple[str, str]:
     """构造精算的 (system, user) prompt，供阻塞版与流式版共用。
 
     extra_instruction: 用户自定义侧重，非空时追加到标准任务说明之后；
@@ -272,8 +276,10 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     fund = fundamentals or ""
     has_h2h = any(k in fund for k in ("交锋", "H2H", "h2h"))
     has_form = any(k in fund for k in ("近10场", "近 10 场", "近况", "战绩"))
+    rules = load_rules(
+        league_name=league, has_h2h=has_h2h, has_form=has_form)
     system = (
-        load_rules(league_name=league, has_h2h=has_h2h, has_form=has_form)
+        rules
         + "\n\n===== 任务 =====\n"
         "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
         "步骤 1~8 执行分析（含步骤 7.5 投注决策），按文档「输出格式」章节的结构"
@@ -303,6 +309,12 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         f"{goals_model.format_states_block(goals_model.states_from_csv(csv_text))}\n"
         f"### 基本面\n{fundamentals}\n"
     )
+    if input_metrics is not None:
+        input_metrics.update({
+            "rule_chars": len(rules),
+            "csv_chars": len(csv_text or ""),
+            "fundamentals_chars": len(fund),
+        })
     return system, user
 
 
@@ -313,9 +325,12 @@ def analyze(csv_text: str, fundamentals: str,
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
-    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
-                                    extra_instruction)
-    report = _call_llm(system, user, effort, tier="heavy", visitor=visitor)
+    input_metrics: dict[str, int] = {}
+    system, user = _analyze_prompts(
+        csv_text, fundamentals, home, away, league, extra_instruction,
+        input_metrics)
+    report = _call_llm(system, user, effort, tier="heavy", visitor=visitor,
+                       input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
         fund = fundamentals or ""
         mf = rules_manifest(
@@ -357,7 +372,7 @@ def live_brief(live_lines: str, deltas: list[str], home: str, away: str,
 # _call_llm 失败时返回的错误串前缀（见 _call_llm 各分支），据此判定基本面预处理失败
 _LLM_ERR_PREFIXES = (
     "LLM 请求失败", "LLM 超时", "LLM 网络错误",
-    "LLM 返回无 choices", "LLM 返回空内容", "LLM_API_KEY",
+    "LLM 返回无 choices", "LLM 返回空内容", "LLM 输出 token 耗尽", "LLM_API_KEY",
 )
 
 
@@ -1050,6 +1065,7 @@ def analyze_stream(csv_text: str, fundamentals: str,
                    extra_instruction: str = "", effort: str = "",
                    visitor: bool = False):
     """流式精算。yield 进度/结果事件，供 bot 实时播报：
+      ('warning', 预警串)   —— 预计输入超过 warn-only 阈值，请求仍继续
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
       ('done', 完整报告)
       ('error', 错误串)
@@ -1062,13 +1078,16 @@ def analyze_stream(csv_text: str, fundamentals: str,
     if not available():
         yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
         return
-    system, user = _analyze_prompts(csv_text, fundamentals, home, away, league,
-                                    extra_instruction)
+    input_metrics: dict[str, int] = {}
+    system, user = _analyze_prompts(
+        csv_text, fundamentals, home, away, league, extra_instruction,
+        input_metrics)
     # 匹配行首的 "### 3." / "###3." 等主段标题，捕获段号
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user, effort, tier="heavy",
-                                     visitor=visitor):
+                                     visitor=visitor,
+                                     input_metrics=input_metrics):
         if kind == "delta":
             # 每收到一块就透传一个轻量事件，供 bot 循环高频检查中断（消费方忽略未知事件）
             yield ("progress",)
@@ -1089,6 +1108,8 @@ def analyze_stream(csv_text: str, fundamentals: str,
             yield ("done", payload + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)
+        elif kind == "warning":
+            yield ("warning", payload)
 
 
 def review_blind_stream(csv_text: str, home: str, away: str, league: str,
@@ -1107,7 +1128,8 @@ def review_blind_stream(csv_text: str, home: str, away: str, league: str,
 
 def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
                     home: str, away: str, league: str,
-                    fund_brief: str = "") -> tuple[str, str]:
+                    fund_brief: str = "",
+                    input_metrics: dict | None = None) -> tuple[str, str]:
     """构造复盘第二遍【对照】的 (system, user)。
 
     关键：第一遍已在不知道比分的情况下正向推出预判（forecast_text）。
@@ -1125,8 +1147,9 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         if has_fund else
         "只依据盘口走势 + 预判 + 实际结果，不使用基本面，缺失数据不要编造。"
     )
+    rules = load_rules()
     system = (
-        load_rules()
+        rules
         + "\n\n===== 任务（赛后对照复盘）=====\n"
         "你是拥有20年经验的庄家操盘手和数据精算师。这是一场【已结束】比赛的复盘"
         "第二阶段。第一阶段已在【完全不知道比分】的前提下，仅凭盘口走势正向跑完"
@@ -1170,6 +1193,14 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
            if has_fund else "")
         + f"### 实际结果（现在才揭晓）\n{result_text}\n"
     )
+    if input_metrics is not None:
+        input_metrics.update({
+            "rule_chars": len(rules),
+            "csv_chars": len(csv_text or ""),
+            "fundamentals_chars": len(fund_brief or ""),
+            "forecast_chars": len(forecast_text or ""),
+            "result_chars": len(result_text or ""),
+        })
     return system, user
 
 
@@ -1179,9 +1210,12 @@ def review(csv_text: str, forecast_text: str, result_text: str,
     """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法复盘。请在 .env 配置。"
-    system, user = _review_prompts(csv_text, forecast_text, result_text,
-                                   home, away, league, fund_brief)
-    return _call_llm(system, user, effort, tier="heavy", visitor=visitor)
+    input_metrics: dict[str, int] = {}
+    system, user = _review_prompts(
+        csv_text, forecast_text, result_text, home, away, league, fund_brief,
+        input_metrics)
+    return _call_llm(system, user, effort, tier="heavy", visitor=visitor,
+                     input_metrics=input_metrics)
 
 
 # 复盘报告 ### N. 段标题 → 进度阶段名（对照复盘第二遍）
@@ -1200,6 +1234,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
                   home: str, away: str, league: str, effort: str = "",
                   fund_brief: str = "", visitor: bool = False):
     """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
+      ('warning', 预警串)   —— 预计输入超过 warn-only 阈值，请求仍继续
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
       ('error', 错误串)
@@ -1211,12 +1246,15 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
     if not available():
         yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法复盘。请在 .env 配置。")
         return
-    system, user = _review_prompts(csv_text, forecast_text, result_text,
-                                   home, away, league, fund_brief)
+    input_metrics: dict[str, int] = {}
+    system, user = _review_prompts(
+        csv_text, forecast_text, result_text, home, away, league, fund_brief,
+        input_metrics)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user, effort, tier="heavy",
-                                     visitor=visitor):
+                                     visitor=visitor,
+                                     input_metrics=input_metrics):
         if kind == "delta":
             for m in head_re.finditer(payload):
                 n = int(m.group(1))
@@ -1227,6 +1265,8 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
             yield ("done", payload)
         elif kind == "error":
             yield ("error", payload)
+        elif kind == "warning":
+            yield ("warning", payload)
 
 
 # ─── 串关(/parlay)用：从单场精算报告抽出结构化投注决策 ──────────────────────

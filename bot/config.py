@@ -6,6 +6,7 @@
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -295,10 +296,60 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
 LLM_MODEL = "gpt-6-astra"
 LLM_TIMEOUT = 300             # 秒，重档推理 + 长报告，给足超时
-LLM_MAX_TOKENS = 32000        # 报告输出上限。重档模型会先消耗大量
-                              # reasoning token 再写正文；规则 system prompt 约
-                              # 7万字符，上限太低（曾设8000）会在推理阶段就被吃光、
-                              # 正文为空 → "LLM 返回空内容"。放宽到 32000 留足空间。
+def _positive_env_int(name: str, default: int) -> int:
+    """读取正整数环境变量；空值、非整数或非正数均安全回退默认值。"""
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (AttributeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _parse_model_token_limits(raw: str) -> dict[str, int]:
+    """解析 `model:tokens,model:tokens`，忽略格式错误或非正数条目。"""
+    limits: dict[str, int] = {}
+    for item in re.split(r"[,\n]", raw or ""):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        model, raw_limit = (part.strip() for part in item.rsplit(":", 1))
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            continue
+        if model and limit > 0:
+            limits[model] = limit
+    return limits
+
+
+# 重档报告的默认输出预算；可在服务器 .env 覆盖，无需改代码。
+# Chat Completions 的该预算同时容纳 reasoning token 与可见正文。
+LLM_MAX_TOKENS = _positive_env_int("LLM_MAX_TOKENS", 32000)
+# 可选的按模型覆盖，例如：
+# LLM_MODEL_MAX_TOKENS=model-id:48000,another-model:64000
+# 未列出的模型继续使用上面的全局默认；走地/基本面显式传入的小预算优先级更高。
+LLM_MODEL_MAX_TOKENS: dict[str, int] = _parse_model_token_limits(
+    os.getenv("LLM_MODEL_MAX_TOKENS", ""))
+
+
+def llm_max_tokens_for_model(model: str) -> int:
+    """返回模型的重档输出预算（按模型覆盖 > 全局默认）。"""
+    return LLM_MODEL_MAX_TOKENS.get(model, LLM_MAX_TOKENS)
+
+
+# 输入规模只做预警，绝不截断、不压缩、不阻止请求。估算值因不同供应商 tokenizer
+# 而存在误差；完成后以接口 usage 返回的实际 token 为准。
+LLM_INPUT_WARN_TOKENS = _positive_env_int("LLM_INPUT_WARN_TOKENS", 240000)
+# 可选的按模型预警线，例如：model-id:220000,another-model:300000
+LLM_MODEL_INPUT_WARN_TOKENS: dict[str, int] = _parse_model_token_limits(
+    os.getenv("LLM_MODEL_INPUT_WARN_TOKENS", ""))
+
+
+def llm_input_warn_tokens_for_model(model: str) -> int:
+    """返回模型的输入 token 预警线（按模型覆盖 > 全局预警线）。"""
+    return LLM_MODEL_INPUT_WARN_TOKENS.get(model, LLM_INPUT_WARN_TOKENS)
+
+
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
 # key = 传给 API 的原始 reasoning_effort 值；value = TG 中英双语按钮标签。
 LLM_EFFORT_LABELS: dict[str, str] = {

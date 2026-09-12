@@ -113,6 +113,14 @@ TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
 # leave the rest out (that tier/role falls back to its configured fallback model,
 # or errors out naming the missing group — it will NOT silently mix keys).
 LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+# Heavy-report output budget (reasoning + visible answer). Default: 32000.
+LLM_MAX_TOKENS=32000
+# Optional per-model overrides; unspecified models keep LLM_MAX_TOKENS.
+# LLM_MODEL_MAX_TOKENS=model-id:48000,another-model:64000
+# Warn-only estimated input threshold; requests are never truncated or blocked.
+LLM_INPUT_WARN_TOKENS=240000
+# Optional per-model warning thresholds.
+# LLM_MODEL_INPUT_WARN_TOKENS=model-id:220000,another-model:300000
 # Legacy LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS are NOT read at all anymore (removed —
 # they were the root cause of a key being silently misrouted to unauthorized models).
 # Validate without printing keys: ./venv/bin/python -m bot.llm_client

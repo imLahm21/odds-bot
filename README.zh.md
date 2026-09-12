@@ -294,6 +294,14 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 # LLM 密钥按授权组配置；逗号分隔，格式：group|key|base_url|标签
 # 同一组可重复多条 key，bot 只在组内轮转；一条 key 不得重复放进多个组。
 LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+# 重档报告输出预算（推理 token + 可见正文），不写时默认 32000。
+LLM_MAX_TOKENS=32000
+# 可选：按模型覆盖；没有列出的模型继续使用 LLM_MAX_TOKENS。
+# LLM_MODEL_MAX_TOKENS=model-id:48000,another-model:64000
+# 输入 token 估算预警线；仅提醒和记录，绝不截断、压缩或阻止请求。
+LLM_INPUT_WARN_TOKENS=240000
+# 可选：按模型设置预警线。
+# LLM_MODEL_INPUT_WARN_TOKENS=model-id:220000,another-model:300000
 # 旧 LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS 已彻底不参与路由（无论是否设置这个新变量都一样）；
 # 留着不会报错，但 /llm 面板会提示删除，避免误以为它们仍生效。
 # 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。

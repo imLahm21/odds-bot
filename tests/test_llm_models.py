@@ -238,6 +238,57 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(config.llm_model_efforts("custom-private-model"),
                          tuple(config.LLM_EFFORT_LABELS))
 
+    def test_output_token_budget_parsing_and_per_model_override(self):
+        parsed = config._parse_model_token_limits(
+            "deepseek-v4-pro:48000, glm-5.3:64000, bad, zero:0, nope:x")
+        self.assertEqual(parsed, {
+            "deepseek-v4-pro": 48000,
+            "glm-5.3": 64000,
+        })
+        with (
+            patch.object(config, "LLM_MAX_TOKENS", 32000),
+            patch.object(config, "LLM_MODEL_MAX_TOKENS",
+                         {"deepseek-v4-pro": 48000}),
+        ):
+            self.assertEqual(
+                config.llm_max_tokens_for_model("deepseek-v4-pro"), 48000)
+            self.assertEqual(
+                config.llm_max_tokens_for_model("gpt-6-astra"), 32000)
+        with (
+            patch.object(config, "LLM_INPUT_WARN_TOKENS", 240000),
+            patch.object(config, "LLM_MODEL_INPUT_WARN_TOKENS",
+                         {"deepseek-v4-pro": 220000}),
+        ):
+            self.assertEqual(
+                config.llm_input_warn_tokens_for_model("deepseek-v4-pro"),
+                220000)
+            self.assertEqual(
+                config.llm_input_warn_tokens_for_model("gpt-6-astra"),
+                240000)
+
+    def test_analyze_prompt_reports_component_sizes_without_changing_content(self):
+        metrics = {}
+        csv_text = "col1,col2\n1,2\n"
+        fundamentals = "基本面原文"
+        with (
+            patch.object(analyzer, "load_rules", return_value="规则正文"),
+            patch.object(analyzer.goals_model, "states_from_csv",
+                         return_value={}),
+            patch.object(analyzer.goals_model, "format_states_block",
+                         return_value="状态块"),
+        ):
+            system, user = analyzer._analyze_prompts(
+                csv_text, fundamentals, "主队", "客队", "联赛",
+                input_metrics=metrics)
+        self.assertTrue(system.startswith("规则正文"))
+        self.assertIn(csv_text, user)
+        self.assertIn(fundamentals, user)
+        self.assertEqual(metrics, {
+            "rule_chars": len("规则正文"),
+            "csv_chars": len(csv_text),
+            "fundamentals_chars": len(fundamentals),
+        })
+
     def test_effort_keyboard_filters_by_current_model_and_visitor_role(self):
         def callbacks(keyboard):
             return [button["callback_data"]
@@ -282,6 +333,7 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(official["max_completion_tokens"], 50)
         self.assertNotIn("max_tokens", official)
         self.assertTrue(official["stream"])
+        self.assertEqual(official["stream_options"], {"include_usage": True})
 
         with self.assertLogs("odds_bot.llm", level="WARNING"):
             filtered = llm_client._payload(
@@ -472,6 +524,15 @@ class TestModelProfile(unittest.TestCase):
         # （12 个 runtime_state 键，但 slot_snapshot 按槽位分组，不是按键铺平）。
         self.assertEqual(len(snapshot["slots"]), 6)
         self.assertNotIn("mode", snapshot)
+        self.assertEqual(snapshot["output_token_budget"]["default"],
+                         config.LLM_MAX_TOKENS)
+        self.assertEqual(snapshot["output_token_budget"]["per_model"],
+                         config.LLM_MODEL_MAX_TOKENS)
+        self.assertEqual(snapshot["input_warn_tokens"]["default"],
+                         config.LLM_INPUT_WARN_TOKENS)
+        self.assertEqual(snapshot["input_warn_tokens"]["per_model"],
+                         config.LLM_MODEL_INPUT_WARN_TOKENS)
+        self.assertEqual(snapshot["input_warn_tokens"]["action"], "warn_only")
 
     def test_llm_panel_and_keyboard_are_group_based(self):
         groups = list(config.LLM_ROUTE_GROUPS)
@@ -586,9 +647,9 @@ class TestModelProfile(unittest.TestCase):
         runtime["fallback_heavy_visitor"] = "gpt-6-astra"
         calls = []
 
-        def fake_do_chat(ep, payload, read_to, retries):
+        def fake_do_chat(ep, payload, read_to, retries, request_id):
             calls.append(payload["model"])
-            return "ok", True, "", False, False
+            return "ok", True, "", False, False, False
 
         with (
             patch.object(llm_client, "_ENDPOINTS", [gpt_ep]),
@@ -605,6 +666,215 @@ class TestModelProfile(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         self.assertEqual(calls, ["gpt-6-astra"])
+
+    def test_chat_token_exhaustion_skips_sibling_keys_and_uses_fallback(self):
+        endpoints = [
+            self._group_endpoint("DeepSeek-1", "ik_deepseek"),
+            self._group_endpoint("DeepSeek-2", "ik_deepseek"),
+            self._group_endpoint("GLM", "ik_glm"),
+        ]
+        breakers = [_FakeBreaker() for _ in endpoints]
+        runtime = dict(RUNTIME_MODELS)
+        runtime["model_heavy"] = "deepseek-v4-pro"
+        runtime["fallback_heavy"] = "glm-5.3"
+        calls = []
+
+        def fake_do_chat(ep, payload, read_to, retries, request_id):
+            calls.append((ep["label"], payload["model"],
+                          payload.get("max_tokens"),
+                          payload.get("reasoning_effort")))
+            if payload["model"] == "deepseek-v4-pro":
+                return (None, False,
+                        llm_client._token_exhausted_message(payload),
+                        False, False, True)
+            return "ok", True, "", False, False, False
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", breakers),
+            patch.object(llm_client, "_runtime_models", runtime),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "get_settings", return_value={
+                key: spec["default"]
+                for key, spec in config.LLM_SETTING_SPECS.items()}),
+            patch.object(config, "LLM_MAX_TOKENS", 32000),
+            patch.object(config, "LLM_MODEL_MAX_TOKENS",
+                         {"deepseek-v4-pro": 48000}),
+            patch.object(llm_client, "_do_chat", side_effect=fake_do_chat),
+        ):
+            result = llm_client.chat(
+                "system", "user", effort="high", tier="heavy")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual([call[1] for call in calls],
+                         ["deepseek-v4-pro", "glm-5.3"])
+        self.assertEqual(calls[0][2:], (48000, "high"))
+        self.assertEqual(calls[1][2:], (32000, "high"))
+        self.assertEqual(breakers[0].records, [])
+        self.assertEqual(breakers[1].records, [])
+        self.assertEqual(breakers[2].records, [True])
+
+    def test_do_chat_classifies_length_as_token_exhaustion(self):
+        ep = self._group_endpoint("DeepSeek", "ik_deepseek")
+        payload = llm_client._payload(
+            "deepseek-v4-pro", "system", "user", 32000, "medium", False,
+            "ik_deepseek")
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {"content": ""},
+                    }],
+                    "usage": {"completion_tokens": 32000},
+                }
+
+        with patch.object(llm_client.requests, "post", return_value=Response()):
+            result = llm_client._do_chat(ep, payload, 180, 0)
+        self.assertFalse(result[1])
+        self.assertTrue(result[5])
+        self.assertIn("finish_reason=length", result[2])
+        self.assertIn("max_tokens=32000", result[2])
+
+    def test_stream_one_classifies_empty_length_as_token_exhaustion(self):
+        ep = self._group_endpoint("DeepSeek", "ik_deepseek")
+        payload = llm_client._payload(
+            "deepseek-v4-pro", "system", "user", 32000, "medium", True,
+            "ik_deepseek")
+
+        class Response:
+            status_code = 200
+            text = ""
+            encoding = ""
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                chunk = {
+                    "choices": [{
+                        "finish_reason": "length",
+                        "delta": {"reasoning_content": "thinking"},
+                    }],
+                    "usage": {"completion_tokens": 32000},
+                }
+                yield "data: " + json.dumps(chunk)
+                yield "data: [DONE]"
+
+        with patch.object(llm_client.requests, "post", return_value=Response()):
+            events = list(llm_client._stream_one(ep, payload, 60, 90, 0))
+        self.assertEqual([event[0] for event in events],
+                         [llm_client._USAGE_EVENT,
+                          llm_client._TOKEN_EXHAUSTED_EVENT])
+        self.assertEqual(events[0][1]["completion_tokens"], 32000)
+        self.assertIn("正文未产出", events[1][1])
+
+    def test_stream_usage_option_400_retries_without_changing_request(self):
+        ep = self._group_endpoint("IK", "ik_gpt")
+        payload = llm_client._payload(
+            "gpt-6-astra", "system", "user", 32000, "high", True,
+            "ik_gpt")
+
+        class UnsupportedResponse:
+            status_code = 400
+            text = "Unsupported parameter: stream_options"
+
+        class SuccessResponse:
+            status_code = 200
+            text = ""
+            encoding = ""
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                usage = {
+                    "prompt_tokens": 267943,
+                    "completion_tokens": 12000,
+                    "prompt_tokens_details": {"cached_tokens": 88064},
+                }
+                yield "data: " + json.dumps({"choices": [], "usage": usage})
+                yield "data: " + json.dumps({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "delta": {"content": "报告"},
+                    }],
+                }, ensure_ascii=False)
+                yield "data: [DONE]"
+
+        with patch.object(
+                llm_client.requests, "post",
+                side_effect=[UnsupportedResponse(), SuccessResponse()]) as post:
+            events = list(llm_client._stream_one(ep, payload, 60, 90, 0))
+
+        self.assertEqual(post.call_count, 2)
+        first_payload = post.call_args_list[0].kwargs["json"]
+        second_payload = post.call_args_list[1].kwargs["json"]
+        self.assertIn("stream_options", first_payload)
+        self.assertNotIn("stream_options", second_payload)
+        self.assertEqual(first_payload["messages"], second_payload["messages"])
+        self.assertEqual(first_payload["reasoning_effort"],
+                         second_payload["reasoning_effort"])
+        self.assertEqual(first_payload["max_tokens"], second_payload["max_tokens"])
+        self.assertEqual([event[0] for event in events],
+                         ["delta", llm_client._USAGE_EVENT, "done"])
+
+    def test_warn_mode_continues_and_logs_actual_cached_usage(self):
+        endpoint = self._group_endpoint("DeepSeek", "ik_deepseek")
+        breaker = _FakeBreaker()
+        runtime = dict(RUNTIME_MODELS)
+        runtime["model_heavy"] = "deepseek-v4-pro"
+        runtime["fallback_heavy"] = ""
+        sent_payloads = []
+
+        def fake_stream(ep, payload, first_byte_to, idle_to, retries):
+            sent_payloads.append(payload)
+            yield (llm_client._USAGE_EVENT, {
+                "prompt_tokens": 267943,
+                "completion_tokens": 22415,
+                "prompt_tokens_details": {"cached_tokens": 88064},
+                "completion_tokens_details": {"reasoning_tokens": 18000},
+                "total_tokens": 290358,
+            })
+            yield ("done", "ok")
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", [endpoint]),
+            patch.object(llm_client, "_breakers", [breaker]),
+            patch.object(llm_client, "_runtime_models", runtime),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "get_settings", return_value={
+                key: spec["default"]
+                for key, spec in config.LLM_SETTING_SPECS.items()}),
+            patch.object(config, "LLM_INPUT_WARN_TOKENS", 10),
+            patch.object(config, "LLM_MODEL_INPUT_WARN_TOKENS", {}),
+            patch.object(llm_client, "_stream_one", side_effect=fake_stream),
+            self.assertLogs("odds_bot.llm", level="INFO") as captured,
+        ):
+            events = list(llm_client.stream_chat(
+                "system", "user", effort="high", tier="heavy",
+                input_metrics={
+                    "rule_chars": 100,
+                    "csv_chars": 200,
+                    "fundamentals_chars": 30,
+                }))
+
+        self.assertEqual([event[0] for event in events], ["warning", "done"])
+        self.assertIn("仍按原 prompt 继续精算", events[0][1])
+        self.assertEqual(len(sent_payloads), 1)
+        self.assertEqual(sent_payloads[0]["messages"][0]["content"], "system")
+        self.assertEqual(sent_payloads[0]["messages"][1]["content"], "user")
+        self.assertEqual(sent_payloads[0]["reasoning_effort"], "high")
+        rendered = "\n".join(captured.output)
+        self.assertIn("rule_chars=100", rendered)
+        self.assertIn("csv_chars=200", rendered)
+        self.assertIn("fundamentals_chars=30", rendered)
+        self.assertIn("cached_tokens=88064", rendered)
+        self.assertIn("reasoning_tokens=18000", rendered)
+        self.assertEqual(breaker.records, [True])
 
     def test_chat_reports_precise_error_when_chain_empty(self):
         """两个候选都缺组时，错误串必须点名具体缺哪个组——不能只说「失败」。
@@ -651,6 +921,92 @@ class TestModelProfile(unittest.TestCase):
                 "system", "user", tier="heavy", visitor=True))
         self.assertEqual(events, [("done", "ok")])
         self.assertEqual(routed, ["gpt-6-astra"])
+
+    def test_stream_token_exhaustion_skips_sibling_keys_and_uses_fallback(self):
+        endpoints = [
+            self._group_endpoint("DeepSeek-1", "ik_deepseek"),
+            self._group_endpoint("DeepSeek-2", "ik_deepseek"),
+            self._group_endpoint("GLM", "ik_glm"),
+        ]
+        breakers = [_FakeBreaker() for _ in endpoints]
+        runtime = dict(RUNTIME_MODELS)
+        runtime["model_heavy"] = "deepseek-v4-pro"
+        runtime["fallback_heavy"] = "glm-5.3"
+        calls = []
+
+        def fake_stream(ep, payload, first_byte_to, idle_to, retries):
+            calls.append((ep["label"], payload["model"],
+                          payload.get("max_tokens"),
+                          payload.get("reasoning_effort")))
+            if payload["model"] == "deepseek-v4-pro":
+                yield (llm_client._TOKEN_EXHAUSTED_EVENT,
+                       llm_client._token_exhausted_message(payload))
+            else:
+                yield ("done", "fallback ok")
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", breakers),
+            patch.object(llm_client, "_runtime_models", runtime),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "get_settings", return_value={
+                key: spec["default"]
+                for key, spec in config.LLM_SETTING_SPECS.items()}),
+            patch.object(config, "LLM_MAX_TOKENS", 32000),
+            patch.object(config, "LLM_MODEL_MAX_TOKENS",
+                         {"deepseek-v4-pro": 48000}),
+            patch.object(llm_client, "_stream_one", side_effect=fake_stream),
+        ):
+            events = list(llm_client.stream_chat(
+                "system", "user", effort="high", tier="heavy"))
+
+        self.assertEqual(events, [("done", "fallback ok")])
+        self.assertEqual([call[1] for call in calls],
+                         ["deepseek-v4-pro", "glm-5.3"])
+        self.assertEqual(calls[0][2:], (48000, "high"))
+        self.assertEqual(calls[1][2:], (32000, "high"))
+        self.assertEqual(breakers[0].records, [])
+        self.assertEqual(breakers[1].records, [])
+        self.assertEqual(breakers[2].records, [True])
+
+    def test_stream_partial_length_does_not_switch_or_trip_breaker(self):
+        endpoints = [
+            self._group_endpoint("DeepSeek", "ik_deepseek"),
+            self._group_endpoint("GLM", "ik_glm"),
+        ]
+        breakers = [_FakeBreaker() for _ in endpoints]
+        runtime = dict(RUNTIME_MODELS)
+        runtime["model_heavy"] = "deepseek-v4-pro"
+        runtime["fallback_heavy"] = "glm-5.3"
+        routed = []
+
+        def fake_stream(ep, payload, first_byte_to, idle_to, retries):
+            routed.append(payload["model"])
+            yield ("delta", "部分正文")
+            yield (llm_client._TOKEN_EXHAUSTED_EVENT,
+                   llm_client._token_exhausted_message(
+                       payload, has_content=True))
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", breakers),
+            patch.object(llm_client, "_runtime_models", runtime),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "get_settings", return_value={
+                key: spec["default"]
+                for key, spec in config.LLM_SETTING_SPECS.items()}),
+            patch.object(llm_client, "_stream_one", side_effect=fake_stream),
+        ):
+            events = list(llm_client.stream_chat(
+                "system", "user", effort="medium", tier="heavy"))
+
+        self.assertEqual([event[0] for event in events], ["delta", "error"])
+        self.assertIn("正文只生成了一部分", events[-1][1])
+        self.assertEqual(routed, ["deepseek-v4-pro"])
+        self.assertEqual(breakers[0].records, [])
+        self.assertEqual(breakers[1].records, [])
 
     def test_stream_chat_does_not_switch_model_after_content_emitted(self):
         """已经吐过正文的流断了，不能静默换模型重来——那会产生重复可见输出。"""

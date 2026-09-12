@@ -27,6 +27,7 @@ import time
 import json
 import logging
 import threading
+import uuid
 from time import monotonic
 from collections import deque
 
@@ -709,6 +710,125 @@ def _token_limit_field(route_group: str) -> str:
     return "max_completion_tokens" if provider == "openai" else "max_tokens"
 
 
+_TOKEN_EXHAUSTED_EVENT = "token_exhausted"
+_USAGE_EVENT = "usage"
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """跨供应商的保守近似：非 ASCII 按 1 token，ASCII 按约 3 字符/token。"""
+    value = text or ""
+    ascii_chars = sum(1 for char in value if ord(char) < 128)
+    non_ascii_chars = len(value) - ascii_chars
+    return non_ascii_chars + (ascii_chars + 2) // 3
+
+
+def _input_observation(system: str, user: str, model: str, output_budget: int,
+                       details: dict | None = None) -> dict:
+    """生成 warn-only 输入观测；只计数，不改写或阻止请求。"""
+    observed = {
+        "model": model,
+        "system_chars": len(system or ""),
+        "user_chars": len(user or ""),
+        "estimated_input_tokens": (
+            _estimate_text_tokens(system) + _estimate_text_tokens(user) + 16),
+        "output_budget": int(output_budget),
+        "warn_tokens": int(config.llm_input_warn_tokens_for_model(model)),
+    }
+    for key in ("rule_chars", "csv_chars", "fundamentals_chars",
+                "forecast_chars", "result_chars"):
+        try:
+            observed[key] = max(0, int((details or {}).get(key, 0)))
+        except (TypeError, ValueError):
+            observed[key] = 0
+    observed["warn"] = (
+        observed["estimated_input_tokens"] >= observed["warn_tokens"])
+    return observed
+
+
+def _log_input_observation(request_id: str, observation: dict) -> None:
+    """把可估算的输入组成写入日志；warn 仅提高日志级别，不改变请求。"""
+    logger = log.warning if observation["warn"] else log.info
+    logger(
+        "LLM输入观测 request=%s model=%s estimate_tokens=%d warn_tokens=%d "
+        "output_budget=%d system_chars=%d user_chars=%d rule_chars=%d "
+        "csv_chars=%d fundamentals_chars=%d forecast_chars=%d result_chars=%d "
+        "action=continue",
+        request_id, observation["model"],
+        observation["estimated_input_tokens"], observation["warn_tokens"],
+        observation["output_budget"], observation["system_chars"],
+        observation["user_chars"], observation["rule_chars"],
+        observation["csv_chars"], observation["fundamentals_chars"],
+        observation["forecast_chars"], observation["result_chars"])
+
+
+def _input_warning_message(observation: dict) -> str:
+    """TG 可读的 warn-only 提示；明确说明请求仍会继续。"""
+    return ("⚠️ 输入规模预警："
+            f"{observation['model']} 预计约 "
+            f"{observation['estimated_input_tokens']:,} tokens，超过预警线 "
+            f"{observation['warn_tokens']:,}。仍按原 prompt 继续精算，不删除盘口、"
+            "不压缩输入、不降低推理强度；最终以接口 usage 为准。")
+
+
+def _usage_summary(usage: dict | None) -> dict | None:
+    """兼容 Chat/Responses 风格 usage 字段，提取实际与缓存 token。"""
+    if not isinstance(usage, dict) or not usage:
+        return None
+    input_details = (usage.get("prompt_tokens_details")
+                     or usage.get("input_tokens_details") or {})
+    output_details = (usage.get("completion_tokens_details")
+                      or usage.get("output_tokens_details") or {})
+    return {
+        "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens")),
+        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens")),
+        "cached_tokens": input_details.get(
+            "cached_tokens", usage.get("prompt_cache_hit_tokens",
+                                       usage.get("cached_tokens"))),
+        "cache_write_tokens": input_details.get(
+            "cache_write_tokens", usage.get("cache_creation_input_tokens")),
+        "cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+        "reasoning_tokens": output_details.get(
+            "reasoning_tokens", usage.get("reasoning_tokens")),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+def _log_usage(request_id: str, model: str, endpoint: str,
+               usage: dict | None) -> None:
+    """记录接口实际 usage；供应商未返回时明确记录 unavailable。"""
+    summary = _usage_summary(usage)
+    if summary is None:
+        log.info("LLM实际用量 request=%s model=%s endpoint=%s usage=unavailable",
+                 request_id, model, endpoint)
+        return
+    log.info(
+        "LLM实际用量 request=%s model=%s endpoint=%s input_tokens=%s "
+        "output_tokens=%s cached_tokens=%s cache_write_tokens=%s cache_miss_tokens=%s "
+        "reasoning_tokens=%s total_tokens=%s",
+        request_id, model, endpoint, summary["input_tokens"],
+        summary["output_tokens"], summary["cached_tokens"],
+        summary["cache_write_tokens"], summary["cache_miss_tokens"],
+        summary["reasoning_tokens"], summary["total_tokens"])
+
+
+def _payload_token_limit(payload: dict) -> tuple[str, int | None]:
+    """取请求实际使用的 token 参数名和值，供错误文案与日志复用。"""
+    for field in ("max_completion_tokens", "max_tokens"):
+        if field in payload:
+            return field, payload.get(field)
+    return "output_tokens", None
+
+
+def _token_exhausted_message(payload: dict, has_content: bool = False) -> str:
+    """生成不会把模型预算问题误写成端点故障的统一错误文案。"""
+    field, limit = _payload_token_limit(payload)
+    budget = f"{field}={limit}" if limit is not None else field
+    result = "正文只生成了一部分，不能作为完整报告" if has_content else "正文未产出"
+    return (f"LLM 输出 token 耗尽（finish_reason=length，模型="
+            f"{payload.get('model', 'unknown')}，{budget}：{result}）。"
+            "这是模型/请求预算问题，不计入端点熔断；系统不会自动降低你选择的推理强度。")
+
+
 def _apply_completion_options(payload: dict, model: str, route_group: str,
                               max_tokens: int, effort: str = "") -> dict:
     """给普通请求与探针统一加入 token 上限，并按模型能力安全附加推理强度。"""
@@ -736,6 +856,9 @@ def _payload(model: str, system: str, user: str, max_tokens: int,
     _apply_completion_options(p, model, route_group, max_tokens, effort)
     if stream:
         p["stream"] = True
+        # 请求流末尾返回 usage，便于记录实际输入/输出/缓存命中。部分中转不支持时，
+        # _stream_one 会在首字节前自动去掉本字段重试一次，不影响正文请求。
+        p["stream_options"] = {"include_usage": True}
     return p
 
 
@@ -758,9 +881,11 @@ _CONNECT_TIMEOUT = 10   # 连接超时（秒），与读超时分开
 
 # ─── 阻塞调用（带端点内重试 + 跨端点故障转移）────────────────────────────────
 def _do_chat(ep: dict, payload: dict, read_to: int,
-             max_retries: int) -> tuple[str | None, bool, str, bool, bool]:
+             max_retries: int, request_id: str = "") \
+        -> tuple[str | None, bool, str, bool, bool, bool]:
     """对单端点发一次非流式请求（含端点内重试）。
-    返回 (正文 or None, 成功?, 错误串, 是否超时类, 是否限流429)。错误串沿用 analyzer 旧格式。
+    返回 (正文 or None, 成功?, 错误串, 是否超时类, 是否限流429, 是否输出预算耗尽)。
+    错误串沿用 analyzer 旧格式。
     重试仅针对瞬时错误（网络/超时/429/5xx）；4xx / 空内容 / 无 choices 为确定性
     错误，不在同端点重试（重试同请求结果相同），直接判失败交由上层切下一端点。
 
@@ -778,18 +903,20 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
             attempt += 1
             if attempt > max_retries:
                 return (None, False,
-                        f"LLM 超时（>{read_to}s）。推理较慢，可稍后重试。", True, False)
+                        f"LLM 超时（>{read_to}s）。推理较慢，可稍后重试。",
+                        True, False, False)
             time.sleep(min(2 ** attempt, 8))
             continue
         except UnicodeEncodeError as e:
             log.error("请求头编码失败（key/url 含非 ASCII）: %s", e)
             return (None, False,
                     "LLM_API_KEY 或 LLM_BASE_URL 含非 ASCII 字符（可能复制时混入了"
-                    "全角符号/空格）。请检查服务器 .env 后重启。", False, False)
+                    "全角符号/空格）。请检查服务器 .env 后重启。",
+                    False, False, False)
         except requests.exceptions.RequestException as e:
             attempt += 1
             if attempt > max_retries:
-                return None, False, f"LLM 网络错误：{e}", False, False
+                return None, False, f"LLM 网络错误：{e}", False, False, False
             time.sleep(min(2 ** attempt, 8))
             continue
 
@@ -804,24 +931,39 @@ def _do_chat(ep: dict, payload: dict, read_to: int,
                         log.warning("端点【%s】被限流 429（重试 %d 次仍限流），"
                                     "换下一端点、不计入熔断", ep["label"], max_retries)
                     return (None, False,
-                            f"LLM 请求失败 HTTP {r.status_code}：{body}", False, is_429)
+                            f"LLM 请求失败 HTTP {r.status_code}：{body}",
+                            False, is_429, False)
                 time.sleep(min(2 ** attempt, 8))
                 continue
             # 4xx（400/401/403 等）确定性错误：不重试，直接切端点
-            return None, False, f"LLM 请求失败 HTTP {r.status_code}：{body}", False, False
+            return (None, False, f"LLM 请求失败 HTTP {r.status_code}：{body}",
+                    False, False, False)
 
         try:
             data = r.json()
         except ValueError:
             return (None, False,
-                    f"LLM 请求失败 HTTP 200：响应非 JSON：{r.text[:200]}", False, False)
+                    f"LLM 请求失败 HTTP 200：响应非 JSON：{r.text[:200]}",
+                    False, False, False)
+        _log_usage(request_id or "-", str(payload.get("model", "")),
+                   str(ep.get("label", "")), data.get("usage"))
         choices = data.get("choices", [])
         if not choices:
-            return None, False, f"LLM 返回无 choices：{str(data)[:300]}", False, False
-        content = choices[0].get("message", {}).get("content", "").strip()
+            return (None, False, f"LLM 返回无 choices：{str(data)[:300]}",
+                    False, False, False)
+        choice = choices[0]
+        content = choice.get("message", {}).get("content", "").strip()
+        if choice.get("finish_reason") == "length":
+            field, limit = _payload_token_limit(payload)
+            log.error("LLM 输出 token 耗尽 model=%s endpoint=%s %s=%s usage=%s "
+                      "content_len=%d", payload.get("model"), ep.get("label"),
+                      field, limit, data.get("usage"), len(content))
+            return (None, False,
+                    _token_exhausted_message(payload, has_content=bool(content)),
+                    False, False, True)
         if not content:
-            return None, False, "LLM 返回空内容", False, False
-        return content, True, "", False, False
+            return None, False, "LLM 返回空内容", False, False, False
+        return content, True, "", False, False, False
 
 
 # 选路优先级：正常/半开端点优先，降级端点次之（仍用但靠后），OPEN 交由 allow() 冷却门控。
@@ -861,7 +1003,8 @@ def _endpoints_by_priority(model: str = "") -> list[tuple[int, dict]]:
 
 
 def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
-         timeout: int = 0, max_tokens: int = 0, visitor: bool = False) -> str:
+         timeout: int = 0, max_tokens: int = 0, visitor: bool = False,
+         input_metrics: dict | None = None) -> str:
     """阻塞式调用，按选路优先级故障转移（正常端点先、降级端点后）。
     失败返回错误说明串（不抛异常）。
     visitor=True 时该档用访客那份选定模型（访客触发的 /analyze /review）。
@@ -874,7 +1017,7 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     st = get_settings()
     read_to = int(timeout or st["non_stream_timeout"])
     max_retries = int(st["max_retries"])
-    tok = max_tokens or config.LLM_MAX_TOKENS
+    request_id = uuid.uuid4().hex[:12]
 
     chain = resolve_model_chain(tier, visitor)
     if not chain:
@@ -883,10 +1026,22 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     raw_errs: list[str] = []      # 各端点原始错误串（单端点时原样返回，保持旧文案）
     labeled: list[str] = []       # 带端点标签的错误（多端点聚合展示）
     all_timeout = True            # 是否全部端点都是超时类失败
+    budget_errs: list[str] = []   # 模型输出预算耗尽：不算端点故障、不换同模型其他 key
+    non_budget_error = False
+    exhausted_models: set[str] = set()
     for pos, model in enumerate(chain):
         if pos:
-            log.warning("模型 %s 的密钥组全部不可用，升级到回退模型 %s",
-                        chain[pos - 1], model)
+            previous = chain[pos - 1]
+            if previous in exhausted_models:
+                log.warning("模型 %s 输出 token 预算耗尽，切换到回退模型 %s",
+                            previous, model)
+            else:
+                log.warning("模型 %s 的密钥组全部不可用，升级到回退模型 %s",
+                            previous, model)
+        tok = int(max_tokens or config.llm_max_tokens_for_model(model))
+        observation = _input_observation(
+            system, user, model, tok, input_metrics)
+        _log_input_observation(request_id, observation)
         for idx, ep in _endpoints_by_priority(model):
             br = _breakers[idx]
             if not br.allow():
@@ -898,8 +1053,17 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                      ep["route_group"], ep["label"])
             payload = _payload(model, system, user, tok, effort, False,
                                ep["route_group"])
-            content, ok, err, was_to, rate_limited = _do_chat(
-                ep, payload, read_to, max_retries)
+            content, ok, err, was_to, rate_limited, token_exhausted = _do_chat(
+                ep, payload, read_to, max_retries, request_id)
+            if token_exhausted:
+                # 换同一模型的另一条 key 不会改变 prompt/effort/token 预算，只会重复
+                # 消耗；直接结束该模型并进入已配置的回退模型。不要污染端点熔断状态。
+                raw_errs.append(err)
+                labeled.append(f"{ep['label']}({model})：{err}")
+                budget_errs.append(err)
+                exhausted_models.add(model)
+                all_timeout = False
+                break
             # 限流(429)不喂熔断器：它是「稍后再来」而非「端点坏了」，计入会把健康但
             # 暂时超 TPM 的 key 误熔断 90s，反而加剧其余 key 压力。5xx/超时仍照记。
             if not rate_limited:
@@ -908,6 +1072,7 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                 return content
             raw_errs.append(err)
             labeled.append(f"{ep['label']}({model})：{err}")
+            non_budget_error = True
             if not was_to:
                 all_timeout = False
 
@@ -923,8 +1088,11 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                     f"{groups} 已全部手动停用）")
         return ("LLM 请求失败（所有端点均处于熔断中，暂无可用端点，"
                 "请稍后重试或用 /llm 重置熔断）")
-    if len(_ENDPOINTS) == 1:
+    if len(_ENDPOINTS) == 1 and len(raw_errs) == 1:
         return raw_errs[0]          # 单端点部署：原样返回，与改造前文案一致
+    if budget_errs and not non_budget_error:
+        # 全链路只有模型预算问题时，避免误报「全部端点不可用」。
+        return budget_errs[-1]
     if all_timeout:
         return "LLM 超时（全部端点无响应）：" + "；".join(labeled)
     return "LLM 请求失败（全部端点不可用）：" + "；".join(labeled)
@@ -934,7 +1102,8 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
 def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
                 max_retries: int = 0):
     """对单端点发一次流式请求。yield ('delta', 累积全文) / ('done', 全文) /
-    ('error', 串) / ('ratelimit', 串)。首字节超时用 monotonic 手动计时（socket 读超时
+    ('error', 串) / ('ratelimit', 串)，另有仅供 stream_chat 消费的 usage 与
+    token_exhausted 内部事件。首字节超时用 monotonic 手动计时（socket 读超时
     取较大值兜底，避免推理模型正常的长首字节/块间静默被过早掐断）；idle_to=0 时禁用块间超时。
 
     429/5xx 在【发起阶段】按 max_retries 退避重试（此时还没吐任何内容，重试安全）。
@@ -945,9 +1114,11 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
     # socket 读超时：取语义上限的较大者兜底；真正的语义判定由下方 monotonic 检查负责。
     sock_read = max(first_byte_to, idle_to) if idle_to > 0 else max(first_byte_to, 300)
     attempt = 0
+    request_payload = payload
+    usage_option_retried = False
     while True:
         try:
-            r = requests.post(url, json=payload, headers=_headers(ep),
+            r = requests.post(url, json=request_payload, headers=_headers(ep),
                               stream=True, timeout=(_CONNECT_TIMEOUT, sock_read))
         except requests.exceptions.Timeout:
             yield ("error", f"LLM 超时（连接/读取 >{sock_read}s）。可稍后重试。")
@@ -965,6 +1136,17 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
             break                       # 进入下方流式读取
         # 非 200：429/5xx 可退避重试（尚未吐内容，安全）
         body = r.text[:300]
+        if (r.status_code == 400 and "stream_options" in request_payload
+                and not usage_option_retried):
+            # 部分 OpenAI 兼容中转未实现 include_usage。400 发生在生成前，去掉观测字段
+            # 原样重试一次；不改变 prompt、模型、预算或推理强度。
+            log.warning("端点【%s】返回 400，可能不兼容 stream_options；"
+                        "已去掉用量观测字段原样重试一次：%s",
+                        ep["label"], body)
+            request_payload = dict(request_payload)
+            request_payload.pop("stream_options", None)
+            usage_option_retried = True
+            continue
         if r.status_code == 429 or 500 <= r.status_code < 600:
             attempt += 1
             if attempt <= max_retries:
@@ -1034,14 +1216,24 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
         yield ("error", f"LLM 网络错误：{e}")
         return
 
+    # usage 是内部观测事件，由 stream_chat 消费，不暴露给 analyzer/tgbot 的正文契约。
+    yield (_USAGE_EVENT, usage)
+
+    if finish_reason == "length":
+        field, limit = _payload_token_limit(payload)
+        log.error("LLM 输出 token 耗尽 model=%s endpoint=%s %s=%s usage=%s "
+                  "reasoning_len=%d content_len=%d", payload.get("model"),
+                  ep.get("label"), field, limit, usage, len(reasoning_acc),
+                  len(acc))
+        yield (_TOKEN_EXHAUSTED_EVENT,
+               _token_exhausted_message(payload, has_content=bool(acc.strip())))
+        return
+
     if not acc.strip():
         log.error("LLM 空正文 finish_reason=%s usage=%s reasoning_len=%d",
                   finish_reason, usage, len(reasoning_acc))
         hint = ""
-        if finish_reason == "length":
-            hint = ("（finish_reason=length：推理把输出 token 上限吃光了，正文没产出。"
-                    "已建议调高 LLM_MAX_TOKENS 或缩短规则。）")
-        elif finish_reason == "content_filter":
+        if finish_reason == "content_filter":
             hint = "（finish_reason=content_filter：被内容审查拦截。）"
         elif reasoning_acc.strip():
             hint = ("（只产出了推理内容、无正文，可能输出 token 上限不足或网关吞了"
@@ -1054,9 +1246,10 @@ def _stream_one(ep: dict, payload: dict, first_byte_to: int, idle_to: int,
 
 
 def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
-                max_tokens: int = 0, visitor: bool = False):
-    """流式调用，只在【首字节前】跨端点故障转移。yield 与旧 _stream_llm 完全一致：
-    ('delta', 累积全文) / ('done', 全文) / ('error', 串)。
+                max_tokens: int = 0, visitor: bool = False,
+                input_metrics: dict | None = None):
+    """流式调用，只在【首字节前】跨端点故障转移。对外 yield：
+    ('warning', 输入规模预警) / ('delta', 累积全文) / ('done', 全文) / ('error', 串)。
     visitor=True 时该档用访客那份选定模型。
     tier ∈ heavy/balanced/light：决定用哪档运行时选定模型（主 SOP=heavy、基本面=balanced）。
     max_tokens 非默认时覆盖（基本面预处理传较小预算，使其也能流式跑、停止按钮低延迟生效）。
@@ -1067,7 +1260,7 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     st = get_settings()
     first_byte_to = int(st["stream_first_byte_timeout"])
     idle_to = int(st["stream_idle_timeout"])
-    tok = max_tokens or config.LLM_MAX_TOKENS
+    request_id = uuid.uuid4().hex[:12]
 
     chain = resolve_model_chain(tier, visitor)
     if not chain:
@@ -1075,10 +1268,25 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
         return
 
     last_err = None
+    exhausted_models: set[str] = set()
+    warning_sent = False
     for pos, model in enumerate(chain):
         if pos:
-            log.warning("模型 %s 的密钥组全部不可用，流式升级到回退模型 %s",
-                        chain[pos - 1], model)
+            previous = chain[pos - 1]
+            if previous in exhausted_models:
+                log.warning("模型 %s 输出 token 预算耗尽，流式切换到回退模型 %s",
+                            previous, model)
+            else:
+                log.warning("模型 %s 的密钥组全部不可用，流式升级到回退模型 %s",
+                            previous, model)
+        tok = int(max_tokens or config.llm_max_tokens_for_model(model))
+        observation = _input_observation(
+            system, user, model, tok, input_metrics)
+        _log_input_observation(request_id, observation)
+        if observation["warn"] and not warning_sent:
+            warning_sent = True
+            yield ("warning", _input_warning_message(observation))
+        model_exhausted = False
         for idx, ep in _endpoints_by_priority(model):
             br = _breakers[idx]
             if not br.allow():
@@ -1090,12 +1298,18 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
             payload = _payload(model, system, user, tok, effort, True,
                                ep["route_group"])
             produced = False        # 是否已向用户吐过正文 delta
+            usage_logged = False
             for ev in _stream_one(ep, payload, first_byte_to, idle_to,
                                   int(st["max_retries"])):
                 if ev[0] == "delta":
                     produced = True
                     yield ev
+                elif ev[0] == _USAGE_EVENT:
+                    usage_logged = True
+                    _log_usage(request_id, model, ep["label"], ev[1])
                 elif ev[0] == "done":
+                    if not usage_logged:
+                        _log_usage(request_id, model, ep["label"], None)
                     br.record(True)
                     yield ev
                     return
@@ -1103,6 +1317,19 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                     # 限流(429)：不喂熔断器（健康 key 只是暂时超 TPM，误熔断会加剧其余
                     # key 压力），直接换下一端点。ratelimit 只在首字节前产生。
                     last_err = ev[1]
+                    break
+                elif ev[0] == _TOKEN_EXHAUSTED_EVENT:
+                    # HTTP/流本身健康，预算耗尽不是端点故障，不喂熔断器。
+                    if not usage_logged:
+                        _log_usage(request_id, model, ep["label"], None)
+                    last_err = ev[1]
+                    exhausted_models.add(model)
+                    if produced:
+                        # 已向调用者吐过正文，不能切模型重来，否则会混入重复输出。
+                        yield ("error", ev[1])
+                        return
+                    # 零正文时，同模型换 key 只会重复消费；直接进入回退模型。
+                    model_exhausted = True
                     break
                 elif ev[0] == "error":
                     br.record(False)
@@ -1113,6 +1340,8 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                         return
                     last_err = ev[1]
                     break
+            if model_exhausted:
+                break
     if last_err is None and enabled_count() == 0:
         yield ("error", "LLM 全部端点均被手动停用（请用 /llm 面板开启至少一个端点）")
         return
@@ -1282,6 +1511,15 @@ def routing_snapshot() -> dict:
         "issues": routing_issues(),
         "group_counts": group_counts,
         "model_routes": model_routes,
+        "output_token_budget": {
+            "default": config.LLM_MAX_TOKENS,
+            "per_model": dict(config.LLM_MODEL_MAX_TOKENS),
+        },
+        "input_warn_tokens": {
+            "default": config.LLM_INPUT_WARN_TOKENS,
+            "per_model": dict(config.LLM_MODEL_INPUT_WARN_TOKENS),
+            "action": "warn_only",
+        },
         "slots": slot_snapshot(),
         "endpoints": endpoints(),
     }
