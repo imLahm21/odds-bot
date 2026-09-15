@@ -830,11 +830,12 @@ def _token_exhausted_message(payload: dict, has_content: bool = False) -> str:
 
 
 def _apply_completion_options(payload: dict, model: str, route_group: str,
-                              max_tokens: int, effort: str = "") -> dict:
+                              max_tokens: int, effort: str = "", *,
+                              force_effort: bool = False) -> dict:
     """给普通请求与探针统一加入 token 上限，并按模型能力安全附加推理强度。"""
     payload[_token_limit_field(route_group)] = max_tokens
     if effort:
-        if config.llm_model_supports_effort(model, effort):
+        if force_effort or config.llm_model_supports_effort(model, effort):
             payload["reasoning_effort"] = effort
         else:
             # 主模型切到能力不同的回退模型时，保留请求但让回退模型使用自身默认强度，
@@ -1376,12 +1377,16 @@ def _save_probe(idx: int, res: dict) -> dict:
     return res
 
 
-def probe(idx: int, which: str = "heavy", *, model: str = "") -> dict:
+def probe(idx: int, which: str = "heavy", *, model: str = "",
+          effort: str = "", max_tokens: int = 16,
+          timeout_seconds: int | None = None, prompt: str = "ping",
+          force_effort: bool = False) -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
     which ∈ heavy/balanced/light：测哪档——按该档运行时选定模型 + 端点映射解析真实模型名
     （端点有映射时测映射模型，否则测该角色当前档位模型）。
-    返回 {ok, http_status, latency_ms, model, req_model, which, error, breaker_state}。
-    max_tokens 用 16（而非 1）：部分推理模型对过小预算会 400，16 既够连通判定又极廉价。
+    effort 非空时按模型能力表发送指定 reasoning_effort；返回安全的 usage 摘要，
+    可据 reasoning_tokens 区分“参数被接受”与“确有可观察推理用量”。默认 max_tokens=16
+    保持原有廉价连通探针；强度诊断可显式提高预算和超时。
     纯诊断——不喂 Breaker，避免健康检查污染故障转移的错误率。
 
     ⚠️ 假通判定：不再「HTTP 200 就算通」。要求 200 且返回体解析出 choices（有正文或
@@ -1406,10 +1411,14 @@ def probe(idx: int, which: str = "heavy", *, model: str = "") -> dict:
             "breaker_state": bstate,
         })
     st = get_settings()
-    probe_to = min(30, int(st["non_stream_timeout"]))   # 探针用短超时，不等满
+    if timeout_seconds is None:
+        probe_to = min(30, int(st["non_stream_timeout"]))
+    else:
+        probe_to = max(1, min(300, int(timeout_seconds)))
     payload = {"model": req_model,
-               "messages": [{"role": "user", "content": "ping"}]}
-    _apply_completion_options(payload, req_model, ep["route_group"], 16)
+               "messages": [{"role": "user", "content": prompt}]}
+    _apply_completion_options(payload, req_model, ep["route_group"],
+                              max_tokens, effort, force_effort=force_effort)
     t0 = monotonic()
     try:
         r = requests.post(f"{ep['base_url']}/chat/completions",
@@ -1448,9 +1457,16 @@ def probe(idx: int, which: str = "heavy", *, model: str = "") -> dict:
             err = str(data.get("error", data))[:150]
         else:
             err = r.text[:150]
+    usage = _usage_summary(data.get("usage")) if isinstance(data, dict) else None
+    finish_reason = ""
+    if isinstance(data, dict) and data.get("choices"):
+        finish_reason = str(data["choices"][0].get("finish_reason") or "")
     return _save_probe(idx, {"ok": ok, "http_status": r.status_code,
             "latency_ms": latency, "model": model, "req_model": req_model,
-            "which": which, "error": err, "breaker_state": bstate})
+            "which": which, "effort": effort,
+            "sent_effort": payload.get("reasoning_effort", ""),
+            "usage": usage, "finish_reason": finish_reason,
+            "error": err, "breaker_state": bstate})
 
 
 def probe_all(which: str = "heavy") -> list[dict]:
@@ -1463,9 +1479,13 @@ def probe_all(which: str = "heavy") -> list[dict]:
     return out
 
 
-def probe_model(idx: int, model: str) -> dict:
+def probe_model(idx: int, model: str, *, effort: str = "",
+                max_tokens: int = 16, timeout_seconds: int | None = None,
+                prompt: str = "ping", force_effort: bool = False) -> dict:
     """对指定端点测试明确模型，用于新密钥组面板；不经过当前档位选择。"""
-    return probe(idx, "model", model=model)
+    return probe(idx, "model", model=model, effort=effort,
+                 max_tokens=max_tokens, timeout_seconds=timeout_seconds,
+                 prompt=prompt, force_effort=force_effort)
 
 
 def _slot_ready(model: str) -> bool:

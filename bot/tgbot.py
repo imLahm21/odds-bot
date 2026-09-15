@@ -2208,19 +2208,17 @@ def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
     admin = _is_admin(chat_id)
     model = llm_client.get_tier_model("heavy", visitor=not admin)
     model_efforts = set(config.llm_model_efforts(model))
-    row1, row2 = [], []
+    buttons = []
     for eff, label in config.LLM_EFFORT_LABELS.items():
         if eff not in model_efforts:
             continue
         if not admin and eff not in config.LLM_EFFORT_VISITOR_ALLOWED:
             continue
-        btn = {"text": label, "callback_data": f"ae:{mode}:{fid}:{eff}"}
-        # low/medium/high → 第1行；扩展档 → 第2行
-        if eff in ("low", "medium", "high"):
-            row1.append(btn)
-        else:
-            row2.append(btn)
-    return {"inline_keyboard": [row1] + ([row2] if row2 else [])}
+        buttons.append({"text": label,
+                        "callback_data": f"ae:{mode}:{fid}:{eff}"})
+    # 每行最多三个，Sol 的七档和 Astra 的六档都不会挤成超宽按钮。
+    return {"inline_keyboard": [buttons[i:i + 3]
+                                for i in range(0, len(buttons), 3)]}
 
 
 def _effort_prompt(chat_id: int) -> str:
@@ -2361,7 +2359,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
              cancel: "threading.Event | None" = None) -> None:
     """第二步：真正跑 SOP 精算。
     extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
-    effort 为推理强度（low/medium/high/xhigh），透传给 analyzer。
+    effort 为推理强度；具体可选值按当前模型能力表过滤后透传给 analyzer。
     task_id/cancel：本任务的中断句柄——停止按钮带 task_id，置位 cancel 后循环收尾。
     """
     from . import fundamentals

@@ -148,8 +148,24 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 走 `ik_gpt`、回退 `grok-4.6` 走 `ik_grok`），这样主组整组挂掉（限流/密钥失效/熔断）
 时才有逃生价值。轻型池只有一个模型，故轻档回退默认留空（不做跨档逃生）。
 
-- **推理强度**：按钮采用“中文 / API 原值”，并按当前重档主模型能力过滤；访客最多可见
-  `低 / low`、`普通 / medium`、`高 / high`。
+- **推理强度**：按钮采用“中文 / API 原值”，并按当前模型的独立能力表过滤；访客只可见
+  `关闭 / none`、`低 / low`、`普通 / medium`、`高 / high` 中该模型实际登记的档位。
+  管理员档位如下：
+
+  | 模型 | 可选档位 |
+  |------|----------|
+  | `gpt-6-astra` | `low` `medium` `high` `xhigh` `max` `ultra`（`ultra` 为当前 IK 网关实测扩展） |
+  | `gpt-5.6-sol` | `none` `low` `medium` `high` `xhigh` `max` `ultra`（`ultra` 为当前 IK 网关实测扩展） |
+  | `gpt-5.6-terra` | `none` `low` `medium` `high` `xhigh` `max` |
+  | `gpt-5.6-luna` | `none` `low` `medium` `high` `xhigh` `max`（`max` 按管理要求保留；当前官方端点实测返回 400） |
+  | `glm-5.3` / `glm-5.3-flash` | `low` `high` `max` |
+  | `grok-4.6` | `low` `medium` `high` `xhigh` |
+  | `grok-4.5` | `low` `medium` `high` |
+  | DeepSeek V4 系列 | `none` `low` `high` `max` |
+  | `gemini-3.8-flash` | `low` `medium` `high` |
+
+  可运行 `python -m scripts.probe_llm_efforts --models <模型ID>` 逐档发送最小真实请求；
+  输出仅含端点标签、HTTP状态、延迟、响应模型及usage，不输出密钥或回答正文。
 - **多端点故障转移**：同组内多条密钥自动轮转/切换；某模型所在组全部熔断/无密钥时，
   自动升级到该槽位设定的回退模型（可能落到另一个密钥组）。坏端点触发熔断后冷却自动
   恢复，熔断/恢复会 TG 告警管理员。

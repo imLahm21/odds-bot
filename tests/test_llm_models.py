@@ -227,13 +227,27 @@ class TestModelProfile(unittest.TestCase):
 
     def test_effort_labels_and_per_model_capabilities(self):
         self.assertEqual(config.LLM_EFFORT_LABELS, {
-            "low": "低 / low", "medium": "普通 / medium", "high": "高 / high",
+            "none": "关闭 / none", "low": "低 / low",
+            "medium": "普通 / medium", "high": "高 / high",
             "xhigh": "极高 / xhigh", "max": "最高 / max", "ultra": "超高 / ultra",
         })
         self.assertEqual(config.llm_model_efforts("gemini-3.8-flash"),
                          ("low", "medium", "high"))
-        self.assertIn("ultra", config.llm_model_efforts("gpt-5.6-terra"))
-        self.assertNotIn("ultra", config.llm_model_efforts("gpt-5.6-luna"))
+        self.assertEqual(config.llm_model_efforts("gpt-6-astra"),
+                         ("low", "medium", "high", "xhigh", "max", "ultra"))
+        self.assertEqual(config.llm_model_efforts("gpt-5.6-sol"),
+                         ("none", "low", "medium", "high", "xhigh", "max",
+                          "ultra"))
+        self.assertEqual(config.llm_model_efforts("gpt-5.6-terra"),
+                         ("none", "low", "medium", "high", "xhigh", "max"))
+        self.assertEqual(config.llm_model_efforts("glm-5.3"),
+                         ("low", "high", "max"))
+        self.assertEqual(config.llm_model_efforts("grok-4.6"),
+                         ("low", "medium", "high", "xhigh"))
+        self.assertEqual(config.llm_model_efforts("deepseek-v4.1-flash"),
+                         ("none", "low", "high", "max"))
+        self.assertEqual(config.llm_model_efforts("gpt-5.6-luna"),
+                         ("none", "low", "medium", "high", "xhigh", "max"))
         # 未登记私有模型无法本地判断，保持升级前的全部可选行为。
         self.assertEqual(config.llm_model_efforts("custom-private-model"),
                          tuple(config.LLM_EFFORT_LABELS))
@@ -308,8 +322,13 @@ class TestModelProfile(unittest.TestCase):
             patch.object(llm_client, "get_tier_model",
                          return_value="gpt-6-astra"),
         ):
-            admin_extended = callbacks(tgbot._effort_keyboard(1, "p", 99))
-        self.assertEqual(len(admin_extended), 6)
+            admin_keyboard = tgbot._effort_keyboard(1, "p", 99)
+            admin_extended = callbacks(admin_keyboard)
+        self.assertEqual(admin_extended,
+                         ["ae:p:99:low", "ae:p:99:medium", "ae:p:99:high",
+                          "ae:p:99:xhigh", "ae:p:99:max", "ae:p:99:ultra"])
+        self.assertTrue(all(len(row) <= 3
+                            for row in admin_keyboard["inline_keyboard"]))
 
         with (
             patch.object(tgbot, "_is_admin", return_value=False),
@@ -319,6 +338,15 @@ class TestModelProfile(unittest.TestCase):
             visitor = callbacks(tgbot._effort_keyboard(1, "p", 99))
         self.assertEqual(visitor, ["ae:p:99:low", "ae:p:99:medium",
                                    "ae:p:99:high"])
+
+        with (
+            patch.object(tgbot, "_is_admin", return_value=False),
+            patch.object(llm_client, "get_tier_model",
+                         return_value="deepseek-v4.1-flash"),
+        ):
+            visitor_deepseek = callbacks(tgbot._effort_keyboard(1, "p", 99))
+        self.assertEqual(visitor_deepseek,
+                         ["ae:p:99:none", "ae:p:99:low", "ae:p:99:high"])
 
     def test_payload_uses_provider_token_field_and_filters_effort(self):
         ik = llm_client._payload(
@@ -340,6 +368,12 @@ class TestModelProfile(unittest.TestCase):
                 "gemini-3.8-flash", "system", "user", 50, "xhigh", False,
                 "ik_gemini")
         self.assertNotIn("reasoning_effort", filtered)
+
+        forced = {}
+        llm_client._apply_completion_options(
+            forced, "gemini-3.8-flash", "ik_gemini", 50, "xhigh",
+            force_effort=True)
+        self.assertEqual(forced["reasoning_effort"], "xhigh")
 
     def test_grouped_endpoint_parser_separates_each_credential_family(self):
         raw = (
@@ -1077,6 +1111,46 @@ class TestModelProfile(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["max_completion_tokens"], 16)
         self.assertNotIn("max_tokens", payload)
+
+    def test_effort_probe_sends_level_and_reports_safe_usage(self):
+        official = self._group_endpoint("OpenAI", "openai_gpt")
+        breaker = _FakeBreaker()
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {
+                    "model": "gpt-5.6-luna",
+                    "choices": [{"finish_reason": "stop",
+                                 "message": {"content": "2.42"}}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 30,
+                        "completion_tokens_details": {"reasoning_tokens": 24},
+                        "total_tokens": 50,
+                    },
+                }
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", [official]),
+            patch.object(llm_client, "_breakers", [breaker]),
+            patch.object(llm_client.requests, "post",
+                         return_value=Response()) as post,
+        ):
+            result = llm_client.probe_model(
+                0, "gpt-5.6-luna", effort="max", max_tokens=64,
+                timeout_seconds=120, prompt="calc")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["reasoning_effort"], "max")
+        self.assertEqual(payload["max_completion_tokens"], 64)
+        self.assertEqual(payload["messages"][0]["content"], "calc")
+        self.assertEqual(post.call_args.kwargs["timeout"][1], 120)
+        self.assertEqual(result["sent_effort"], "max")
+        self.assertEqual(result["usage"]["reasoning_tokens"], 24)
+        self.assertEqual(result["finish_reason"], "stop")
 
     def test_chain_error_names_missing_groups_for_every_candidate(self):
         runtime = dict(RUNTIME_MODELS)

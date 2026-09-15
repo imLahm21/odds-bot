@@ -353,6 +353,7 @@ def llm_input_warn_tokens_for_model(model: str) -> int:
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
 # key = 传给 API 的原始 reasoning_effort 值；value = TG 中英双语按钮标签。
 LLM_EFFORT_LABELS: dict[str, str] = {
+    "none":   "关闭 / none",
     "low":    "低 / low",
     "medium": "普通 / medium",
     "high":   "高 / high",
@@ -362,7 +363,7 @@ LLM_EFFORT_LABELS: dict[str, str] = {
 }
 # 访客可选档位（管理员不受限，可用全部 LLM_EFFORT_LABELS）。
 # 新增的极高/最高/超高为实验档，仅管理员可用（新档不稳定时只影响管理员自己）。
-LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"low", "medium", "high"}
+LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"none", "low", "medium", "high"}
 # 默认强度：未显式选择时用（如旧入口直接调 analyze 不带 effort 则传空=不附带字段）
 LLM_EFFORT_DEFAULT = "high"
 
@@ -375,43 +376,53 @@ LLM_EFFORT_DEFAULT = "high"
 # 同时开放给 heavy；light 仍严格隔离，防止重模型进入走地 1min 循环。
 # light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放最快的模型——
 # 放推理重档进去会让单次研判几十秒，拖住下一轮抓取。
-_EFFORT_CORE = ("low", "medium", "high")
-_EFFORT_EXTENDED = ("low", "medium", "high", "xhigh", "max", "ultra")
-_EFFORT_OPENAI_LIGHT = ("low", "medium", "high", "xhigh", "max")
+# 不同厂商的档位不是同义枚举，必须按模型声明分开维护。不要为了按钮整齐
+# 把不支持的值发给上游：有的网关会 400，有的会静默回落，后者更难排查。
+_EFFORT_OPENAI_ASTRA = ("low", "medium", "high", "xhigh", "max", "ultra")
+_EFFORT_OPENAI_SOL = ("none", "low", "medium", "high", "xhigh", "max",
+                      "ultra")
+_EFFORT_OPENAI_TERRA = ("none", "low", "medium", "high", "xhigh", "max")
+# Luna max 在当前 OpenAI 端点实测返回 400，但按管理员明确要求保留。
+_EFFORT_OPENAI_LUNA = ("none", "low", "medium", "high", "xhigh", "max")
+_EFFORT_GLM = ("low", "high", "max")
+_EFFORT_GROK_46 = ("low", "medium", "high", "xhigh")
+_EFFORT_GROK_45 = ("low", "medium", "high")
+_EFFORT_DEEPSEEK = ("none", "low", "high", "max")
+_EFFORT_GEMINI_38 = ("low", "medium", "high")
 
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
     # 既有五个模型保持原顺序，兼容部署前已发出的索引型旧面板按钮。
     "gpt-6-astra":      {"label": "GPT-6 Astra", "tiers": ("heavy",),
-                           "efforts": _EFFORT_EXTENDED},
+                           "efforts": _EFFORT_OPENAI_ASTRA},
     "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": ("heavy",),
-                           "efforts": _EFFORT_EXTENDED},
+                           "efforts": _EFFORT_OPENAI_SOL},
     "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_GLM},
     "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy",),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_GROK_46},
     "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_DEEPSEEK},
     "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy",),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_GEMINI_38},
     "deepseek-v4.1-flash": {
         "label": "DeepSeek V4.1 Flash", "tiers": ("heavy",),
-        "efforts": _EFFORT_CORE,
+        "efforts": _EFFORT_DEEPSEEK,
     },
     # ── 中型池：基本面预分析 + SEO/科普 + 教训提炼 ──
     "gpt-5.6-terra":    {"label": "GPT-5.6 Terra",
                            "tiers": ("heavy", "balanced"),
-                           "efforts": _EFFORT_EXTENDED},
+                           "efforts": _EFFORT_OPENAI_TERRA},
     "deepseek-v4-flash": {"label": "DeepSeek V4 Flash", "tiers": ("balanced",),
-                             "efforts": _EFFORT_CORE},
+                             "efforts": _EFFORT_DEEPSEEK},
     "glm-5.3-flash":    {"label": "GLM-5.3 Flash",
                            "tiers": ("heavy", "balanced"),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_GLM},
     "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
-                           "efforts": _EFFORT_CORE},
+                           "efforts": _EFFORT_GROK_45},
     # ── 轻型池：走地实时研判 ──
     "gpt-5.6-luna":     {"label": "GPT-5.6 Luna", "tiers": ("light",),
-                           "efforts": _EFFORT_OPENAI_LIGHT},
+                           "efforts": _EFFORT_OPENAI_LUNA},
 }
 
 
