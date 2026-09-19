@@ -384,7 +384,10 @@ _EFFORT_OPENAI_SOL = ("none", "low", "medium", "high", "xhigh", "max",
 _EFFORT_OPENAI_TERRA = ("none", "low", "medium", "high", "xhigh", "max")
 # Luna max 在当前 OpenAI 端点实测返回 400，但按管理员明确要求保留。
 _EFFORT_OPENAI_LUNA = ("none", "low", "medium", "high", "xhigh", "max")
-_EFFORT_GLM = ("low", "high", "max")
+# GLM-5.3 与 Flash 当前都接受 low/high/max，但分开声明：两者由不同服务实现时
+# 不再因为共用一个常量而被误同步修改。glm-5.3-flash 已在两条 ik_glm 端点实测。
+_EFFORT_GLM_53 = ("low", "high", "max")
+_EFFORT_GLM_53_FLASH = ("low", "high", "max")
 _EFFORT_GROK_46 = ("low", "medium", "high", "xhigh")
 _EFFORT_GROK_45 = ("low", "medium", "high")
 _EFFORT_DEEPSEEK = ("none", "low", "high", "max")
@@ -398,7 +401,7 @@ LLM_MODELS: dict[str, dict] = {
     "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": ("heavy",),
                            "efforts": _EFFORT_OPENAI_SOL},
     "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
-                           "efforts": _EFFORT_GLM},
+                           "efforts": _EFFORT_GLM_53},
     "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy",),
                            "efforts": _EFFORT_GROK_46},
     "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
@@ -417,7 +420,7 @@ LLM_MODELS: dict[str, dict] = {
                              "efforts": _EFFORT_DEEPSEEK},
     "glm-5.3-flash":    {"label": "GLM-5.3 Flash",
                            "tiers": ("heavy", "balanced"),
-                           "efforts": _EFFORT_GLM},
+                           "efforts": _EFFORT_GLM_53_FLASH},
     "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
                            "efforts": _EFFORT_GROK_45},
     # ── 轻型池：走地实时研判 ──

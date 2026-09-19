@@ -3226,7 +3226,12 @@ def _fmt_probe_line(r: dict) -> str:
         return f"⏭️ {label}：端点未声明支持，未发请求"
     if r["ok"]:
         model = f" · 应答 {r['model']}" if r.get("model") else ""
-        return f"✅ {label}：HTTP {r['http_status']} · {r['latency_ms']}ms{model}"
+        finish_reason = r.get("finish_reason", "")
+        finish = (" · finish=length（端点可用，但本次探针预算耗尽）"
+                  if finish_reason == "length" else
+                  (f" · finish={finish_reason}" if finish_reason else ""))
+        return (f"✅ {label}：HTTP {r['http_status']} · "
+                f"{r['latency_ms']}ms{model}{finish}")
     status = r["http_status"] if r["http_status"] is not None else "无响应"
     err = f" · {r['error']}" if r.get("error") else ""
     # HTTP 200 却失败 = 假通（无补全内容），用 ❗ 与「真断」的 ❌ 区分，更醒目

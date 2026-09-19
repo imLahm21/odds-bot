@@ -44,6 +44,7 @@ except ModuleNotFoundError:
     sys.modules["markdown"] = markdown_stub
 
 from bot import analyzer, config, db, llm_client, tgbot   # noqa: E402
+from scripts import probe_llm_efforts                       # noqa: E402
 
 
 PRIMARY = {
@@ -242,6 +243,8 @@ class TestModelProfile(unittest.TestCase):
                          ("none", "low", "medium", "high", "xhigh", "max"))
         self.assertEqual(config.llm_model_efforts("glm-5.3"),
                          ("low", "high", "max"))
+        self.assertEqual(config.llm_model_efforts("glm-5.3-flash"),
+                         ("low", "high", "max"))
         self.assertEqual(config.llm_model_efforts("grok-4.6"),
                          ("low", "medium", "high", "xhigh"))
         self.assertEqual(config.llm_model_efforts("deepseek-v4.1-flash"),
@@ -374,6 +377,17 @@ class TestModelProfile(unittest.TestCase):
             forced, "gemini-3.8-flash", "ik_gemini", 50, "xhigh",
             force_effort=True)
         self.assertEqual(forced["reasoning_effort"], "xhigh")
+
+    def test_effort_probe_distinguishes_rejection_from_budget_exhaustion(self):
+        self.assertEqual(probe_llm_efforts._probe_status({"ok": False}),
+                         "rejected")
+        self.assertEqual(probe_llm_efforts._probe_status({
+            "ok": True, "finish_reason": "length",
+        }), "accepted_budget_exhausted")
+        self.assertEqual(probe_llm_efforts._probe_status({
+            "ok": True, "finish_reason": "stop",
+            "usage": {"reasoning_tokens": 0},
+        }), "accepted")
 
     def test_grouped_endpoint_parser_separates_each_credential_family(self):
         raw = (
@@ -1109,8 +1123,19 @@ class TestModelProfile(unittest.TestCase):
             result = llm_client.probe_model(0, "gpt-5.6-luna")
         self.assertTrue(result["ok"])
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["max_completion_tokens"], 16)
+        self.assertEqual(payload["max_completion_tokens"], 256)
         self.assertNotIn("max_tokens", payload)
+
+    def test_probe_line_marks_length_as_budget_exhaustion_not_unavailable(self):
+        line = tgbot._fmt_probe_line({
+            "label": "IK-GLM", "which": "model",
+            "req_model": "glm-5.3-flash", "ok": True,
+            "http_status": 200, "latency_ms": 1234,
+            "model": "glm-5.3-flash", "finish_reason": "length",
+        })
+        self.assertIn("✅", line)
+        self.assertIn("端点可用", line)
+        self.assertIn("探针预算耗尽", line)
 
     def test_effort_probe_sends_level_and_reports_safe_usage(self):
         official = self._group_endpoint("OpenAI", "openai_gpt")

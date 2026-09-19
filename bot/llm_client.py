@@ -1378,15 +1378,16 @@ def _save_probe(idx: int, res: dict) -> dict:
 
 
 def probe(idx: int, which: str = "heavy", *, model: str = "",
-          effort: str = "", max_tokens: int = 16,
+          effort: str = "", max_tokens: int = 256,
           timeout_seconds: int | None = None, prompt: str = "ping",
           force_effort: bool = False) -> dict:
     """对指定端点发一个最小 chat 请求，测真实连通 + 延迟。
     which ∈ heavy/balanced/light：测哪档——按该档运行时选定模型 + 端点映射解析真实模型名
     （端点有映射时测映射模型，否则测该角色当前档位模型）。
     effort 非空时按模型能力表发送指定 reasoning_effort；返回安全的 usage 摘要，
-    可据 reasoning_tokens 区分“参数被接受”与“确有可观察推理用量”。默认 max_tokens=16
-    保持原有廉价连通探针；强度诊断可显式提高预算和超时。
+    可据 reasoning_tokens 区分“参数被接受”与“确有可观察推理用量”。默认 max_tokens=256：
+    16 对默认 max 思考的 GLM-5.3 Flash 会稳定 finish_reason=length，容易被误读为不可用；
+    256 仍是小请求，但足以让这类推理模型完成 ping。强度诊断可再显式提高预算和超时。
     纯诊断——不喂 Breaker，避免健康检查污染故障转移的错误率。
 
     ⚠️ 假通判定：不再「HTTP 200 就算通」。要求 200 且返回体解析出 choices（有正文或
@@ -1480,7 +1481,7 @@ def probe_all(which: str = "heavy") -> list[dict]:
 
 
 def probe_model(idx: int, model: str, *, effort: str = "",
-                max_tokens: int = 16, timeout_seconds: int | None = None,
+                max_tokens: int = 256, timeout_seconds: int | None = None,
                 prompt: str = "ping", force_effort: bool = False) -> dict:
     """对指定端点测试明确模型，用于新密钥组面板；不经过当前档位选择。"""
     return probe(idx, "model", model=model, effort=effort,

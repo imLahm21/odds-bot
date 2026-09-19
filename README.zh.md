@@ -158,14 +158,17 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
   | `gpt-5.6-sol` | `none` `low` `medium` `high` `xhigh` `max` `ultra`（`ultra` 为当前 IK 网关实测扩展） |
   | `gpt-5.6-terra` | `none` `low` `medium` `high` `xhigh` `max` |
   | `gpt-5.6-luna` | `none` `low` `medium` `high` `xhigh` `max`（`max` 按管理要求保留；当前官方端点实测返回 400） |
-  | `glm-5.3` / `glm-5.3-flash` | `low` `high` `max` |
+  | `glm-5.3` | `low` `high` `max` |
+  | `glm-5.3-flash` | `low` `high` `max`（两条 `ik_glm` 端点均已实测接受） |
   | `grok-4.6` | `low` `medium` `high` `xhigh` |
   | `grok-4.5` | `low` `medium` `high` |
   | DeepSeek V4 系列 | `none` `low` `high` `max` |
   | `gemini-3.8-flash` | `low` `medium` `high` |
 
   可运行 `python -m scripts.probe_llm_efforts --models <模型ID>` 逐档发送最小真实请求；
-  输出仅含端点标签、HTTP状态、延迟、响应模型及usage，不输出密钥或回答正文。
+  如需核对同组每条 key，追加 `--all-endpoints`。输出仅含端点标签、HTTP状态、延迟、
+  响应模型及 usage，不输出密钥或回答正文；`accepted_budget_exhausted` 表示参数已被接受、
+  只是探针输出预算不足，不应误判成模型/强度不可用。
 - **多端点故障转移**：同组内多条密钥自动轮转/切换；某模型所在组全部熔断/无密钥时，
   自动升级到该槽位设定的回退模型（可能落到另一个密钥组）。坏端点触发熔断后冷却自动
   恢复，熔断/恢复会 TG 告警管理员。

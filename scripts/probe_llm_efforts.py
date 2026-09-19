@@ -27,6 +27,15 @@ def _endpoint_indices(model: str) -> tuple[int, ...]:
                  if endpoint.get("route_group") in groups)
 
 
+def _probe_status(result: dict) -> str:
+    """区分参数拒绝与预算耗尽；reasoning_tokens=0 不能证明档位不可用。"""
+    if not result.get("ok"):
+        return "rejected"
+    if result.get("finish_reason") == "length":
+        return "accepted_budget_exhausted"
+    return "accepted"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Probe configured LLM reasoning-effort levels safely.")
@@ -34,13 +43,18 @@ def main() -> int:
         "--models", default=",".join(DEFAULT_MODELS),
         help="comma-separated model ids")
     parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-tokens", type=int, default=1024,
+        help="completion budget; 1024 avoids false negatives at max effort")
     parser.add_argument(
         "--efforts", default="",
         help="optional comma-separated subset; still filtered by model support")
     parser.add_argument(
         "--force-efforts", action="store_true",
         help="diagnostic only: send requested efforts even if not registered")
+    parser.add_argument(
+        "--all-endpoints", action="store_true",
+        help="test every endpoint in the model group instead of stopping after first success")
     args = parser.parse_args()
 
     prompt = (
@@ -63,8 +77,6 @@ def main() -> int:
         print(json.dumps({"model": model, "planned_efforts": efforts},
                          ensure_ascii=False), flush=True)
         for effort in efforts:
-            result = None
-            endpoint = None
             for idx in indices:
                 endpoint = llm_client.endpoints()[idx]
                 try:
@@ -78,27 +90,27 @@ def main() -> int:
                               "sent_effort": effort, "usage": None,
                               "finish_reason": "",
                               "error": f"探针异常：{exc!r}"}
-                if result.get("ok"):
+                usage = result.get("usage") or {}
+                safe = {
+                    "model": model,
+                    "effort": effort,
+                    "endpoint": endpoint.get("label", f"#{idx + 1}"),
+                    "group": endpoint.get("route_group", ""),
+                    "probe_status": _probe_status(result),
+                    "ok": result.get("ok", False),
+                    "http_status": result.get("http_status"),
+                    "latency_ms": result.get("latency_ms"),
+                    "response_model": result.get("model", ""),
+                    "sent_effort": result.get("sent_effort", ""),
+                    "finish_reason": result.get("finish_reason", ""),
+                    "input_tokens": usage.get("input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "reasoning_tokens": usage.get("reasoning_tokens"),
+                    "error": result.get("error", ""),
+                }
+                print(json.dumps(safe, ensure_ascii=False), flush=True)
+                if result.get("ok") and not args.all_endpoints:
                     break
-            assert result is not None and endpoint is not None
-            usage = result.get("usage") or {}
-            safe = {
-                "model": model,
-                "effort": effort,
-                "endpoint": endpoint.get("label", f"#{idx + 1}"),
-                "group": endpoint.get("route_group", ""),
-                "ok": result.get("ok", False),
-                "http_status": result.get("http_status"),
-                "latency_ms": result.get("latency_ms"),
-                "response_model": result.get("model", ""),
-                "sent_effort": result.get("sent_effort", ""),
-                "finish_reason": result.get("finish_reason", ""),
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "reasoning_tokens": usage.get("reasoning_tokens"),
-                "error": result.get("error", ""),
-            }
-            print(json.dumps(safe, ensure_ascii=False), flush=True)
     return 0
 
 
