@@ -28,7 +28,7 @@ AUTH_HEADER = "x-apisports-key"     # 直连鉴权头（非 RapidAPI）
 #   EXTRA_LEAGUES           —— 写入可选池但默认停用（enabled=0），TG bot 点开即用
 # 调度器只抓数据库里 enabled=1 的，所以加进 EXTRA 不会平白消耗额度。
 
-# 默认启用：五大联赛 + 五大杯赛 + 冰岛超/沙特联/中超 + 欧战 + 世界杯
+# 默认启用：五大联赛 + 五大杯赛 + 冰岛超/沙特联/中超 + 欧战 + 国家队大赛
 DEFAULT_ENABLED_LEAGUES: dict[int, tuple[str, int]] = {
     39:  ("英超 EPL",            2025),
     140: ("西甲 La Liga",        2025),
@@ -47,6 +47,8 @@ DEFAULT_ENABLED_LEAGUES: dict[int, tuple[str, int]] = {
     3:   ("欧联 Europa Lg",      2025),
     848: ("欧协联 Conference",   2025),
     5:   ("欧国联 Nations Lg",   2026),
+    # API 按目标正赛年份标记：2026-09 开始的预选赛属于 2027 届，不能填 2026。
+    36:  ("非洲杯预选赛 AFCON Qualifiers", 2027),
     1:   ("世界杯 World Cup",    2026),
 }
 
@@ -880,6 +882,8 @@ LEAGUE_SEARCH_ALIASES: dict[str, str] = {
     "日职": "Japan", "韩K联": "South-Korea", "美职联": "USA",
     "世界杯": "World Cup", "欧冠": "UEFA Champions",
     "欧联": "UEFA Europa", "欧国联": "UEFA Nations",
+    "非洲杯": "Africa Cup of Nations",
+    "非洲杯预选赛": "Africa Cup of Nations - Qualification",
 }
 
 # ─── league_id → 中文名：/status、/fixtures 等展示时给英文库名加中文注释 ────────
@@ -901,6 +905,7 @@ LEAGUE_ZH_NAMES: dict[int, str] = {
     81:  "德国杯", 137: "意大利杯", 66: "法国杯",
     # 跨国/国家队
     2:   "欧冠", 3: "欧联", 848: "欧协联", 1: "世界杯", 5: "欧国联",
+    6:   "非洲杯", 36: "非洲杯预选赛",
 }
 
 
