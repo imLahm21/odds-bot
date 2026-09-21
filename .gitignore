@@ -9,7 +9,6 @@ secrets.*
 # Claude Code 本地配置：settings.<名>.json 常含 ANTHROPIC_AUTH_TOKEN 等密钥，绝不上传
 .claude/settings.*.json
 .claude/settings.local.json
-.claude/worktrees/
 
 # 本地保留的详细版 README（提交版为精简版 README.md）
 README.full.md
@@ -31,6 +30,7 @@ daemon.log*
 *.db-wal
 *.db-shm
 *.bak
+*.db.bak*
 
 # ===== Python =====
 __pycache__/
