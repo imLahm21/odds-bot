@@ -2,12 +2,12 @@
 目录导出工具 —— 把 API-Football 支持的全部联赛/博彩公司导出成易读清单
 
 用法：
-  python dump_catalog.py            # 用已缓存的 probe_samples，离线生成
-  python dump_catalog.py --fetch    # 重新联网拉取最新目录再生成
+  python -m scripts.dump_catalog            # 用已缓存的 probe_samples，离线生成
+  python -m scripts.dump_catalog --fetch    # 重新联网拉取最新目录再生成
 
 产出：
-  catalog_leagues.txt      所有有当前赛季的联赛，按国家分组（含 id/season）
-  catalog_bookmakers.txt   所有博彩公司（含 id）
+  scripts/output/catalog_leagues.txt      所有有当前赛季的联赛，按国家分组（含 id/season）
+  scripts/output/catalog_bookmakers.txt   所有博彩公司（含 id）
 
 想新增联赛时，在 catalog_leagues.txt 里找到 id，填进 bot/config.py 的
 EXTRA_LEAGUES，或直接在 Telegram bot 用 /add <id> <season> 添加。
@@ -16,21 +16,30 @@ EXTRA_LEAGUES，或直接在 Telegram bot 用 /add <id> <season> 添加。
 import os
 import sys
 import json
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+SAMPLE_DIR = PROJECT_ROOT / "probe_samples"
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 BASE = "https://v3.football.api-sports.io"
-SAMPLE_DIR = "probe_samples"
 
 
 def _load(name: str, endpoint: str, fetch: bool):
     """优先读缓存；--fetch 或缓存缺失时联网。"""
-    path = os.path.join(SAMPLE_DIR, f"{name}.json")
-    if not fetch and os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
+    path = SAMPLE_DIR / f"{name}.json"
+    if not fetch and path.exists():
+        with path.open(encoding="utf-8") as f:
             return json.load(f)
     key = os.getenv("APIFOOTBALL_KEY", "").strip()
     if not key:
@@ -38,8 +47,8 @@ def _load(name: str, endpoint: str, fetch: bool):
     r = requests.get(f"{BASE}{endpoint}", headers={"x-apisports-key": key},
                      timeout=20)
     data = r.json()
-    os.makedirs(SAMPLE_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return data
 
@@ -73,9 +82,11 @@ def dump_leagues(fetch: bool) -> None:
             lines.append(f"  {lid:<6} {name}  [{typ}]  {season}")
         lines.append("")
 
-    with open("catalog_leagues.txt", "w", encoding="utf-8") as f:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / "catalog_leagues.txt"
+    with output_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print(f"✓ catalog_leagues.txt 已生成（{len(by_country)} 国 / "
+    print(f"✓ {output_path} 已生成（{len(by_country)} 国 / "
           f"{sum(len(v) for v in by_country.values())} 联赛）")
 
 
@@ -88,9 +99,11 @@ def dump_bookmakers(fetch: bool) -> None:
         name = b.get("name")
         if name:
             lines.append(f"  {b.get('id'):<6} {name}")
-    with open("catalog_bookmakers.txt", "w", encoding="utf-8") as f:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / "catalog_bookmakers.txt"
+    with output_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print(f"✓ catalog_bookmakers.txt 已生成（{len(resp)} 家）")
+    print(f"✓ {output_path} 已生成（{len(resp)} 家）")
 
 
 if __name__ == "__main__":

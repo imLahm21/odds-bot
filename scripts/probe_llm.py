@@ -2,10 +2,10 @@
 LLM 连通性探针 —— 实测分组端点的 chat/completions
 
 用法（推荐先在 .env 配好 LLM_ROUTE_ENDPOINTS）：
-  python probe_llm.py          # 发一个最小请求，确认通
-  python probe_llm.py effort    # 逐档测 reasoning_effort（重点验 xhigh 是否被网关接受）
-  python probe_llm.py full     # 用真实规则+一场比赛跑完整精算（耗 token）
-  python probe_llm.py pool      # 端点池：解析 .env 端点、逐条探针、打印熔断态与 10 参数
+  python -m scripts.probe_llm          # 发一个最小请求，确认通
+  python -m scripts.probe_llm effort   # 逐档测 reasoning_effort（重点验 xhigh 是否被网关接受）
+  python -m scripts.probe_llm full     # 用真实规则+一场比赛跑完整精算（耗 token）
+  python -m scripts.probe_llm pool     # 端点池：解析 .env 端点、逐条探针、打印熔断态与 10 参数
 
 先跑无参数版确认连通和返回结构，再决定要不要 effort / full / pool。
 """
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     elif arg == "effort":
         probe_effort()
     elif arg == "pool":
-        # python probe_llm.py pool [heavy|balanced|light]，默认 heavy
+        # python -m scripts.probe_llm pool [heavy|balanced|light]，默认 heavy
         w = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] in (
             "heavy", "balanced", "light") else "heavy"
         probe_pool(w)

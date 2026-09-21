@@ -7,8 +7,8 @@
   3. 滚球盘里有没有大小球(bet id=5)与亚盘(bet id=4)，value 文本格式
 
 用法：
-  python probe_live.py            # 探 /odds/live（全量进行中比赛）+ /odds/live/bets（可用盘口字典）
-  python probe_live.py bets       # 只看滚球支持哪些 bet 类型
+  python -m scripts.probe_live            # 探 /odds/live（全量进行中比赛）+ /odds/live/bets（可用盘口字典）
+  python -m scripts.probe_live bets       # 只看滚球支持哪些 bet 类型
 
 样例 JSON 存到 probe_samples/ 供离线参考（该目录已被 .gitignore 排除）。
 """
@@ -17,11 +17,18 @@ import os
 import sys
 import json
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 
 API_KEY = os.getenv("APIFOOTBALL_KEY", "").strip()
 if not API_KEY:
@@ -30,13 +37,13 @@ if not API_KEY:
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 TZ_CST = timezone(timedelta(hours=8))
-SAMPLE_DIR = "probe_samples"
+SAMPLE_DIR = PROJECT_ROOT / "probe_samples"
 
 
 def save_sample(name: str, data) -> None:
-    os.makedirs(SAMPLE_DIR, exist_ok=True)
-    path = os.path.join(SAMPLE_DIR, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as f:
+    SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLE_DIR / f"{name}.json"
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"    → 原始 JSON 已保存：{path}")
 

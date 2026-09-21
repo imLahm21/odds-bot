@@ -157,7 +157,7 @@ python -m bot.daemon
 ## Managing leagues
 
 Edit `WATCH_LEAGUES` in `bot/config.py` (key=league_id, value=(name, season)).
-Run `python probe.py leagues` to look up a new league's ID.
+Run `python -m scripts.probe leagues` to look up a new league's ID.
 
 ## Querying data
 

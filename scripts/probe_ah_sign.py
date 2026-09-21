@@ -1,5 +1,7 @@
 """一次性探针：验证 API-Football 亚盘 value 的符号约定（主热 / 客热两种情况）。
 
+运行：python -m scripts.probe_ah_sign
+
 判据（不依赖任何既有假设）：
   用同场欧赔算去抽水的主胜概率 p_home，再对每条亚盘线算「主侧去抽水概率」
   p_side = (1/主水)/((1/主水)+(1/客水))。
@@ -7,15 +9,22 @@
     主队强（p_home 高） → 平衡线应在「主队让出」那一侧
     主队弱（p_home 低） → 平衡线应在「主队受让」那一侧
 """
-import os, sys, json, time
+import os
+import sys
+import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 KEY = os.getenv("APIFOOTBALL_KEY", "").strip()
-if not KEY:
-    sys.exit("no APIFOOTBALL_KEY")
 BASE = "https://v3.football.api-sports.io"
 H = {"x-apisports-key": KEY}
 
@@ -81,33 +90,41 @@ def analyze(fx_id, label):
     return None
 
 
-now = datetime.now(timezone.utc)
-res = []
-for d in range(0, 4):
-    day = (now + timedelta(days=d)).strftime("%Y-%m-%d")
-    fx = get("fixtures", date=day, timezone="UTC")
-    cands = [f for f in fx.get("response", [])
-             if f["fixture"]["status"]["short"] == "NS"]
-    for f in cands[:40]:
+def main() -> None:
+    if not KEY:
+        raise SystemExit("no APIFOOTBALL_KEY")
+    now = datetime.now(timezone.utc)
+    res = []
+    for d in range(0, 4):
+        day = (now + timedelta(days=d)).strftime("%Y-%m-%d")
+        fx = get("fixtures", date=day, timezone="UTC")
+        cands = [f for f in fx.get("response", [])
+                 if f["fixture"]["status"]["short"] == "NS"]
+        for fixture in cands[:40]:
+            if len(res) >= 6:
+                break
+            fid = fixture["fixture"]["id"]
+            nm = (f"{fixture['teams']['home']['name']} vs "
+                  f"{fixture['teams']['away']['name']}")
+            got = analyze(fid, nm)
+            if got:
+                res.append((nm, *got))
+            time.sleep(0.4)
         if len(res) >= 6:
             break
-        fid = f["fixture"]["id"]
-        nm = f"{f['teams']['home']['name']} vs {f['teams']['away']['name']}"
-        got = analyze(fid, nm)
-        if got:
-            res.append((nm, *got))
-        time.sleep(0.4)
-    if len(res) >= 6:
-        break
 
-print("\n\n########## 汇总 ##########")
-print(f"{'比赛':46s} {'主胜%':>7s} {'平衡线raw':>10s}")
-for nm, ph, avg in res:
-    print(f"{nm[:44]:46s} {ph:6.1%} {avg:+10.2f}")
-print("""
+    print("\n\n########## 汇总 ##########")
+    print(f"{'比赛':46s} {'主胜%':>7s} {'平衡线raw':>10s}")
+    for nm, ph, avg in res:
+        print(f"{nm[:44]:46s} {ph:6.1%} {avg:+10.2f}")
+    print("""
 判读：
   若「主胜% 高（主强）」对应「平衡线 raw 为负」→ API: 负=主队让出，正=主队受让
      则内部 handicap 应 = raw（不取反，因 CLAUDE.md 也是 负=让出）
   若「主胜% 高（主强）」对应「平衡线 raw 为正」→ API: 正=主队让出
      则内部 handicap 应 = -raw（取反，即现有代码）
 """)
+
+
+if __name__ == "__main__":
+    main()

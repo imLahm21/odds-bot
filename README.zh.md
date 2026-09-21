@@ -51,7 +51,7 @@ bot/
 ├── lesson_archive.py# 赛后复盘 → 实战教训归档（确定性落盘，不碰 LLM）
 ├── tgbot.py         # Telegram bot 命令与内联面板
 └── daemon.py        # 入口：初始化→拉赛程→启动调度器(+bot)
-probe.py             # 阶段0 探针：实测 API 真实 JSON（开发用，部署不需要）
+scripts/             # 本地维护、校准和 API/LLM 探针工具；清单见 scripts/README.md
 ```
 ### 数据库表
 
@@ -392,12 +392,12 @@ journalctl -u odds-bot -f      # 看日志
 
 ### 改 .env 自动重启（白名单保存即生效）
 
-改 `.env`（尤其是 TG 白名单）后必须重启 bot 才生效。用 `setup_env_watch.sh` 让 systemd
+改 `.env`（尤其是 TG 白名单）后必须重启 bot 才生效。用 `scripts/setup_env_watch.sh` 让 systemd
 监听 `.env`，保存即自动重启：
 
 ```bash
-bash setup_env_watch.sh          # 安装并自检
-bash setup_env_watch.sh --remove # 卸载
+bash scripts/setup_env_watch.sh          # 安装并自检
+bash scripts/setup_env_watch.sh --remove # 卸载
 ```
 
 原理：一个 systemd `path` 单元盯住 `.env`，文件一变就触发一次性 service 去 `restart odds-bot`。
@@ -409,7 +409,7 @@ bash setup_env_watch.sh --remove # 卸载
 
 只改 `bot/config.py` 的 `DEFAULT_ENABLED_LEAGUES` / `EXTRA_LEAGUES`（key=league_id，value=(中文名, season)）：
 `DEFAULT_ENABLED_LEAGUES` 开机即抓，`EXTRA_LEAGUES` 写入可选池但默认停用、TG bot `/leagues` 点开即用。
-运行中也可直接用 `/add <关键词>｜<id> <season>` 增加。需要新联赛的 ID 时，跑 `python probe.py leagues` 实测查出。
+运行中也可直接用 `/add <关键词>｜<id> <season>` 增加。需要新联赛的 ID 时，跑 `python -m scripts.probe leagues` 实测查出。
 
 ## 查数据
 

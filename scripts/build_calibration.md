@@ -1,11 +1,11 @@
-# build_calibration.py 使用说明
+# scripts/build_calibration.py 使用说明
 
 ## 这脚本是什么
 
 从本地 `竞彩.xlsx` 的下注战绩，重算一张「**自评置信度 → 历史方向命中率**」的校准表，
 外加一张「玩法分类表现」表。若表内存在「公允赔率」列，还会额外生成
 「事前 edge → 实际胜率/ROI」校准表。输出可直接用于
-[reference_staking_kelly.md](rules/风控验证/reference_staking_kelly.md) 第二部分观测层。
+[reference_staking_kelly.md](../rules/风控验证/reference_staking_kelly.md) 第二部分观测层。
 
 它的作用：把你主观打的「置信度分」翻译成**历史方向命中率/ROI**，
 作为 p_校准 与权重 `w` 的**慢变弱先验**，而不是下注硬闸门。若记录了公允赔率，
@@ -19,16 +19,16 @@
 
 ```bash
 # 默认：统计用户选定的 3 个 sheet
-python build_calibration.py
+python -m scripts.build_calibration
 
 # 只取最近 3 个月（按 A 列日期滚动窗口）
-python build_calibration.py --months 3
+python -m scripts.build_calibration --months 3
 
 # 指定 sheet
-python build_calibration.py --sheets 世界杯 20260701-20260731 20260801-20260831
+python -m scripts.build_calibration --sheets 世界杯 20260701-20260731 20260801-20260831
 
 # 指定表格路径 / 另存结果到文件
-python build_calibration.py --xlsx 竞彩.xlsx --out calibration_out.md
+python -m scripts.build_calibration --xlsx 竞彩.xlsx --out scripts/output/calibration_out.md
 ```
 
 默认统计的 3 个 sheet（按本期指定口径）：

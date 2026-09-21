@@ -8,10 +8,10 @@
   4. odds 的 JSON 结构 + bookmaker ID + bet ID + 亚盘/欧赔字段 (/odds)
 
 用法：
-  python probe.py            # 全部探测
-  python probe.py status     # 只看额度
-  python probe.py leagues    # 只看联赛 ID
-  python probe.py odds       # 只看赔率结构
+  python -m scripts.probe            # 全部探测
+  python -m scripts.probe status     # 只看额度
+  python -m scripts.probe leagues    # 只看联赛 ID
+  python -m scripts.probe odds       # 只看赔率结构
 
 所有原始 JSON 样例会保存到 probe_samples/ 供离线开发参考（该目录已被 .gitignore 排除）。
 """
@@ -21,11 +21,18 @@ import sys
 import json
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 
 API_KEY = os.getenv("APIFOOTBALL_KEY", "").strip()
 if not API_KEY:
@@ -57,13 +64,13 @@ WATCH_LEAGUES = {
     "冰岛超": "Úrvalsdeild",          # 冰岛顶级，英文常写 Besta deild / Premier League
 }
 
-SAMPLE_DIR = "probe_samples"
+SAMPLE_DIR = PROJECT_ROOT / "probe_samples"
 
 
 def save_sample(name: str, data) -> None:
-    os.makedirs(SAMPLE_DIR, exist_ok=True)
-    path = os.path.join(SAMPLE_DIR, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as f:
+    SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+    path = SAMPLE_DIR / f"{name}.json"
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"    → 原始 JSON 已保存：{path}")
 
@@ -237,7 +244,7 @@ def main():
         time.sleep(1)
 
     # fixtures + odds 需要先有 league_id
-    # 支持命令行指定：python probe.py odds <league_id> <season>
+    # 支持命令行指定：python -m scripts.probe odds <league_id> <season>
     if arg in ("all", "fixtures", "odds"):
         if len(sys.argv) >= 4:
             league_id = int(sys.argv[2])

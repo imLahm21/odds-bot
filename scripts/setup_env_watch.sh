@@ -6,8 +6,8 @@
 # 原理：一个 systemd path 单元盯住 .env，文件一变就触发一次性 service 去 restart odds-bot。
 #
 # 用法（在服务器上）：
-#   bash setup_env_watch.sh           # 安装并启用
-#   bash setup_env_watch.sh --remove  # 卸载
+#   bash scripts/setup_env_watch.sh           # 安装并启用
+#   bash scripts/setup_env_watch.sh --remove  # 卸载
 #
 # 前提：odds-bot.service 已存在并能用（见 README「备选：systemd」）。
 
@@ -15,7 +15,8 @@ set -euo pipefail
 
 # .env 绝对路径（默认按本脚本所在目录推断；如目录不同可在此覆盖）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env}"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 
 TARGET_SERVICE="odds-bot.service"
 PATH_UNIT="/etc/systemd/system/odds-bot-env.path"
@@ -34,7 +35,7 @@ remove() {
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "错误：找不到 .env：$ENV_FILE" >&2
-    echo "请在项目根目录运行本脚本，或用 ENV_FILE=/abs/path/.env bash setup_env_watch.sh 指定。" >&2
+    echo "请在项目根目录运行本脚本，或用 ENV_FILE=/abs/path/.env bash scripts/setup_env_watch.sh 指定。" >&2
     exit 1
 fi
 
@@ -92,4 +93,4 @@ echo
 echo "备用命令："
 echo "  反复存盘被限流报 start-limit：  sudo systemctl reset-failed odds-bot"
 echo "  临时关闭监听：                  sudo systemctl disable --now odds-bot-env.path"
-echo "  彻底卸载：                      bash setup_env_watch.sh --remove"
+echo "  彻底卸载：                      bash scripts/setup_env_watch.sh --remove"

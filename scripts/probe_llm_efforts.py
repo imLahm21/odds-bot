@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 from bot import config, llm_client
 

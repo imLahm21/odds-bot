@@ -1,7 +1,7 @@
 """
 配置中心 —— 联赛清单、关注庄家、轮询间隔、节点定义
 
-所有 ID 均由阶段 0 探针（probe.py）实测确认，非猜测。
+所有 ID 均由阶段 0 探针（scripts/probe.py）实测确认，非猜测。
 增删联赛只改这里，无需动其它代码（配置驱动）。
 """
 
@@ -140,7 +140,7 @@ BET_TOTAL_HOME = 16      # 主队大小球（主队进球总数），value: "Ove
 BET_TOTAL_AWAY = 17      # 客队大小球（客队进球总数），value: "Over 2.5" / "Under 2.5"
 
 # ─── 走地(滚球/in-play) bet 类型 ID ─────────────────────────────────────────
-# ⚠️ /odds/live 的 bet id 体系与盘前 /odds 完全不同（已用 probe_live.py 实测）。
+# ⚠️ /odds/live 的 bet id 体系与盘前 /odds 完全不同（已用 scripts/probe_live.py 实测）。
 # 走地结构：盘口线在独立 handicap 字段，value 仅 Over/Under/Home/Away；
 # 亚盘/大小球每盘带 main:true 标主盘口线；欧赔(59)无 main、直接取三条 value。
 BET_LIVE_1X2 = 59             # 走地欧赔 Fulltime Result（无 main，三条 value 直取）

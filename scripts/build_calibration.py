@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_calibration.py —— 从战绩表重算「置信度 → 真实胜率」校准表
+scripts/build_calibration.py —— 从战绩表重算「置信度 → 真实胜率」校准表
 
 用途：
     读本地 竞彩.xlsx 的下注战绩，按「置信度分桶」和「玩法分类」统计真实胜率/ROI；
@@ -10,15 +10,15 @@ build_calibration.py —— 从战绩表重算「置信度 → 真实胜率」�
 
     这是【低频重跑】产物：每新增约 30 笔或每周一次即可，不需要每天跑。
     每日「这场买什么/买多少」靠 LLM 实时算的 p_市场，不依赖本脚本。
-    使用说明见 build_calibration.md。
+    使用说明见 scripts/build_calibration.md。
 
 只依赖本地 竞彩.xlsx + openpyxl，不碰服务器/赔率库，只读不写表格。
 
 用法：
-    python build_calibration.py                     # 默认 3 个 sheet
-    python build_calibration.py --months 3          # 只取最近 3 个月（按日期滚动窗口）
-    python build_calibration.py --sheets 世界杯 20260701-20260731 20260801-20260831
-    python build_calibration.py --xlsx 竞彩.xlsx     # 指定表格路径
+    python -m scripts.build_calibration                     # 默认 3 个 sheet
+    python -m scripts.build_calibration --months 3          # 只取最近 3 个月（按日期滚动窗口）
+    python -m scripts.build_calibration --sheets 世界杯 20260701-20260731 20260801-20260831
+    python -m scripts.build_calibration --xlsx 竞彩.xlsx     # 指定表格路径
 """
 
 import argparse
@@ -27,6 +27,12 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 try:
     import openpyxl
@@ -50,6 +56,7 @@ PLAY_CATS = ["让球", "大小球", "双进", "胜平负/其他", "波胆", "串
 
 # 支持以后给每注补记公允赔率；当前表没有该列时自动跳过事前 edge 表。
 FAIR_ODDS_HEADERS = ("公允赔率", "我认为的公允赔率", "我的公允赔率", "公平赔率")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 SCORE_RE = re.compile(r"\d+\s*[:：]\s*\d+")
 RESULT_SUFFIX_RE = re.compile(
@@ -326,7 +333,8 @@ def build_markdown(rows):
 def main():
     ap = argparse.ArgumentParser(
         description="从 竞彩.xlsx 重算置信度→真实胜率校准表（低频重跑，非每天）")
-    ap.add_argument("--xlsx", default="竞彩.xlsx", help="战绩表路径（默认 竞彩.xlsx）")
+    ap.add_argument("--xlsx", default=str(PROJECT_ROOT / "竞彩.xlsx"),
+                    help="战绩表路径（默认项目根目录的 竞彩.xlsx）")
     ap.add_argument("--sheets", nargs="+", default=None,
                     help="指定统计的 sheet 名（默认用户选定的 3 个）")
     ap.add_argument("--months", type=float, default=None,
