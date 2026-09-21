@@ -60,7 +60,53 @@ def _json_instruction(module_id: str, role: str,
     ) % (role, module_id, focus)
 
 
+def _review_module_input(task: dict, bundle: dict) -> str:
+    return (
+        f"## 比赛：{bundle.get('home','')} vs {bundle.get('away','')}\n"
+        f"## 联赛：{bundle.get('league','')}\n\n"
+        f"### 全程盘口CSV\n{bundle.get('csv_text','')}\n\n"
+        f"### 第一阶段盲推预判\n{bundle.get('forecast','')}\n\n"
+        f"### 基本面（盲推时不可见，仅供事后归因）\n"
+        f"{bundle.get('fundamentals','')}\n\n"
+        f"### 进球状态\n{bundle.get('goals_block','')}\n\n"
+        f"### 实际结果（现在才揭晓）\n{bundle.get('result_text','')}\n"
+    )
+
+
+def _review_module_system(task: dict, bundle: dict) -> str:
+    module_id = task["id"]
+    if module_id in ("fundamentals", "fundamentals_review"):
+        rules = analyzer.load_fund_rules(
+            league_name=bundle.get("league", ""),
+            has_h2h=any(k in bundle.get("fundamentals", "")
+                        for k in ("交锋", "H2H", "h2h")),
+            has_form=any(k in bundle.get("fundamentals", "")
+                         for k in ("近10场", "近 10 场", "近况", "战绩")),
+        )
+    elif module_id in ("market_primary", "market_challenge"):
+        rules = _read_rules("market")
+    elif module_id == "risk_review":
+        rules = _read_rules("risk")
+    elif module_id in ("numeric_summary", "cross_market"):
+        rules = _read_rules("goals")
+    elif module_id == "lesson_match":
+        rules = _read_rules("lesson")
+    else:
+        rules = "审计盲推输入、实际结果和数据缺失，不得重写赛前事实。"
+    task_rule = (
+        "\n\n===== 全模型对照复盘模块 =====\n"
+        "这是已结束比赛的第二阶段复盘。第一阶段盲推当时不知道比分和基本面；"
+        "现在才揭晓结果。必须以盲推原文为基准判断哪里对、哪里错，禁止利用结果"
+        "倒推并改写盲推。A层模块分析盘口信号有效性；B层只分析盲推未见的基本面"
+        "是否能解释偏差；C层复核结算、概率与风险；D层只提炼教训。\n"
+    )
+    return rules + task_rule + _json_instruction(
+        module_id, task["label"], bundle.get("extra_instruction", ""))
+
+
 def _module_input(task: dict, bundle: dict) -> str:
+    if bundle.get("review_mode"):
+        return _review_module_input(task, bundle)
     csv_text = bundle.get("csv_text", "")
     fundamentals = bundle.get("fundamentals", "")
     goals = bundle.get("goals_block", "")
@@ -86,6 +132,8 @@ def _module_input(task: dict, bundle: dict) -> str:
 
 
 def _module_system(task: dict, bundle: dict) -> str:
+    if bundle.get("review_mode"):
+        return _review_module_system(task, bundle)
     module_id = task["id"]
     role = task["label"]
     if module_id in ("fundamentals", "fundamentals_review"):
@@ -365,5 +413,177 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         if repaired and not repaired.startswith(_ERR_PREFIXES):
             report = repaired.strip()
             audit = _audit_report(bundle, report, cards)
+    report += "\n\n" + _render_appendix(results, audit)
+    return report, {"results": results, "audit": audit}
+
+
+def _basic_review_issues(report: str) -> list[str]:
+    issues = []
+    for number in range(1, 7):
+        if not re.search(rf"(?m)^###\s*{number}\s*[.、]", report or ""):
+            issues.append(f"缺少复盘 ### {number} 主段")
+    if len(report or "") < 400:
+        issues.append("复盘正文过短")
+    return issues
+
+
+def _review_audit(bundle: dict, report: str, cards: list[dict]) -> dict:
+    deterministic = _basic_review_issues(report)
+    system = (
+        "你是全模型赛后复盘审计员。只输出合法JSON，不要Markdown。"
+        "检查六段复盘是否完整，是否严格区分盲推阶段与赛果揭晓阶段，"
+        "是否出现拿结果倒推或改写盲推，结算是否正确，教训是否来自本场证据。"
+        '{"ok":true,"issues":[{"section":"4","problem":"...",'
+        '"required_fix":"..."}]}'
+    )
+    audit_user = (
+        _audit_input(bundle, report, cards)
+        + "\n### 第一阶段盲推原文\n" + bundle.get("forecast", "")
+        + "\n### 实际结果\n" + bundle.get("result_text", "")
+    )
+    raw = llm_client.chat_model(
+        system,
+        audit_user,
+        model=config.FULL_CONSULT_AUDIT["model"],
+        effort=config.FULL_CONSULT_AUDIT["effort"],
+        timeout=config.FULL_CONSULT_TIMEOUT,
+        max_tokens=config.FULL_CONSULT_AUDIT["max_tokens"],
+    )
+    parsed, error = _parse_json(raw)
+    if parsed is None:
+        return {"ok": False, "issues": deterministic + [error]}
+    issues = deterministic + list(parsed.get("issues") or [])
+    return {"ok": not issues and bool(parsed.get("ok", True)), "issues": issues}
+
+
+def _review_synthesis_prompt(bundle: dict,
+                             cards: list[dict]) -> tuple[str, str, dict]:
+    metrics: dict[str, int] = {}
+    system, user = analyzer._review_prompts(
+        bundle["csv_text"], bundle["forecast"], bundle["result_text"],
+        bundle["home"], bundle["away"], bundle["league"],
+        bundle.get("fundamentals", ""), metrics,
+    )
+    focus = bundle.get("extra_instruction", "").strip()
+    if focus:
+        system += (
+            "\n\n===== 用户复盘侧重 =====\n"
+            "在不改变盲推事实、不泄漏赛果到第一阶段的前提下，重点回应：\n"
+            + focus
+        )
+    user += (
+        "\n### 全模型复盘专家卡片\n"
+        + json.dumps(cards, ensure_ascii=False, indent=2)
+        + "\n\n===== 会诊合并要求 =====\n"
+        "专家卡片是分模块证据，不按多数投票。必须以第一阶段盲推原文为"
+        "事前基准，严格输出现有复盘格式的 ### 1 到 ### 6。\n"
+    )
+    return system, user, metrics
+
+
+def _review_synthesize(bundle: dict, cards: list[dict], cancel=None,
+                       progress: Callable[[str], None] | None = None) -> str:
+    system, user, metrics = _review_synthesis_prompt(bundle, cards)
+    accumulated = ""
+    for event in llm_client.stream_chat_model(
+            system, user,
+            model=config.FULL_CONSULT_SYNTHESIS["model"],
+            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
+            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+            fallback_models=("gpt-5.6-sol",),
+            input_metrics=metrics):
+        if cancel is not None and cancel.is_set():
+            return ""
+        kind, payload = event[0], event[1]
+        if kind == "delta":
+            accumulated = payload
+            if progress:
+                progress("review_synthesis")
+        elif kind == "done":
+            accumulated = payload
+        elif kind == "warning" and progress:
+            progress("warning:" + payload)
+        elif kind == "error":
+            log.warning("全模型复盘最终合并失败：%s", payload)
+            return ""
+    return accumulated.strip()
+
+
+def run_review(csv_text: str, forecast: str, result_text: str,
+               fundamentals: str, home: str, away: str, league: str,
+               goals_block: str = "", extra_instruction: str = "",
+               cancel=None,
+               progress: Callable[[str, dict | None], None] | None = None
+               ) -> tuple[str, dict]:
+    """执行第二阶段全模型对照复盘，返回 (六段报告, 执行摘要)。"""
+    bundle = {
+        "review_mode": True,
+        "csv_text": csv_text or "",
+        "forecast": forecast or "",
+        "result_text": result_text or "",
+        "fundamentals": fundamentals or "",
+        "home": home or "",
+        "away": away or "",
+        "league": league or "",
+        "goals_block": goals_block or "",
+        "extra_instruction": extra_instruction or "",
+    }
+    results: list[dict] = []
+    executor = ThreadPoolExecutor(
+        max_workers=config.FULL_CONSULT_MAX_WORKERS,
+        thread_name_prefix="full-review")
+    futures = [executor.submit(_run_one, task, bundle)
+               for task in config.FULL_CONSULT_TASKS]
+    try:
+        for future in as_completed(futures):
+            if cancel is not None and cancel.is_set():
+                break
+            result = future.result()
+            results.append(result)
+            if progress:
+                progress("review_module", result)
+    finally:
+        if cancel is not None and cancel.is_set():
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": results}
+
+    order = {task["id"]: i for i, task in enumerate(config.FULL_CONSULT_TASKS)}
+    results.sort(key=lambda item: order.get(item.get("id"), 999))
+    cards = [
+        {
+            "id": item["id"], "label": item["label"], "model": item["model"],
+            "effort": item["effort"], "status": item["status"],
+            "card": item.get("card"), "error": item.get("error"),
+        }
+        for item in results
+    ]
+    report = _review_synthesize(
+        bundle, cards, cancel=cancel,
+        progress=(lambda kind: progress(kind, None) if progress else None),
+    )
+    if not report:
+        return "", {"results": results, "error": "Astra复盘合并失败"}
+
+    audit = _review_audit(bundle, report, cards)
+    if not audit["ok"] and not (cancel is not None and cancel.is_set()):
+        repair_system = (
+            "你是复盘报告修复器。只修复审计指出的问题，保留第一阶段盲推原文"
+            "与赛果揭晓边界，输出完整的 ### 1 到 ### 6，不解释修复过程。"
+        )
+        repaired = llm_client.chat_model(
+            repair_system,
+            "### 原复盘\n" + report + "\n### 审计问题\n"
+            + json.dumps(audit["issues"], ensure_ascii=False),
+            model=config.FULL_CONSULT_SYNTHESIS["model"],
+            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
+            timeout=config.FULL_CONSULT_TIMEOUT,
+            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+        )
+        if repaired and not repaired.startswith(_ERR_PREFIXES):
+            report = repaired.strip()
+            audit = _review_audit(bundle, report, cards)
     report += "\n\n" + _render_appendix(results, audit)
     return report, {"results": results, "audit": audit}

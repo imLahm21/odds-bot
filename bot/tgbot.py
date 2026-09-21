@@ -219,6 +219,9 @@ _pending_custom: dict[int, tuple[int, str]] = {}
 # 与旧版 _pending_custom 分开，避免改变旧版 effort→文本流程。
 _pending_multi_custom: dict[int, int] = {}
 
+# 全模型复盘的自定义侧重等待态：chat_id -> fixture_id。
+_pending_multi_review_custom: dict[int, int] = {}
+
 # 等待管理员回复「LLM 参数新值」的会话状态：chat_id -> 参数 key（LLM_SETTING_SPECS 键）。
 # 点 /llm 面板某参数按钮(ls:<key>)后置位，下一条纯数字文本被当作新值消费、校验范围后写库。
 _pending_llm_set: dict[int, str] = {}
@@ -2766,8 +2769,7 @@ def _run_parlay(chat_id: int, fids: list[int], effort: str = "",
 
 
 def _cmd_review(chat_id: int, args: list[str]) -> None:
-    """复盘第一步：校验 + 弹模式选择键盘（只盲推/只对照/两步全跑）。
-    选完模式再弹强度键盘（ae:r<mode>:<fid>:<effort>），选完强度才开跑（见 _run_review）。"""
+    """复盘入口：旧版三种模式继续选 effort；管理员另有全模型复盘。"""
     if not args or not args[0].isdigit():
         send(chat_id, "用法：/review &lt;fixture_id&gt;（对已结束的比赛复盘）")
         return
@@ -2785,11 +2787,17 @@ def _cmd_review(chat_id: int, args: list[str]) -> None:
         {"text": "🎬 只对照", "callback_data": f"rm:c:{fid}"},
         {"text": "🔁 两步全跑", "callback_data": f"rm:a:{fid}"},
     ]]}
+    if _is_admin(chat_id):
+        kb["inline_keyboard"].append([
+            {"text": "🧪 全模型交叉复盘", "callback_data": f"rmx:{fid}"},
+        ])
     send(chat_id, "🔬 复盘方式：\n"
                   "🔮 只盲推 = 只凭盘口正向跑 SOP 出预判（不看比分，归档备用）；\n"
                   "🎬 只对照 = 读已归档的盲推预判 + 揭晓比分做归因（需先跑过盲推）；\n"
                   "🔁 两步全跑 = 盲推 + 对照连跑（默认）。\n"
-                  "选完再选推理强度。", kb)
+                  "🧪 全模型交叉复盘 = 全模型盲推后再揭晓比分，由各模型分模块归因"
+                  "（管理员功能，自动分配强度）。\n"
+                  "旧版三种模式选完后再选推理强度；全模型模式自动分配。", kb)
 
 
 def _run_review(chat_id: int, fid: int, effort: str = "",
@@ -2994,6 +3002,143 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
                  {"text": "📚 归档为实战教训", "callback_data": f"ls:{token}:go"},
                  {"text": "跳过", "callback_data": f"ls:{token}:no"},
              ]]})
+
+
+def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
+                      task_id: str = "",
+                      cancel: "threading.Event | None" = None) -> None:
+    """管理员专用全模型复盘：全模型盲推后才把赛果交给全模型对照阶段。"""
+    if not _is_admin(chat_id):
+        send(chat_id, "⛔ 全模型交叉复盘暂仅管理员可用。")
+        return
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法复盘。")
+        return
+    csv_str, meta = _build_csv(fid)
+    if not csv_str:
+        send(chat_id, f"fixture {fid} 暂无盘口数据，无法复盘")
+        return
+
+    entry = api_client.fetch_fixture_result(fid)
+    if not entry:
+        send(chat_id, f"无法拉取 fixture {fid} 的结果（API 无返回）")
+        return
+    result_text, short = _fmt_result(entry)
+    if result_text is None or short not in {"FT", "AET", "PEN"}:
+        send(chat_id, f"⚠️ fixture {fid} 尚未结束（状态：{short or '未知'}），"
+                      "无法复盘。请在比赛结束后再试。")
+        return
+
+    from . import fundamentals, goals_model
+    states = goals_model.states_from_csv(csv_str)
+    goals_block = goals_model.format_states_block(states)
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止全模型复盘", "callback_data": f"stopan:{task_id}"}]]}
+    title = f"⏳ 全模型交叉复盘：{meta['home']} vs {meta['away']}"
+    phase = {"name": "第一阶段·全模型盲推", "done": 0}
+
+    def progress_text() -> str:
+        return (
+            f"{title}\n\n"
+            f"🔄 {phase['name']}\n"
+            f"已完成专家模块：{phase['done']}/{len(config.FULL_CONSULT_TASKS)}\n"
+            "赛果只会在第二阶段揭晓。"
+        )
+
+    msg_id = send(chat_id, progress_text(), stop_kb)
+    _llm_audit(chat_id, "full-review", "heavy", fid=fid)
+
+    def on_blind_progress(kind: str, result: dict | None) -> None:
+        if kind == "module" and result:
+            phase["done"] += 1
+        elif kind == "synthesis":
+            phase["name"] = "第一阶段·Astra合并盲推"
+        if msg_id:
+            edit_text(chat_id, msg_id, progress_text(), stop_kb)
+
+    blind_focus = (
+        "这是赛后复盘的第一阶段盲推：当前严禁使用或猜测实际比分，"
+        "只按赛前盘口正向执行SOP。"
+    )
+    if extra_instruction.strip():
+        blind_focus += "\n用户复盘侧重：" + extra_instruction.strip()
+    forecast, blind_summary = multi_analyzer.run(
+        csv_str, "", meta["home"], meta["away"], meta["league"],
+        goals_block=goals_block, extra_instruction=blind_focus,
+        cancel=cancel, progress=on_blind_progress,
+    )
+    if cancel is not None and cancel.is_set():
+        if msg_id:
+            edit_text(chat_id, msg_id, title + "\n\n🛑 已停止全模型复盘。", _NO_KB)
+        return
+    if not forecast:
+        error = blind_summary.get("error", "盲推未产出")
+        if msg_id:
+            edit_text(chat_id, msg_id, f"❌ 全模型盲推失败：{error}", _NO_KB)
+        return
+    _send_long(chat_id, _md_to_tg("🔮 第一步·全模型盲推预判\n\n" + forecast))
+
+    # 盲推完成之后才拉取基本面并进入赛果归因，保持两阶段边界。
+    try:
+        conn = db.get_conn()
+        try:
+            raw_funds = fundamentals.build_fundamentals(conn, fid)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("全模型复盘基本面拉取失败：%s", exc)
+        raw_funds = ""
+
+    phase.update({"name": "第二阶段·全模型对照归因", "done": 0})
+    if msg_id:
+        edit_text(chat_id, msg_id, progress_text(), stop_kb)
+
+    def on_review_progress(kind: str, result: dict | None) -> None:
+        if kind == "review_module" and result:
+            phase["done"] += 1
+        elif kind == "review_synthesis":
+            phase["name"] = "第二阶段·Astra合并复盘"
+        if msg_id:
+            edit_text(chat_id, msg_id, progress_text(), stop_kb)
+
+    report, review_summary = multi_analyzer.run_review(
+        csv_str, forecast, result_text, raw_funds,
+        meta["home"], meta["away"], meta["league"],
+        goals_block=goals_block, extra_instruction=extra_instruction,
+        cancel=cancel, progress=on_review_progress,
+    )
+    if cancel is not None and cancel.is_set():
+        if msg_id:
+            edit_text(chat_id, msg_id, title + "\n\n🛑 已停止全模型复盘。", _NO_KB)
+        return
+    if not report:
+        error = review_summary.get("error", "对照复盘未产出")
+        if msg_id:
+            edit_text(chat_id, msg_id, f"❌ 全模型对照复盘失败：{error}", _NO_KB)
+        return
+
+    if msg_id:
+        edit_text(chat_id, msg_id, title + "\n\n✅ 全模型盲推与对照复盘完成。",
+                  _NO_KB)
+    _send_long(chat_id, _md_to_tg(report))
+    full = ("# 第一步·全模型盲推预判（不看比分与基本面）\n\n"
+            + forecast
+            + "\n\n---\n\n# 第二步·全模型对照复盘\n\n"
+            + report)
+    path = _archive_report(
+        meta, full, suffix="review_consult", chat_id=chat_id)
+    if path:
+        send(chat_id, f"📁 全模型复盘已归档：{path}")
+
+    token = uuid.uuid4().hex[:12]
+    with _lesson_lock:
+        _lesson_pending[token] = {"report": report, "meta": meta}
+    send(chat_id,
+         "是否把本场全模型复盘沉淀为一条【实战教训】归入规则库？",
+         {"inline_keyboard": [[
+             {"text": "📚 归档为实战教训", "callback_data": f"ls:{token}:go"},
+             {"text": "跳过", "callback_data": f"ls:{token}:no"},
+         ]]})
 
 
 # ─── /llm 管理面板（端点池 + 熔断状态 + 可调参数；仅管理员）──────────────────
@@ -3488,6 +3633,28 @@ def handle_message(msg: dict) -> None:
             llm_client.reload_settings()   # 令缓存失效，下次调用即用新值
             send(chat_id, f"✅ 已设 {spec['label']} = {_fmt_num(val)}（即时生效）。"
                           f"\n发 /llm 查看面板。")
+            return
+
+    # 若该 chat 正在等待「全模型复盘自定义侧重」输入，优先消费这条消息。
+    if chat_id in _pending_multi_review_custom:
+        fid = _pending_multi_review_custom.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消"):
+            send(chat_id, "已取消全模型复盘。")
+            return
+        if text.startswith("/"):
+            send(chat_id, "（已取消上一条全模型复盘侧重，改为执行新命令）")
+        elif not text.strip():
+            send(chat_id, "自定义侧重不能为空，已取消本次复盘。")
+            return
+        else:
+            tid = _submit_analysis(
+                chat_id, "全模型复盘", _run_multi_review,
+                chat_id, fid, text.strip()[:2000])
+            if tid:
+                send(chat_id, f"收到自定义侧重，开始全模型复盘 fixture {fid} …")
+            else:
+                send(chat_id, f"⚠️ 你同时进行的分析已达上限"
+                              f"（{_ANALYSIS_MAX_PER_CHAT} 个）")
             return
 
     # 若该 chat 正在等待「全模型会诊自定义侧重」输入，优先消费这条消息。
@@ -4179,6 +4346,62 @@ def handle_callback(cb: dict) -> None:
         send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再发你的侧重要求。\n"
                       f"{_effort_prompt(chat_id)}",
              _effort_keyboard(chat_id, "c", fid))
+        return
+
+    # 全模型交叉复盘：不弹统一强度，分标准/自定义两种入口。
+    if data.startswith("rmx:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("rmx:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        fid = int(fid_str)
+        answer_callback(cb_id, "请选择全模型复盘方式")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id,
+             "🧪 全模型交叉复盘：先让全模型在不知道比分和基本面的情况下盲推，"
+             "再揭晓赛果做分模块归因。\n请选择：",
+             {"inline_keyboard": [[
+                 {"text": "🎯 标准全模型复盘",
+                  "callback_data": f"rmxp:{fid}"},
+                 {"text": "✍️ 自定义侧重复盘",
+                  "callback_data": f"rmxc:{fid}"},
+             ]]})
+        return
+
+    if data.startswith("rmxp:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("rmxp:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        tid = _submit_analysis(
+            chat_id, "全模型复盘", _run_multi_review,
+            chat_id, int(fid_str), "")
+        answer_callback(cb_id, "已开始全模型复盘…" if tid
+                        else f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}）")
+        return
+
+    if data.startswith("rmxc:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("rmxc:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        _pending_multi_review_custom[chat_id] = int(fid_str)
+        answer_callback(cb_id, "请回复复盘侧重")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id,
+             f"✍️ 请发一条消息，描述 fixture {fid_str} 的全模型复盘侧重。\n"
+             "侧重会传给全部复盘专家、Astra和Sol，但不会泄漏赛果到盲推阶段。\n"
+             "（发 /cancel 取消）",
+             {"force_reply": True, "input_field_placeholder": "输入复盘侧重…"})
         return
 
     # 复盘模式选定：rm:<sub>:<fid>（sub=b 只盲推/c 只对照/a 两步全跑）→ 再弹强度键盘

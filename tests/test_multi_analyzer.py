@@ -155,6 +155,56 @@ class TestMultiAnalyzer(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0]["status"], "error")
 
+    def test_full_review_uses_all_models_and_preserves_custom_focus(self):
+        called = []
+        focus = "重点解释临场降盘为何没有兑现"
+
+        def fake_chat(system, user, model, **kwargs):
+            called.append((model, system, user))
+            if "全模型赛后复盘审计员" in system:
+                return '{"ok":true,"issues":[]}'
+            module_id = next(
+                task["id"] for task in config.FULL_CONSULT_TASKS
+                if task["model"] == model
+            )
+            return _card(module_id)
+
+        review_report = (
+            "### 1. 实际结果\nx\n### 2. 盘口结算回放\nx\n"
+            "### 3. 盲推预判 vs 实际对照\nx\n"
+            "### 4. 信号有效性复盘\nx\n### 5. 经验教训\nx\n"
+            "### 6. 盘口指示强度评分\nx\n" + ("x" * 500)
+        )
+
+        def fake_stream(system, user, model, **kwargs):
+            called.append((model, system, user))
+            self.assertIn("第一阶段盲推", user)
+            self.assertIn("实际结果", user)
+            yield ("done", review_report)
+
+        with (
+            patch.object(multi_analyzer.llm_client, "chat_model",
+                         side_effect=fake_chat),
+            patch.object(multi_analyzer.llm_client, "stream_chat_model",
+                         side_effect=fake_stream),
+        ):
+            result, summary = multi_analyzer.run_review(
+                "csv", "第一阶段盲推", "实际结果", "基本面",
+                "主队", "客队", "联赛", goals_block="goals",
+                extra_instruction=focus,
+            )
+
+        self.assertIn("### 6. 盘口指示强度评分", result)
+        self.assertTrue(summary["audit"]["ok"])
+        self.assertEqual(
+            {model for model, _, _ in called},
+            {task["model"] for task in config.FULL_CONSULT_TASKS}
+            | {config.FULL_CONSULT_SYNTHESIS["model"],
+               config.FULL_CONSULT_AUDIT["model"]},
+        )
+        self.assertTrue(all(focus in system or focus in user
+                            for _, system, user in called))
+
 
 if __name__ == "__main__":
     unittest.main()

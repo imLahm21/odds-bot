@@ -87,6 +87,10 @@ Administrators also see `🧪 Full-model cross consultation` under `/analyze`.
 It assigns the configured model pool to separate modules, then uses Astra to
 compose and Sol to audit the report. The consultation supports an optional
 custom focus and archives to a separate `_consult.md` file.
+Administrators also see `🧪 Full-model cross review` under `/review`. It runs
+a result-blind full-model forecast first, reveals the final score only in the
+second-stage attribution, and archives the combined result as
+`_review_consult.md`.
 
 **Two-tier permissions**: the bot only responds to whitelisted chat IDs. `TELEGRAM_ALLOWED_CHAT_IDS`
 are users who can query/analyze; `TELEGRAM_ADMIN_CHAT_IDS` are admins who can change config. If ADMIN
