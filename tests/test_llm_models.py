@@ -970,6 +970,42 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(events, [("done", "ok")])
         self.assertEqual(routed, ["gpt-6-astra"])
 
+    def test_explicit_stream_model_fallback_uses_fallback_effort(self):
+        endpoints = [
+            self._group_endpoint("GPT", "ik_gpt"),
+            self._group_endpoint("DeepSeek", "ik_deepseek"),
+        ]
+        breakers = [_FakeBreaker() for _ in endpoints]
+        calls = []
+
+        def fake_stream(ep, payload, first_byte_to, idle_to, retries):
+            calls.append((payload["model"],
+                          payload.get("reasoning_effort")))
+            if payload["model"] == "gpt-6-astra":
+                yield ("error", "primary failed before first byte")
+            else:
+                yield ("done", "fallback ok")
+
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", breakers),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "get_settings", return_value={
+                key: spec["default"]
+                for key, spec in config.LLM_SETTING_SPECS.items()}),
+            patch.object(llm_client, "_stream_one", side_effect=fake_stream),
+        ):
+            events = list(llm_client.stream_chat_model(
+                "system", "user", model="gpt-6-astra", effort="xhigh",
+                fallback_models=("deepseek-v4-pro",),
+                fallback_efforts=("max",),
+            ))
+
+        self.assertEqual(events, [("done", "fallback ok")])
+        self.assertEqual(calls, [("gpt-6-astra", "xhigh"),
+                                 ("deepseek-v4-pro", "max")])
+
     def test_stream_token_exhaustion_skips_sibling_keys_and_uses_fallback(self):
         endpoints = [
             self._group_endpoint("DeepSeek-1", "ik_deepseek"),

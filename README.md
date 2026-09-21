@@ -85,8 +85,10 @@ When `TELEGRAM_BOT_TOKEN` is set, the daemon also runs a TG bot with inline-butt
 
 Administrators also see `🧪 Full-model cross consultation` under `/analyze`.
 It assigns the configured model pool to separate modules, then uses Astra to
-compose and Sol to audit the report. The consultation supports an optional
-custom focus and archives to a separate `_consult.md` file.
+compose and Sol to audit the report. Each module has a same-grade, cross-group
+fallback chain, with the fallback model's own effort and token budget. The
+consultation supports an optional custom focus and archives to a separate
+`_consult.md` file.
 Administrators also see `🧪 Full-model cross review` under `/review`. It runs
 a result-blind full-model forecast first, reveals the final score only in the
 second-stage attribution, and archives the combined result as

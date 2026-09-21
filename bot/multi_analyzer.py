@@ -13,10 +13,9 @@ from . import analyzer, config, llm_client
 
 log = logging.getLogger("odds_bot.multi_analyzer")
 
-_ERR_PREFIXES = getattr(analyzer, "_LLM_ERR_PREFIXES", (
-    "LLM 请求失败", "LLM 超时", "LLM 网络错误", "LLM 返回无 choices",
-    "LLM 返回空内容", "LLM 输出 token 耗尽", "LLM_API_KEY",
-))
+_ERR_PREFIXES = tuple(getattr(analyzer, "_LLM_ERR_PREFIXES", ())) + (
+    "未配置 LLM_ROUTE_ENDPOINTS",
+)
 
 _RULE_FILES = {
     "market": [
@@ -178,51 +177,191 @@ def _parse_json(raw: str) -> tuple[dict | None, str]:
     return value, ""
 
 
+def _route_candidates(spec: dict) -> list[dict]:
+    """Return the primary and explicit per-model fallback route."""
+    raw = [{"model": spec.get("model", ""),
+            "effort": spec.get("effort", "")}]
+    raw.extend(spec.get("fallbacks", ()))
+    # Read the old shape while migrating local worktrees, but do not use it
+    # in the committed configuration because it cannot carry per-model effort.
+    if not spec.get("fallbacks"):
+        raw.extend({"model": model, "effort": spec.get("effort", "")}
+                   for model in spec.get("fallback_models", ()))
+    candidates = []
+    seen = set()
+    for item in raw:
+        if isinstance(item, str):
+            item = {"model": item, "effort": spec.get("effort", "")}
+        model = str(item.get("model", "")).strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        candidates.append({"model": model,
+                           "effort": str(item.get("effort", "")).strip()})
+    return candidates
+
+
+def _route_problems(spec: dict) -> list[str]:
+    """Validate grade, registration, group escape, and effort declarations."""
+    candidates = _route_candidates(spec)
+    if not candidates:
+        return ["未指定模型"]
+    problems = []
+    primary = candidates[0]["model"]
+    primary_grade = config.FULL_CONSULT_MODEL_GRADES.get(primary)
+    if not config.llm_model_registered(primary):
+        problems.append(f"主模型未登记：{primary}")
+    if not primary_grade:
+        problems.append(f"主模型未声明会诊等级：{primary}")
+    primary_groups = set(config.llm_route_groups_for_model(primary))
+    for item in candidates:
+        model, effort = item["model"], item["effort"]
+        if not config.llm_model_registered(model):
+            problems.append(f"模型未登记：{model}")
+        if config.FULL_CONSULT_MODEL_GRADES.get(model) != primary_grade:
+            problems.append(
+                f"模型等级不一致：{primary}({primary_grade}) -> "
+                f"{model}({config.FULL_CONSULT_MODEL_GRADES.get(model)})")
+        if not config.llm_model_supports_effort(model, effort):
+            problems.append(f"{model} 不支持 effort={effort}")
+    if len(candidates) > 1:
+        first_groups = set(config.llm_route_groups_for_model(
+            candidates[1]["model"]))
+        if primary_groups and first_groups and primary_groups & first_groups:
+            problems.append(
+                f"第一回退未离开主授权组：{primary} -> "
+                f"{candidates[1]['model']}")
+    return problems
+
+
+def validate_full_consult_routes() -> list[str]:
+    """Return configuration errors before any live request is attempted."""
+    specs = list(config.FULL_CONSULT_TASKS) + [
+        config.FULL_CONSULT_SYNTHESIS, config.FULL_CONSULT_AUDIT,
+    ]
+    problems = []
+    for spec in specs:
+        name = spec.get("id") or spec.get("model", "route")
+        problems.extend(f"{name}: {problem}"
+                        for problem in _route_problems(spec))
+    return problems
+
+
+def _route_meta(spec: dict, candidate: dict, position: int,
+                attempts: list[dict], *, error: str = "") -> dict:
+    return {
+        "requested_model": spec.get("model", ""),
+        "model": candidate.get("model", spec.get("model", "")),
+        "requested_effort": spec.get("effort", ""),
+        "effort": candidate.get("effort", ""),
+        "fallback_used": position > 0,
+        "fallback_attempted": len(attempts) > 1 or position > 0,
+        "attempts": attempts,
+        "error": error,
+    }
+
+
+def _call_route(system: str, user: str, spec: dict, *, parse_json: bool,
+                phase: str, input_metrics: dict | None = None
+                ) -> tuple[object | None, dict]:
+    """Call a route one model at a time so contract errors also fail over."""
+    problems = _route_problems(spec)
+    if problems:
+        error = "会诊路由配置错误：" + "；".join(problems)
+        log.error("全模型路由拒绝 phase=%s reason=%s", phase, error)
+        candidates = _route_candidates(spec)
+        meta = _route_meta(spec, candidates[0] if candidates else {}, 0, [],
+                           error=error)
+        return None, meta
+
+    attempts = []
+    candidates = _route_candidates(spec)
+    for position, candidate in enumerate(candidates):
+        model, effort = candidate["model"], candidate["effort"]
+        try:
+            raw = llm_client.chat_model(
+                system, user, model=model, effort=effort,
+                timeout=config.FULL_CONSULT_TIMEOUT,
+                max_tokens=int(spec.get("max_tokens", 0) or 0),
+                input_metrics=input_metrics,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)[:500]
+            log.exception("全模型调用异常 phase=%s model=%s", phase, model)
+        else:
+            if not raw or str(raw).startswith(_ERR_PREFIXES):
+                error = (raw or "模型无返回")[:500]
+            elif parse_json:
+                value, error = _parse_json(str(raw))
+                if value is not None:
+                    attempts.append({"model": model, "effort": effort,
+                                     "status": "ok"})
+                    meta = _route_meta(spec, candidate, position, attempts)
+                    log.info(
+                        "全模型调用成功 phase=%s requested=%s actual=%s "
+                        "fallback=%s attempts=%d",
+                        phase, spec.get("model"), model, position > 0,
+                        len(attempts))
+                    return value, meta
+            else:
+                value = str(raw).strip()
+                if value:
+                    attempts.append({"model": model, "effort": effort,
+                                     "status": "ok"})
+                    meta = _route_meta(spec, candidate, position, attempts)
+                    log.info(
+                        "全模型调用成功 phase=%s requested=%s actual=%s "
+                        "fallback=%s attempts=%d",
+                        phase, spec.get("model"), model, position > 0,
+                        len(attempts))
+                    return value, meta
+                error = "模型返回空内容"
+        attempts.append({"model": model, "effort": effort,
+                         "status": "error", "error": str(error)[:500]})
+        next_model = (candidates[position + 1]["model"]
+                      if position + 1 < len(candidates) else "")
+        log.warning(
+            "全模型故障转移尝试失败 phase=%s requested=%s failed=%s "
+            "reason=%s%s",
+            phase, spec.get("model"), model, str(error)[:200],
+            f" next={next_model}" if next_model else "",
+        )
+    error = "；".join(
+        f"{item['model']}：{item.get('error', '失败')}"
+        for item in attempts)[:1500]
+    meta = _route_meta(spec, candidates[-1], len(candidates) - 1,
+                       attempts, error=error)
+    log.error("全模型故障转移耗尽 phase=%s requested=%s attempts=%d",
+              phase, spec.get("model"), len(attempts))
+    return None, meta
+
+
 def _run_one(task: dict, bundle: dict) -> dict:
     started = time.monotonic()
-    model = task["model"]
-    try:
-        raw = llm_client.chat_model(
-            _module_system(task, bundle), _module_input(task, bundle),
-            model=model, effort=task["effort"],
-            timeout=config.FULL_CONSULT_TIMEOUT,
-            max_tokens=task["max_tokens"],
-        )
-        elapsed = int((time.monotonic() - started) * 1000)
-        if not raw or raw.startswith(_ERR_PREFIXES):
-            return {
-                "id": task["id"], "label": task["label"], "model": model,
-                "effort": task["effort"], "status": "error",
-                "error": (raw or "模型无返回")[:500], "elapsed_ms": elapsed,
-            }
-        parsed, error = _parse_json(raw)
-        if parsed is None:
-            return {
-                "id": task["id"], "label": task["label"], "model": model,
-                "effort": task["effort"], "status": "error",
-                "error": error, "raw_preview": raw[:500],
-                "elapsed_ms": elapsed,
-            }
-        parsed.setdefault("module", task["id"])
-        parsed.setdefault("summary", "")
-        parsed.setdefault("findings", [])
-        parsed.setdefault("direction", "not_applicable")
-        parsed.setdefault("missing_data", [])
-        parsed.setdefault("risks", [])
-        parsed.setdefault("disagreements", [])
+    value, route = _call_route(
+        _module_system(task, bundle), _module_input(task, bundle), task,
+        parse_json=True, phase=f"module:{task['id']}",
+    )
+    if value is None:
         return {
-            "id": task["id"], "label": task["label"], "model": model,
-            "effort": task["effort"], "status": "ok", "card": parsed,
-            "elapsed_ms": elapsed,
-        }
-    except Exception as exc:  # noqa: BLE001
-        log.exception("全模型模块失败 module=%s model=%s", task["id"], model)
-        return {
-            "id": task["id"], "label": task["label"], "model": model,
-            "effort": task["effort"], "status": "error",
-            "error": str(exc)[:500],
+            "id": task["id"], "label": task["label"], **route,
+            "model": task["model"], "status": "error",
+            "error": route.get("error", "模型链全部失败"),
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
+    parsed = value
+    parsed.setdefault("module", task["id"])
+    parsed.setdefault("summary", "")
+    parsed.setdefault("findings", [])
+    parsed.setdefault("direction", "not_applicable")
+    parsed.setdefault("missing_data", [])
+    parsed.setdefault("risks", [])
+    parsed.setdefault("disagreements", [])
+    return {
+        "id": task["id"], "label": task["label"], **route,
+        "status": "ok", "card": parsed,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
 
 
 def _audit_input(bundle: dict, report: str, cards: list[dict]) -> str:
@@ -258,18 +397,17 @@ def _audit_report(bundle: dict, report: str, cards: list[dict]) -> dict:
         '{"ok":true,"issues":[{"section":"7","problem":"...",'
         '"required_fix":"..."}]}'
     )
-    raw = llm_client.chat_model(
+    parsed, route = _call_route(
         system, _audit_input(bundle, report, cards),
-        model=config.FULL_CONSULT_AUDIT["model"],
-        effort=config.FULL_CONSULT_AUDIT["effort"],
-        timeout=config.FULL_CONSULT_TIMEOUT,
-        max_tokens=config.FULL_CONSULT_AUDIT["max_tokens"],
+        config.FULL_CONSULT_AUDIT, parse_json=True, phase="audit",
     )
-    parsed, error = _parse_json(raw)
     if parsed is None:
-        return {"ok": False, "issues": deterministic + [error]}
+        return {"ok": False, "issues": deterministic + [
+            route.get("error", "审计模型链全部失败")
+        ], "route": route}
     issues = deterministic + list(parsed.get("issues") or [])
-    return {"ok": not issues and bool(parsed.get("ok", True)), "issues": issues}
+    return {"ok": not issues and bool(parsed.get("ok", True)),
+            "issues": issues, "route": route}
 
 
 def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
@@ -297,13 +435,15 @@ def _synthesize(bundle: dict, cards: list[dict], cancel=None,
     if cancel is not None and cancel.is_set():
         return ""
     system, user, metrics = _synthesis_prompt(bundle, cards)
+    fallbacks = config.FULL_CONSULT_SYNTHESIS.get("fallbacks", ())
     accumulated = ""
     for event in llm_client.stream_chat_model(
             system, user,
             model=config.FULL_CONSULT_SYNTHESIS["model"],
             effort=config.FULL_CONSULT_SYNTHESIS["effort"],
             max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
-            fallback_models=("gpt-5.6-sol",),
+            fallback_models=tuple(item["model"] for item in fallbacks),
+            fallback_efforts=tuple(item["effort"] for item in fallbacks),
             input_metrics=metrics):
         if cancel is not None and cancel.is_set():
             return ""
@@ -328,16 +468,26 @@ def _render_appendix(results: list[dict], audit: dict) -> str:
         status = "✅" if result.get("status") == "ok" else "❌"
         error = result.get("error", "")
         tail = f"；{error[:120]}" if error else ""
+        requested = result.get("requested_model", result.get("model"))
+        used = result.get("model")
+        model_text = (
+            f"{requested} → {used}（故障转移）"
+            if result.get("fallback_used") else str(used)
+        )
         lines.append(
             f"- {status} {result.get('label')}："
-            f"{result.get('model')} / {result.get('effort')} / "
+            f"{model_text} / {result.get('effort')} / "
             f"{result.get('elapsed_ms', 0)}ms{tail}"
         )
     if audit.get("ok"):
-        lines.append("- ✅ Sol最终审计：通过")
+        route = audit.get("route") or {}
+        lines.append(f"- ✅ {route.get('model', '审计模型')}最终审计：通过")
     else:
         issues = audit.get("issues") or []
-        lines.append(f"- ⚠️ Sol最终审计：{len(issues)}项问题，已标注或尝试修复")
+        route = audit.get("route") or {}
+        lines.append(
+            f"- ⚠️ {route.get('model', '审计模型')}最终审计："
+            f"{len(issues)}项问题，已标注或尝试修复")
     return "\n".join(lines)
 
 
@@ -383,7 +533,10 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
     cards = [
         {
             "id": item["id"], "label": item["label"], "model": item["model"],
+            "requested_model": item.get("requested_model", item["model"]),
             "effort": item["effort"], "status": item["status"],
+            "fallback_used": item.get("fallback_used", False),
+            "attempts": item.get("attempts", []),
             "card": item.get("card"), "error": item.get("error"),
         }
         for item in results
@@ -393,7 +546,7 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         progress=(lambda kind: progress(kind, None) if progress else None),
     )
     if not report:
-        return "", {"results": results, "error": "Astra最终合并失败"}
+        return "", {"results": results, "error": "最终合并模型链全部失败"}
 
     audit = _audit_report(bundle, report, cards)
     if not audit["ok"] and not (cancel is not None and cancel.is_set()):
@@ -402,16 +555,14 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
             "你是报告修复器。只修复给定问题，保留原报告事实和方向权限，"
             "输出完整修复后的 ### 1 到 ### 8 报告，不要解释修复过程。"
         )
-        repaired = llm_client.chat_model(
+        repaired, repair_route = _call_route(
             repair_system,
             "### 原报告\n" + report + "\n### 审计问题\n" + issues,
-            model=config.FULL_CONSULT_SYNTHESIS["model"],
-            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
-            timeout=config.FULL_CONSULT_TIMEOUT,
-            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+            config.FULL_CONSULT_SYNTHESIS, parse_json=False,
+            phase="repair",
         )
-        if repaired and not repaired.startswith(_ERR_PREFIXES):
-            report = repaired.strip()
+        if repaired:
+            report = str(repaired).strip()
             audit = _audit_report(bundle, report, cards)
     report += "\n\n" + _render_appendix(results, audit)
     return report, {"results": results, "audit": audit}
@@ -441,19 +592,17 @@ def _review_audit(bundle: dict, report: str, cards: list[dict]) -> dict:
         + "\n### 第一阶段盲推原文\n" + bundle.get("forecast", "")
         + "\n### 实际结果\n" + bundle.get("result_text", "")
     )
-    raw = llm_client.chat_model(
-        system,
-        audit_user,
-        model=config.FULL_CONSULT_AUDIT["model"],
-        effort=config.FULL_CONSULT_AUDIT["effort"],
-        timeout=config.FULL_CONSULT_TIMEOUT,
-        max_tokens=config.FULL_CONSULT_AUDIT["max_tokens"],
+    parsed, route = _call_route(
+        system, audit_user, config.FULL_CONSULT_AUDIT,
+        parse_json=True, phase="review_audit",
     )
-    parsed, error = _parse_json(raw)
     if parsed is None:
-        return {"ok": False, "issues": deterministic + [error]}
+        return {"ok": False, "issues": deterministic + [
+            route.get("error", "复盘审计模型链全部失败")
+        ], "route": route}
     issues = deterministic + list(parsed.get("issues") or [])
-    return {"ok": not issues and bool(parsed.get("ok", True)), "issues": issues}
+    return {"ok": not issues and bool(parsed.get("ok", True)),
+            "issues": issues, "route": route}
 
 
 def _review_synthesis_prompt(bundle: dict,
@@ -484,13 +633,15 @@ def _review_synthesis_prompt(bundle: dict,
 def _review_synthesize(bundle: dict, cards: list[dict], cancel=None,
                        progress: Callable[[str], None] | None = None) -> str:
     system, user, metrics = _review_synthesis_prompt(bundle, cards)
+    fallbacks = config.FULL_CONSULT_SYNTHESIS.get("fallbacks", ())
     accumulated = ""
     for event in llm_client.stream_chat_model(
             system, user,
             model=config.FULL_CONSULT_SYNTHESIS["model"],
             effort=config.FULL_CONSULT_SYNTHESIS["effort"],
             max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
-            fallback_models=("gpt-5.6-sol",),
+            fallback_models=tuple(item["model"] for item in fallbacks),
+            fallback_efforts=tuple(item["effort"] for item in fallbacks),
             input_metrics=metrics):
         if cancel is not None and cancel.is_set():
             return ""
@@ -555,7 +706,10 @@ def run_review(csv_text: str, forecast: str, result_text: str,
     cards = [
         {
             "id": item["id"], "label": item["label"], "model": item["model"],
+            "requested_model": item.get("requested_model", item["model"]),
             "effort": item["effort"], "status": item["status"],
+            "fallback_used": item.get("fallback_used", False),
+            "attempts": item.get("attempts", []),
             "card": item.get("card"), "error": item.get("error"),
         }
         for item in results
@@ -565,7 +719,7 @@ def run_review(csv_text: str, forecast: str, result_text: str,
         progress=(lambda kind: progress(kind, None) if progress else None),
     )
     if not report:
-        return "", {"results": results, "error": "Astra复盘合并失败"}
+        return "", {"results": results, "error": "复盘合并模型链全部失败"}
 
     audit = _review_audit(bundle, report, cards)
     if not audit["ok"] and not (cancel is not None and cancel.is_set()):
@@ -573,17 +727,15 @@ def run_review(csv_text: str, forecast: str, result_text: str,
             "你是复盘报告修复器。只修复审计指出的问题，保留第一阶段盲推原文"
             "与赛果揭晓边界，输出完整的 ### 1 到 ### 6，不解释修复过程。"
         )
-        repaired = llm_client.chat_model(
+        repaired, repair_route = _call_route(
             repair_system,
             "### 原复盘\n" + report + "\n### 审计问题\n"
             + json.dumps(audit["issues"], ensure_ascii=False),
-            model=config.FULL_CONSULT_SYNTHESIS["model"],
-            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
-            timeout=config.FULL_CONSULT_TIMEOUT,
-            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+            config.FULL_CONSULT_SYNTHESIS, parse_json=False,
+            phase="review_repair",
         )
-        if repaired and not repaired.startswith(_ERR_PREFIXES):
-            report = repaired.strip()
+        if repaired:
+            report = str(repaired).strip()
             audit = _review_audit(bundle, report, cards)
     report += "\n\n" + _render_appendix(results, audit)
     return report, {"results": results, "audit": audit}

@@ -2511,6 +2511,8 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
     goals_block = goals_model.format_states_block(states)
     labels = {task["id"]: task["label"] for task in config.FULL_CONSULT_TASKS}
     statuses = {task_id: "⬜" for task_id in labels}
+    display_models = {task["id"]: task["model"]
+                      for task in config.FULL_CONSULT_TASKS}
     statuses.update({"synthesis": "⬜", "audit": "⬜"})
     title = (f"⏳ 全模型交叉会诊：{meta['home']} vs {meta['away']}\n"
              f"共 {len(config.FULL_CONSULT_TASKS) + 2} 个模型，自动分配推理强度")
@@ -2521,9 +2523,9 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
         lines = [title, ""]
         for task in config.FULL_CONSULT_TASKS:
             lines.append(f"{statuses[task['id']]} {task['label']} "
-                         f"({task['model']} / {task['effort']})")
-        lines.append(f"{statuses['synthesis']} Astra 最终合并")
-        lines.append(f"{statuses['audit']} Sol 最终审计")
+                         f"({display_models[task['id']]} / {task['effort']})")
+        lines.append(f"{statuses['synthesis']} 最终合并模型链")
+        lines.append(f"{statuses['audit']} 最终审计模型链")
         return "\n".join(lines)
 
     msg_id = send(chat_id, progress_text(), stop_kb)
@@ -2533,6 +2535,8 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
         if kind == "module" and result:
             status = "✅" if result.get("status") == "ok" else "❌"
             statuses[result["id"]] = status
+            display_models[result["id"]] = result.get(
+                "model", display_models[result["id"]])
         elif kind == "synthesis":
             statuses["synthesis"] = "🔄"
         elif kind == "warning":
@@ -2562,10 +2566,10 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
     if msg_id:
         edit_text(chat_id, msg_id,
                   title + "\n\n" + "\n".join(
-                      f"{statuses[t['id']]} {t['label']}"
-                      for t in config.FULL_CONSULT_TASKS)
-                  + f"\n{statuses['synthesis']} Astra 最终合并"
-                  + f"\n{statuses['audit']} Sol 最终审计", _NO_KB)
+                       f"{statuses[t['id']]} {t['label']}"
+                       for t in config.FULL_CONSULT_TASKS)
+                   + f"\n{statuses['synthesis']} 最终合并模型链"
+                   + f"\n{statuses['audit']} 最终审计模型链", _NO_KB)
     _send_long(chat_id, _md_to_tg(report))
     path = _archive_report(meta, report, suffix="consult", chat_id=chat_id)
     if path:
@@ -3052,7 +3056,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         if kind == "module" and result:
             phase["done"] += 1
         elif kind == "synthesis":
-            phase["name"] = "第一阶段·Astra合并盲推"
+            phase["name"] = "第一阶段·最终合并模型链盲推"
         if msg_id:
             edit_text(chat_id, msg_id, progress_text(), stop_kb)
 
@@ -3097,7 +3101,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         if kind == "review_module" and result:
             phase["done"] += 1
         elif kind == "review_synthesis":
-            phase["name"] = "第二阶段·Astra合并复盘"
+            phase["name"] = "第二阶段·最终合并模型链复盘"
         if msg_id:
             edit_text(chat_id, msg_id, progress_text(), stop_kb)
 

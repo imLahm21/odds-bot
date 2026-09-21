@@ -1420,8 +1420,13 @@ def chat_model(system: str, user: str, model: str, effort: str = "",
 def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                       max_tokens: int = 0,
                       fallback_models: tuple[str, ...] = (),
+                      fallback_efforts: tuple[str, ...] = (),
                       input_metrics: dict | None = None):
-    """按明确模型流式调用；只在首字节前进入调用方指定的模型回退链。"""
+    """按明确模型流式调用；只在首字节前进入调用方指定的模型回退链。
+
+    fallback_efforts 与 fallback_models 按位置对应；未提供时沿用主模型
+    effort，旧调用方因此保持兼容。
+    """
     if not available():
         yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
         return
@@ -1433,13 +1438,21 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
     idle_to = int(st["stream_idle_timeout"])
     request_id = uuid.uuid4().hex[:12]
     chain = []
-    for item in (model, *fallback_models):
+    chain_efforts = []
+    for raw_position, item in enumerate((model, *fallback_models)):
         if item and item not in chain:
             chain.append(item)
+            chain_efforts.append(
+                effort if raw_position == 0 else (
+                    fallback_efforts[raw_position - 1]
+                    if raw_position - 1 < len(fallback_efforts) else effort
+                )
+            )
     last_err = None
     warning_sent = False
     for position, current_model in enumerate(chain):
         tok = int(max_tokens or config.llm_max_tokens_for_model(current_model))
+        current_effort = chain_efforts[position]
         observation = _input_observation(
             system, user, current_model, tok, input_metrics)
         _log_input_observation(request_id, observation)
@@ -1458,7 +1471,7 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                 continue
             log.info("LLM显式流式路由 model=%s group=%s endpoint=%s",
                      current_model, ep["route_group"], ep["label"])
-            payload = _payload(current_model, system, user, tok, effort,
+            payload = _payload(current_model, system, user, tok, current_effort,
                                True, ep["route_group"])
             endpoint_produced = False
             usage_logged = False

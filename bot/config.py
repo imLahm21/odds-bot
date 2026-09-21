@@ -675,32 +675,94 @@ LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
 
 # 全模型交叉会诊的固定任务。该模式不读取 /llm 面板当前的 tier 主模型，
 # 而是按模型能力把每个模型固定到一个可审计的职责；密钥仍按模型家族路由。
+# consult_grade 是会诊专用能力等级，不等同于运行时 heavy/balanced/light 档位。
+# 同一模块的回退模型必须保持同等级；每个回退模型独立声明 effort。
+# max_tokens=0 表示不在模块层覆盖，让 llm_client 按 LLM_MODEL_MAX_TOKENS
+# （未单列时 LLM_MAX_TOKENS）读取服务器 .env 的逐模型预算。
+FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
+    "gpt-6-astra": "flagship",
+    "gpt-5.6-sol": "flagship",
+    "glm-5.3": "flagship",
+    "grok-4.6": "flagship",
+    "deepseek-v4-pro": "flagship",
+    "gpt-5.6-luna": "specialized_fast",
+    "gpt-5.6-terra": "specialized_fast",
+    "glm-5.3-flash": "specialized_fast",
+    "grok-4.5": "specialized_fast",
+    "deepseek-v4.1-flash": "specialized_fast",
+    "gemini-3.8-flash": "specialized_fast",
+}
+
 FULL_CONSULT_TASKS: tuple[dict, ...] = (
     {"id": "data_audit", "label": "数据审计", "model": "gpt-5.6-luna",
-     "effort": "low", "max_tokens": 1600},
+     "effort": "low", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "deepseek-v4.1-flash", "effort": "high"},
+         {"model": "glm-5.3-flash", "effort": "high"},
+     )},
     {"id": "fundamentals", "label": "基本面主分析", "model": "gpt-5.6-terra",
-     "effort": "medium", "max_tokens": 4000},
+     "effort": "medium", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gemini-3.8-flash", "effort": "high"},
+         {"model": "glm-5.3-flash", "effort": "high"},
+     )},
     {"id": "fundamentals_review", "label": "基本面复核", "model": "glm-5.3-flash",
-     "effort": "high", "max_tokens": 3000},
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gemini-3.8-flash", "effort": "high"},
+         {"model": "gpt-5.6-terra", "effort": "high"},
+     )},
     {"id": "market_primary", "label": "盘口主分析", "model": "grok-4.6",
-     "effort": "xhigh", "max_tokens": 5000},
+     "effort": "xhigh", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gpt-6-astra", "effort": "xhigh"},
+         {"model": "deepseek-v4-pro", "effort": "max"},
+     )},
     {"id": "market_challenge", "label": "盘口反方分析", "model": "grok-4.5",
-     "effort": "high", "max_tokens": 3500},
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gpt-5.6-terra", "effort": "high"},
+         {"model": "gemini-3.8-flash", "effort": "high"},
+     )},
     {"id": "numeric_summary", "label": "数字整理", "model": "deepseek-v4.1-flash",
-     "effort": "high", "max_tokens": 4000},
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "glm-5.3-flash", "effort": "high"},
+         {"model": "gemini-3.8-flash", "effort": "high"},
+     )},
     {"id": "risk_review", "label": "风险复核", "model": "deepseek-v4-pro",
-     "effort": "max", "max_tokens": 4000},
+     "effort": "max", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gpt-5.6-sol", "effort": "max"},
+         {"model": "gpt-6-astra", "effort": "max"},
+     )},
     {"id": "cross_market", "label": "跨市场检查", "model": "gemini-3.8-flash",
-     "effort": "high", "max_tokens": 4000},
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gpt-5.6-terra", "effort": "high"},
+         {"model": "glm-5.3-flash", "effort": "high"},
+     )},
     {"id": "lesson_match", "label": "教训匹配", "model": "glm-5.3",
-     "effort": "high", "max_tokens": 3500},
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gpt-5.6-sol", "effort": "high"},
+         {"model": "gpt-6-astra", "effort": "high"},
+     )},
 )
 
 FULL_CONSULT_SYNTHESIS = {
     "model": "gpt-6-astra", "effort": "xhigh", "max_tokens": 0,
+    "fallbacks": (
+        {"model": "deepseek-v4-pro", "effort": "max"},
+        {"model": "grok-4.6", "effort": "xhigh"},
+    ),
 }
 FULL_CONSULT_AUDIT = {
-    "model": "gpt-5.6-sol", "effort": "high", "max_tokens": 4000,
+    "model": "gpt-5.6-sol", "effort": "high", "max_tokens": 0,
+    "fallbacks": (
+        {"model": "deepseek-v4-pro", "effort": "high"},
+        {"model": "glm-5.3", "effort": "high"},
+    ),
 }
 FULL_CONSULT_MAX_WORKERS = 4
 FULL_CONSULT_TIMEOUT = 300
