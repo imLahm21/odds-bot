@@ -30,8 +30,8 @@ from html import escape as _html_escape
 import requests
 from dotenv import load_dotenv
 
-from . import (config, db, api_client, analyzer, llm_client, ghost_publish,
-               wechat_publish, lesson_archive, report_paths)
+from . import (config, db, api_client, analyzer, llm_client, multi_analyzer,
+               ghost_publish, wechat_publish, lesson_archive, report_paths)
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -214,6 +214,10 @@ API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 # 等待用户回复自定义侧重的会话状态：chat_id -> (fixture_id, effort)
 # 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
 _pending_custom: dict[int, tuple[int, str]] = {}
+
+# 全模型会诊的自定义侧重等待态：chat_id -> fixture_id。
+# 与旧版 _pending_custom 分开，避免改变旧版 effort→文本流程。
+_pending_multi_custom: dict[int, int] = {}
 
 # 等待管理员回复「LLM 参数新值」的会话状态：chat_id -> 参数 key（LLM_SETTING_SPECS 键）。
 # 点 /llm 面板某参数按钮(ls:<key>)后置位，下一条纯数字文本被当作新值消费、校验范围后写库。
@@ -2269,12 +2273,17 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
         [{"text": "🎯 预设精算", "callback_data": f"az:{fid}"},
          {"text": "✍️ 自定义侧重", "callback_data": f"ac:{fid}"}],
     ]}
+    if _is_admin(chat_id):
+        kb["inline_keyboard"].append(
+            [{"text": "🧪 全模型交叉会诊", "callback_data": f"am:{fid}"}])
     send(chat_id, "请选择下一步：\n"
                   "🧠 基本面预分析 = 先用轻量模型把两队近况/交锋/赛程/积分榜"
                   "分析成一份可读概述（可选、较慢，可随时停止；跑基本面时仍可发其它命令）；\n"
                   "🎯 预设精算 = 跳过预分析，直接按标准 SOP 跑结果预测；\n"
                   "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求"
                   "（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
+                  "🧪 全模型交叉会诊 = 让模型池中的每个模型分别处理自己的模块，"
+                  "最后由 Astra 合并、Sol 审计（管理员功能）。\n"
                   "🎯/✍️ 选完后再按当前重档模型选择可用的中英双语推理强度。\n"
                   "（预分析不影响精算质量——主 SOP 本就会自行研判原始基本面）", kb)
 
@@ -2464,6 +2473,100 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     path = _archive_report(meta, report, chat_id=chat_id)
     if path:
         send(chat_id, f"📁 报告已归档：{path}")
+
+
+def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
+                   task_id: str = "",
+                   cancel: "threading.Event | None" = None) -> None:
+    """管理员专用全模型交叉会诊。旧版 _run_sop 保持独立不变。"""
+    if not _is_admin(chat_id):
+        send(chat_id, "⛔ 全模型交叉会诊暂仅管理员可用。")
+        return
+    if not analyzer.available():
+        send(chat_id, "未配置 LLM（.env 缺 LLM_ROUTE_ENDPOINTS），无法会诊。")
+        return
+    csv_str, meta = _build_csv(fid)
+    if not csv_str:
+        send(chat_id, f"fixture {fid} 暂无盘口数据，无法会诊")
+        return
+    if cancel is not None and cancel.is_set():
+        send(chat_id, "🛑 已停止全模型交叉会诊。")
+        return
+
+    from . import fundamentals, goals_model
+    try:
+        conn = db.get_conn()
+        try:
+            funds = fundamentals.build_fundamentals(conn, fid)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("全模型基本面拉取失败：%s", exc)
+        funds = "（基本面拉取失败）"
+
+    states = goals_model.states_from_csv(csv_str)
+    goals_block = goals_model.format_states_block(states)
+    labels = {task["id"]: task["label"] for task in config.FULL_CONSULT_TASKS}
+    statuses = {task_id: "⬜" for task_id in labels}
+    statuses.update({"synthesis": "⬜", "audit": "⬜"})
+    title = (f"⏳ 全模型交叉会诊：{meta['home']} vs {meta['away']}\n"
+             f"共 {len(config.FULL_CONSULT_TASKS) + 2} 个模型，自动分配推理强度")
+    stop_kb = {"inline_keyboard": [[
+        {"text": "🛑 停止全模型会诊", "callback_data": f"stopan:{task_id}"}]]}
+
+    def progress_text() -> str:
+        lines = [title, ""]
+        for task in config.FULL_CONSULT_TASKS:
+            lines.append(f"{statuses[task['id']]} {task['label']} "
+                         f"({task['model']} / {task['effort']})")
+        lines.append(f"{statuses['synthesis']} Astra 最终合并")
+        lines.append(f"{statuses['audit']} Sol 最终审计")
+        return "\n".join(lines)
+
+    msg_id = send(chat_id, progress_text(), stop_kb)
+    _llm_audit(chat_id, "full-consult", "heavy", fid=fid)
+
+    def on_progress(kind: str, result: dict | None) -> None:
+        if kind == "module" and result:
+            status = "✅" if result.get("status") == "ok" else "❌"
+            statuses[result["id"]] = status
+        elif kind == "synthesis":
+            statuses["synthesis"] = "🔄"
+        elif kind == "warning":
+            log.warning("全模型会诊预警：%s", result)
+        if msg_id:
+            edit_text(chat_id, msg_id, progress_text(), stop_kb)
+
+    report, summary = multi_analyzer.run(
+        csv_str, funds, meta["home"], meta["away"], meta["league"],
+        goals_block=goals_block, extra_instruction=extra_instruction,
+        cancel=cancel, progress=on_progress,
+    )
+    if cancel is not None and cancel.is_set():
+        if msg_id:
+            edit_text(chat_id, msg_id,
+                      title + "\n\n🛑 已按你的要求停止全模型会诊。", _NO_KB)
+        return
+    if not report:
+        error = summary.get("error", "未产出报告")
+        if msg_id:
+            edit_text(chat_id, msg_id, f"❌ 全模型会诊失败：{error}", _NO_KB)
+        else:
+            send(chat_id, f"❌ 全模型会诊失败：{error}")
+        return
+    statuses["synthesis"] = "✅"
+    statuses["audit"] = "✅" if (summary.get("audit") or {}).get("ok") else "⚠️"
+    if msg_id:
+        edit_text(chat_id, msg_id,
+                  title + "\n\n" + "\n".join(
+                      f"{statuses[t['id']]} {t['label']}"
+                      for t in config.FULL_CONSULT_TASKS)
+                  + f"\n{statuses['synthesis']} Astra 最终合并"
+                  + f"\n{statuses['audit']} Sol 最终审计", _NO_KB)
+    _send_long(chat_id, _md_to_tg(report))
+    path = _archive_report(meta, report, suffix="consult", chat_id=chat_id)
+    if path:
+        send(chat_id, f"📁 全模型会诊报告已归档：{path}")
 
 
 # ─── /parlay 3串1串关（Beta）─────────────────────────────────────────────────
@@ -3387,6 +3490,28 @@ def handle_message(msg: dict) -> None:
                           f"\n发 /llm 查看面板。")
             return
 
+    # 若该 chat 正在等待「全模型会诊自定义侧重」输入，优先消费这条消息。
+    if chat_id in _pending_multi_custom:
+        fid = _pending_multi_custom.pop(chat_id)
+        if text.lstrip("/").lower() in ("cancel", "取消"):
+            send(chat_id, "已取消全模型会诊。")
+            return
+        if text.startswith("/"):
+            send(chat_id, "（已取消上一条全模型侧重输入，改为执行新命令）")
+        elif not text.strip():
+            send(chat_id, "自定义侧重不能为空，已取消本次会诊。")
+            return
+        else:
+            tid = _submit_analysis(
+                chat_id, "全模型会诊", _run_multi_sop,
+                chat_id, fid, text.strip()[:2000])
+            if tid:
+                send(chat_id, f"收到全模型自定义侧重，开始会诊 fixture {fid} …")
+            else:
+                send(chat_id, f"⚠️ 你同时进行的分析已达上限"
+                              f"（{_ANALYSIS_MAX_PER_CHAT} 个）")
+            return
+
     # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
     if chat_id in _pending_custom:
         fid, eff = _pending_custom.pop(chat_id)
@@ -3979,6 +4104,60 @@ def handle_callback(cb: dict) -> None:
         else:
             answer_callback(cb_id,
                             f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），请先停止一个")
+        return
+
+    # 全模型交叉会诊：管理员点击后先选择标准或自定义侧重。
+    if data.startswith("am:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("am:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        fid = int(fid_str)
+        answer_callback(cb_id, "请选择会诊方式")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id, "🧪 全模型交叉会诊：请选择方式\n"
+                      "标准会诊自动按模型能力分配任务和推理强度；\n"
+                      "自定义会诊会把你的侧重同时传给所有专家、Astra和Sol。",
+             {"inline_keyboard": [[
+                 {"text": "🎯 标准会诊", "callback_data": f"amp:{fid}"},
+                 {"text": "✍️ 自定义侧重会诊", "callback_data": f"amc:{fid}"},
+             ]]})
+        return
+
+    if data.startswith("amp:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("amp:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        tid = _submit_analysis(chat_id, "全模型会诊", _run_multi_sop,
+                               chat_id, int(fid_str), "")
+        answer_callback(cb_id, "已开始全模型会诊…" if tid
+                        else f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}）")
+        return
+
+    if data.startswith("amc:"):
+        if not _is_admin(chat_id):
+            answer_callback(cb_id, "仅管理员可用")
+            return
+        fid_str = data[len("amc:"):]
+        if not fid_str.isdigit():
+            answer_callback(cb_id, "场次号错误")
+            return
+        _pending_multi_custom[chat_id] = int(fid_str)
+        answer_callback(cb_id, "请回复自定义侧重")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id,
+             f"✍️ 请发一条消息，描述 fixture {fid_str} 的全模型会诊侧重。\n"
+             "该侧重会传给所有专家、Astra和Sol；不能违反SOP。\n"
+             "例：「重点分析临场异动和大小球，不要泛泛复述基本面」。\n"
+             "（发 /cancel 取消）",
+             {"force_reply": True, "input_field_placeholder": "输入会诊侧重…"})
         return
 
     # 预设精算按钮：不直接跑，先弹推理强度选择（ae:p:<fid>:<effort>）

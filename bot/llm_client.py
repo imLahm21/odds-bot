@@ -1355,6 +1355,155 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     yield ("error", last_err or "LLM 全部端点不可用（请用 /llm 测试/重置端点）")
 
 
+def chat_model(system: str, user: str, model: str, effort: str = "",
+               timeout: int = 0, max_tokens: int = 0,
+               fallback_models: tuple[str, ...] = (),
+               input_metrics: dict | None = None) -> str:
+    """按明确模型调用，不读取 tier 运行时主模型。
+
+    供全模型会诊使用：同一模型仍可在其授权组的多个 endpoint 间故障转移，
+    但默认不会静默切换到另一模型。只有调用方显式提供 fallback_models 时，
+    才会在首字节/正文前进入指定的模型回退链。
+    """
+    if not available():
+        return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
+    if not model:
+        return "LLM 请求失败（未指定模型）"
+    st = get_settings()
+    read_to = int(timeout or st["non_stream_timeout"])
+    max_retries = int(st["max_retries"])
+    request_id = uuid.uuid4().hex[:12]
+    chain = []
+    for item in (model, *fallback_models):
+        if item and item not in chain:
+            chain.append(item)
+    raw_errs: list[str] = []
+    labeled: list[str] = []
+    for position, current_model in enumerate(chain):
+        tok = int(max_tokens or config.llm_max_tokens_for_model(current_model))
+        observation = _input_observation(
+            system, user, current_model, tok, input_metrics)
+        _log_input_observation(request_id, observation)
+        endpoints = _endpoints_by_priority(current_model)
+        if not endpoints:
+            labeled.append(f"{current_model}（没有可用授权端点）")
+            continue
+        for idx, ep in endpoints:
+            br = _breakers[idx]
+            if not br.allow():
+                labeled.append(f"{ep['label']}({current_model})熔断跳过")
+                continue
+            log.info("LLM显式路由 model=%s group=%s endpoint=%s",
+                     current_model, ep["route_group"], ep["label"])
+            payload = _payload(current_model, system, user, tok, effort,
+                               False, ep["route_group"])
+            content, ok, err, was_to, rate_limited, token_exhausted = _do_chat(
+                ep, payload, read_to, max_retries, request_id)
+            if token_exhausted:
+                raw_errs.append(err)
+                labeled.append(f"{ep['label']}({current_model})：{err}")
+                break
+            if not rate_limited:
+                br.record(ok)
+            if ok:
+                return content
+            raw_errs.append(err)
+            labeled.append(f"{ep['label']}({current_model})：{err}")
+        if position + 1 < len(chain):
+            log.warning("显式模型 %s 不可用，切换到调用方指定回退模型 %s",
+                        current_model, chain[position + 1])
+    if not raw_errs:
+        return "LLM 请求失败（指定模型没有可用端点：%s）" % "、".join(chain)
+    return "LLM 请求失败（显式模型链全部不可用）：" + "；".join(labeled)
+
+
+def stream_chat_model(system: str, user: str, model: str, effort: str = "",
+                      max_tokens: int = 0,
+                      fallback_models: tuple[str, ...] = (),
+                      input_metrics: dict | None = None):
+    """按明确模型流式调用；只在首字节前进入调用方指定的模型回退链。"""
+    if not available():
+        yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
+        return
+    if not model:
+        yield ("error", "LLM 请求失败（未指定模型）")
+        return
+    st = get_settings()
+    first_byte_to = int(st["stream_first_byte_timeout"])
+    idle_to = int(st["stream_idle_timeout"])
+    request_id = uuid.uuid4().hex[:12]
+    chain = []
+    for item in (model, *fallback_models):
+        if item and item not in chain:
+            chain.append(item)
+    last_err = None
+    warning_sent = False
+    for position, current_model in enumerate(chain):
+        tok = int(max_tokens or config.llm_max_tokens_for_model(current_model))
+        observation = _input_observation(
+            system, user, current_model, tok, input_metrics)
+        _log_input_observation(request_id, observation)
+        if observation["warn"] and not warning_sent:
+            warning_sent = True
+            yield ("warning", _input_warning_message(observation))
+        endpoints = _endpoints_by_priority(current_model)
+        if not endpoints:
+            last_err = f"{current_model}（没有可用授权端点）"
+            continue
+        produced = False
+        for idx, ep in endpoints:
+            br = _breakers[idx]
+            if not br.allow():
+                last_err = f"{ep['label']}({current_model})熔断中（已跳过）"
+                continue
+            log.info("LLM显式流式路由 model=%s group=%s endpoint=%s",
+                     current_model, ep["route_group"], ep["label"])
+            payload = _payload(current_model, system, user, tok, effort,
+                               True, ep["route_group"])
+            endpoint_produced = False
+            usage_logged = False
+            for ev in _stream_one(ep, payload, first_byte_to, idle_to,
+                                  int(st["max_retries"])):
+                if ev[0] == "delta":
+                    endpoint_produced = True
+                    produced = True
+                    yield ev
+                elif ev[0] == _USAGE_EVENT:
+                    usage_logged = True
+                    _log_usage(request_id, current_model, ep["label"], ev[1])
+                elif ev[0] == "done":
+                    if not usage_logged:
+                        _log_usage(request_id, current_model, ep["label"], None)
+                    br.record(True)
+                    yield ev
+                    return
+                elif ev[0] == "ratelimit":
+                    last_err = ev[1]
+                    break
+                elif ev[0] == _TOKEN_EXHAUSTED_EVENT:
+                    if not usage_logged:
+                        _log_usage(request_id, current_model, ep["label"], None)
+                    last_err = ev[1]
+                    if endpoint_produced:
+                        yield ("error", ev[1])
+                        return
+                    break
+                elif ev[0] == "error":
+                    br.record(False)
+                    last_err = ev[1]
+                    if endpoint_produced:
+                        yield ev
+                        return
+                    break
+            if produced:
+                yield ("error", last_err or "LLM 流式请求中断")
+                return
+        if position + 1 < len(chain):
+            log.warning("显式流式模型 %s 不可用，切换到调用方指定回退模型 %s",
+                        current_model, chain[position + 1])
+    yield ("error", last_err or "LLM 显式模型链全部不可用")
+
+
 # ─── 连通性探针（最小 chat 请求；不计入 Breaker 统计）───────────────────────
 # 探针结果留痕：idx → 上次测试结果 dict（含 ts=epoch 秒）。供 /llm 面板显示「上次测试」，
 # 让「测过 404 但没进真实流量、熔断状态仍正常」的困惑得到解释。故意与 Breaker 分离——

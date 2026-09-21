@@ -297,6 +297,18 @@ def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:
             new_value = upgrade_map.get(old_value)
             if new_value and new_value != old_value:
                 updates.append((new_value, now, key))
+
+    # 已退役模型名的全局迁移不受「完整旧方案是否命中」影响。
+    # 迁移目标可能刚由完整旧方案写入 updates，因此要同时检查当前值
+    # 和待写入值；这样旧方案快照、用户手动选择和 fallback 槽位都能升级。
+    pending = {key: value for value, _ts, key in updates}
+    for key in set(_runtime_defaults()):
+        source = str(pending.get(key, current.get(key, "")))
+        new_value = config.LLM_RETIRED_MODEL_UPGRADE_MAP.get(source)
+        if not new_value or new_value == source:
+            continue
+        pending[key] = new_value
+    updates = [(value, now, key) for key, value in pending.items()]
     if updates:
         conn.executemany(
             "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=?",

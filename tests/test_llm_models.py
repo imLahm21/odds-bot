@@ -51,7 +51,7 @@ PRIMARY = {
     "model_heavy": "gpt-6-astra",
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "gpt-5.6-terra",
-    "model_balanced_visitor": "deepseek-v4-flash",
+    "model_balanced_visitor": "deepseek-v4.1-flash",
     "model_light": "gpt-5.6-luna",
     "model_light_visitor": "gpt-5.6-luna",
 }
@@ -81,7 +81,7 @@ RETIRED_UPGRADED = {
     "model_heavy": "grok-4.6",
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "grok-4.5",
-    "model_balanced_visitor": "deepseek-v4-flash",
+    "model_balanced_visitor": "deepseek-v4.1-flash",
     "model_light": "gpt-5.6-luna",
     "model_light_visitor": "gpt-5.6-luna",
 }
@@ -100,7 +100,7 @@ V1_FALLBACK_UPGRADED = {
     "model_heavy": "grok-4.6",
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "grok-4.5",
-    "model_balanced_visitor": "deepseek-v4-flash",
+    "model_balanced_visitor": "deepseek-v4.1-flash",
     "model_light": "gpt-5.6-luna",
     "model_light_visitor": "gpt-5.6-luna",
 }
@@ -174,7 +174,6 @@ class TestModelProfile(unittest.TestCase):
                 "deepseek-v4-pro": ("ik_deepseek",),
                 "deepseek-v4.1-flash": ("ik_deepseek",),
                 "gpt-5.6-terra": ("ik_gpt",),
-                "deepseek-v4-flash": ("ik_deepseek",),
                 "glm-5.3-flash": ("ik_glm",),
                 "grok-4.5": ("ik_grok",),
                 "gpt-5.6-luna": ("openai_gpt",),
@@ -218,11 +217,12 @@ class TestModelProfile(unittest.TestCase):
             "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
             "gpt-5.6-terra", "glm-5.3-flash",
         })
-        self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4-flash",
+        self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "glm-5.3-flash", "grok-4.5"})
         self.assertEqual(light, {"gpt-5.6-luna"})
         self.assertEqual(heavy & balanced,
-                         {"gpt-5.6-terra", "glm-5.3-flash"})
+                         {"gpt-5.6-terra", "deepseek-v4.1-flash",
+                          "glm-5.3-flash"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 

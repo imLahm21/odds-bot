@@ -83,6 +83,11 @@ When `TELEGRAM_BOT_TOKEN` is set, the daemon also runs a TG bot with inline-butt
 | `/analyze` | Pre-match projection: preview fundamentals + odds movement, then run SOP (preset or custom focus) |
 | `/review` | Post-match review: fetch final score + odds movement → LLM attribution |
 
+Administrators also see `🧪 Full-model cross consultation` under `/analyze`.
+It assigns the configured model pool to separate modules, then uses Astra to
+compose and Sol to audit the report. The consultation supports an optional
+custom focus and archives to a separate `_consult.md` file.
+
 **Two-tier permissions**: the bot only responds to whitelisted chat IDs. `TELEGRAM_ALLOWED_CHAT_IDS`
 are users who can query/analyze; `TELEGRAM_ADMIN_CHAT_IDS` are admins who can change config. If ADMIN
 is unset, all ALLOWED users are treated as admins.

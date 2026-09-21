@@ -374,8 +374,8 @@ LLM_EFFORT_DEFAULT = "high"
 # 密钥组不在这里写 —— 由 llm_route_groups_for_model 按模型名前缀推导（见下文）。
 #   tiers —— 允许该模型出现在哪些档位的可选池里。
 #   efforts —— 该模型接受的 reasoning_effort 原始值；TG 只显示这些选项，请求层再兜底过滤。
-# 默认/回退槽不因增加候选而改变。Terra 与 GLM Flash 为保留现有 balanced 默认/回退，
-# 同时开放给 heavy；light 仍严格隔离，防止重模型进入走地 1min 循环。
+# 默认/回退槽不因增加候选而改变。Terra、DeepSeek V4.1 Flash 与 GLM Flash
+# 同时开放给 heavy 和 balanced；light 仍严格隔离，防止重模型进入走地 1min 循环。
 # light 档跑在走地 1min 广播循环里、是同步阻塞调用，只放最快的模型——
 # 放推理重档进去会让单次研判几十秒，拖住下一轮抓取。
 # 不同厂商的档位不是同义枚举，必须按模型声明分开维护。不要为了按钮整齐
@@ -411,15 +411,13 @@ LLM_MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy",),
                            "efforts": _EFFORT_GEMINI_38},
     "deepseek-v4.1-flash": {
-        "label": "DeepSeek V4.1 Flash", "tiers": ("heavy",),
+        "label": "DeepSeek V4.1 Flash", "tiers": ("heavy", "balanced"),
         "efforts": _EFFORT_DEEPSEEK,
     },
     # ── 中型池：基本面预分析 + SEO/科普 + 教训提炼 ──
     "gpt-5.6-terra":    {"label": "GPT-5.6 Terra",
                            "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_OPENAI_TERRA},
-    "deepseek-v4-flash": {"label": "DeepSeek V4 Flash", "tiers": ("balanced",),
-                             "efforts": _EFFORT_DEEPSEEK},
     "glm-5.3-flash":    {"label": "GLM-5.3 Flash",
                            "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GLM_53_FLASH},
@@ -472,7 +470,7 @@ LLM_TIER_MODELS: dict[str, dict] = {
                  "visitor_default": "deepseek-v4-pro"},
     "balanced": {"label": "平衡·基本面/SEO",
                  "default": "gpt-5.6-terra",
-                 "visitor_default": "deepseek-v4-flash"},
+                 "visitor_default": "deepseek-v4.1-flash"},
     "light":    {"label": "轻档·走地",
                  "default": "gpt-5.6-luna",
                  "visitor_default": "gpt-5.6-luna"},
@@ -505,7 +503,7 @@ LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     },
     "balanced": {
         "admin": "grok-4.5",        # 主 terra 走 ik_gpt → 回退落 ik_grok
-        "visitor": "glm-5.3-flash",  # 主 deepseek-v4-flash → 回退落 ik_glm
+        "visitor": "glm-5.3-flash",  # 主 deepseek-v4.1-flash → 回退落 ik_glm
     },
     "light": {
         "admin": "",
@@ -597,7 +595,7 @@ def llm_models_in_group(group: str) -> list[str]:
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
 # 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
-LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-08-tier-pools-partitioned-v2"
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-21-tier-pools-partitioned-v3"
 
 # 精确识别上一版方案，解决 deepseek-v4-flash 在上一版中同时可能表示主轻档或
 # 回退轻档的歧义：主方案升级到 Luna，回退方案升级到 GLM Flash。
@@ -659,7 +657,7 @@ LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
         "gpt-5.4-mini": "grok-4.5",
     },
     "model_balanced_visitor": {
-        "gpt-5.4-mini": "deepseek-v4-flash",
+        "gpt-5.4-mini": "deepseek-v4.1-flash",
     },
     "model_light": {
         "gpt-5.4-mini": "gpt-5.6-luna",
@@ -668,6 +666,44 @@ LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
         "gpt-5.4-mini": "gpt-5.6-luna",
     },
 }
+
+# V4 Flash 更名为 V4.1 Flash。迁移函数会对所有运行时主/回退槽位
+# 统一替换；历史方案快照仍保留旧值，用于识别旧数据库版本。
+LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
+    "deepseek-v4-flash": "deepseek-v4.1-flash",
+}
+
+# 全模型交叉会诊的固定任务。该模式不读取 /llm 面板当前的 tier 主模型，
+# 而是按模型能力把每个模型固定到一个可审计的职责；密钥仍按模型家族路由。
+FULL_CONSULT_TASKS: tuple[dict, ...] = (
+    {"id": "data_audit", "label": "数据审计", "model": "gpt-5.6-luna",
+     "effort": "low", "max_tokens": 1600},
+    {"id": "fundamentals", "label": "基本面主分析", "model": "gpt-5.6-terra",
+     "effort": "medium", "max_tokens": 4000},
+    {"id": "fundamentals_review", "label": "基本面复核", "model": "glm-5.3-flash",
+     "effort": "high", "max_tokens": 3000},
+    {"id": "market_primary", "label": "盘口主分析", "model": "grok-4.6",
+     "effort": "xhigh", "max_tokens": 5000},
+    {"id": "market_challenge", "label": "盘口反方分析", "model": "grok-4.5",
+     "effort": "high", "max_tokens": 3500},
+    {"id": "numeric_summary", "label": "数字整理", "model": "deepseek-v4.1-flash",
+     "effort": "high", "max_tokens": 4000},
+    {"id": "risk_review", "label": "风险复核", "model": "deepseek-v4-pro",
+     "effort": "max", "max_tokens": 4000},
+    {"id": "cross_market", "label": "跨市场检查", "model": "gemini-3.8-flash",
+     "effort": "high", "max_tokens": 4000},
+    {"id": "lesson_match", "label": "教训匹配", "model": "glm-5.3",
+     "effort": "high", "max_tokens": 3500},
+)
+
+FULL_CONSULT_SYNTHESIS = {
+    "model": "gpt-6-astra", "effort": "xhigh", "max_tokens": 0,
+}
+FULL_CONSULT_AUDIT = {
+    "model": "gpt-5.6-sol", "effort": "high", "max_tokens": 4000,
+}
+FULL_CONSULT_MAX_WORKERS = 4
+FULL_CONSULT_TIMEOUT = 300
 
 # ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
 # 这里是这 10 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、

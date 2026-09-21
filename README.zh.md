@@ -131,11 +131,11 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 | 档位 | 用途 | 可选模型池 | 管理员主模型 | 访客主模型 |
 |------|------|------------------------|--------------|------------|
 | 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-5.6-sol` `gemini-3.8-flash` `glm-5.3` `grok-4.6` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
-| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-5.6-terra` `deepseek-v4-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4-flash` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-5.6-terra` `deepseek-v4.1-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4.1-flash` |
 | 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
 
 **按用途分池**：`/llm` 面板的模型选择器只列目标档允许的模型。为保留现有 balanced
-默认/回退，`gpt-5.6-terra` 与 `glm-5.3-flash` 同时开放给 heavy 和 balanced；light
+默认/回退，`gpt-5.6-terra`、`deepseek-v4.1-flash` 与 `glm-5.3-flash` 同时开放给 heavy 和 balanced；light
 仍严格隔离，不会把重档推理模型塞进走地 1min 循环。加新模型 / 调整分档只改 `bot/config.py` 的
 `LLM_MODELS`（改完需重启一次；之后面板内切换免重启）。
 
@@ -147,6 +147,12 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 **回退模型**默认刻意选与主模型**不同密钥组**的同档模型（如重档管理员主 `gpt-6-astra`
 走 `ik_gpt`、回退 `grok-4.6` 走 `ik_grok`），这样主组整组挂掉（限流/密钥失效/熔断）
 时才有逃生价值。轻型池只有一个模型，故轻档回退默认留空（不做跨档逃生）。
+
+**全模型交叉会诊**：管理员在 `/analyze` 中可选择 `🧪 全模型交叉会诊`，再选择标准会诊或
+自定义侧重会诊。该模式固定调用模型池中的 11 个模型：各模型只处理自己的模块，最后由
+`gpt-6-astra` 合并报告、`gpt-5.6-sol` 审计。它使用每个模型自己的推理强度，不弹统一强度按钮；
+会诊报告使用 `_consult.md` 后缀归档，不覆盖旧版 `_report.md`。专家失败会在报告末尾的
+「模型会诊记录」中标出。
 
 - **推理强度**：按钮采用“中文 / API 原值”，并按当前模型的独立能力表过滤；访客只可见
   `关闭 / none`、`低 / low`、`普通 / medium`、`高 / high` 中该模型实际登记的档位。
