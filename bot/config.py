@@ -7,6 +7,8 @@
 
 import os
 import re
+import logging
+import math
 
 from dotenv import load_dotenv
 
@@ -14,6 +16,91 @@ from dotenv import load_dotenv
 # 这里必须自己先加载 .env，否则模块体里 os.getenv(...) 读到的全是空
 # （TELEGRAM_BROADCAST_TARGETS 曾因此读不到、/publish 后不弹通知按钮）。
 load_dotenv()
+
+# ─── TypeSafe / Jev：独立于现有 LLM provider 路由 ───────────────────────────
+_typesafe_log = logging.getLogger("odds_bot.config")
+TYPESAFE_STARTUP_ISSUES: list[str] = []
+
+
+def _typesafe_mode(name: str) -> str:
+    value = os.getenv(name, "off").strip().lower()
+    if value in {"off", "shadow", "active"}:
+        return value
+    TYPESAFE_STARTUP_ISSUES.append(f"{name} 无效，已设为 off")
+    return "off"
+
+
+def _typesafe_confidence(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        TYPESAFE_STARTUP_ISSUES.append(f"{name} 不是有效的 0..1 数值")
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        TYPESAFE_STARTUP_ISSUES.append(f"{name} 不在 0..1 范围内")
+        return None
+    return value
+
+
+def _typesafe_positive_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except (AttributeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _typesafe_nonnegative_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (AttributeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "").strip()
+TYPESAFE_BASE_URL = os.getenv("TYPESAFE_BASE_URL", "").strip()
+TYPESAFE_MODEL = (
+    os.getenv("TYPESAFE_MODEL", "jev-1.13.0").strip()
+    or "jev-1.13.0"
+)
+TYPESAFE_HTTP_TIMEOUT_SECONDS = _typesafe_positive_float(
+    "TYPESAFE_HTTP_TIMEOUT_SECONDS", 5.0)
+TYPESAFE_MAX_RETRIES = _typesafe_nonnegative_int("TYPESAFE_MAX_RETRIES", 2)
+TYPESAFE_RETRY_BUDGET_SECONDS = _typesafe_positive_float(
+    "TYPESAFE_RETRY_BUDGET_SECONDS", 12.0)
+
+TYPESAFE_LESSON_MODE = _typesafe_mode("TYPESAFE_LESSON_MODE")
+TYPESAFE_DECISION_MODE = _typesafe_mode("TYPESAFE_DECISION_MODE")
+TYPESAFE_LESSON_MIN_CONFIDENCE = _typesafe_confidence(
+    "TYPESAFE_LESSON_MIN_CONFIDENCE")
+TYPESAFE_DECISION_MIN_CONFIDENCE = _typesafe_confidence(
+    "TYPESAFE_DECISION_MIN_CONFIDENCE")
+
+for _feature, _mode, _threshold in (
+    ("lesson", TYPESAFE_LESSON_MODE, TYPESAFE_LESSON_MIN_CONFIDENCE),
+    ("decision", TYPESAFE_DECISION_MODE, TYPESAFE_DECISION_MIN_CONFIDENCE),
+):
+    if _mode == "active" and _threshold is None:
+        _issue = (f"TYPESAFE_{_feature.upper()}_MODE=active 缺少经评测的 "
+                  f"TYPESAFE_{_feature.upper()}_MIN_CONFIDENCE，已降级为 shadow")
+        TYPESAFE_STARTUP_ISSUES.append(_issue)
+        if _feature == "lesson":
+            TYPESAFE_LESSON_MODE = "shadow"
+        else:
+            TYPESAFE_DECISION_MODE = "shadow"
+
+if ((TYPESAFE_LESSON_MODE != "off" or TYPESAFE_DECISION_MODE != "off")
+        and not TYPESAFE_API_KEY):
+    TYPESAFE_STARTUP_ISSUES.append(
+        "TypeSafe 模式已开启但未配置 TYPESAFE_API_KEY，功能不可用并将走现有 fallback"
+    )
+for _issue in TYPESAFE_STARTUP_ISSUES:
+    _typesafe_log.warning("TypeSafe 启动检查：%s", _issue)
+
 
 # ─── API-Football 端点 ──────────────────────────────────────────────────────
 BASE_URL = "https://v3.football.api-sports.io"

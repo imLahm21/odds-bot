@@ -3,6 +3,7 @@
 #   pip install -r requirements-bot.txt
 requests==2.34.2
 python-dotenv==1.2.2
+typesafe-sdk==0.7.1
 apscheduler==3.11.2
 
 # Ghost 博客发布（/publish 命令）
