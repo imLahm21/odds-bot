@@ -10,13 +10,23 @@ import os
 import re
 import math
 import logging
+import threading
 
 from dotenv import load_dotenv
 
-from . import config, llm_client, goals_model
+from . import config, llm_client, goals_model, typesafe_decisions
 
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
+
+
+def _start_typesafe_shadow(target, *args, name: str) -> None:
+    try:
+        threading.Thread(
+            target=target, args=args, name=name, daemon=True
+        ).start()
+    except Exception as exc:
+        log.warning("无法启动 TypeSafe 影子线程（%s）", type(exc).__name__)
 
 # 请求头清洗迁至 llm_client.clean_header_value；此处保留别名兼容旧引用。
 _clean_header_value = llm_client.clean_header_value
@@ -565,7 +575,7 @@ def load_lesson_route_context() -> str:
     return _lesson_route_cache
 
 
-def route_lesson(review_report: str, home: str, away: str,
+def _route_lesson_llm(review_report: str, home: str, away: str,
                  league: str) -> tuple[dict | None, str | None]:
     """判定新复盘教训应归入哪个 feedback_*.md 主题。使用重档模型。
 
@@ -629,6 +639,44 @@ def route_lesson(review_report: str, home: str, away: str,
         "new_topic_slug": (str(d.get("new_topic_slug")).strip()
                            if d.get("new_topic_slug") else None),
     }, None
+
+
+def route_lesson(review_report: str, home: str, away: str,
+                 league: str) -> tuple[dict | None, str | None]:
+    """保留原公开路由接口；Jev 仅在独立模式启用时参与。"""
+    mode = config.TYPESAFE_LESSON_MODE
+    if mode == "active":
+        judgment = typesafe_decisions.route_lesson_topic(
+            review_report,
+            typesafe_decisions.load_lesson_topics(),
+            home,
+            away,
+            league,
+        )
+        threshold = config.TYPESAFE_LESSON_MIN_CONFIDENCE
+        if (judgment is not None and threshold is not None
+                and not judgment.need_new_topic
+                and judgment.recommended
+                and judgment.confidence >= threshold):
+            return {
+                "recommended": judgment.recommended,
+                "candidates": list(judgment.candidates),
+                "reason": "TypeSafe 高置信度候选，管理员最终确认",
+                "need_new_topic": False,
+                "new_topic_slug": None,
+            }, None
+        # New-topic and uncertain judgments stay on the established LLM route.
+        return _route_lesson_llm(review_report, home, away, league)
+
+    baseline = _route_lesson_llm(review_report, home, away, league)
+    if mode == "shadow":
+        _start_typesafe_shadow(
+            typesafe_decisions.log_lesson_shadow,
+            review_report,
+            baseline[0],
+            name="typesafe-lesson-shadow",
+        )
+    return baseline
 
 
 def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
@@ -1270,7 +1318,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
 
 
 # ─── 串关(/parlay)用：从单场精算报告抽出结构化投注决策 ──────────────────────
-def extract_decision(report: str, home: str = "", away: str = "",
+def _extract_decision_llm(report: str, home: str = "", away: str = "",
                      visitor: bool = False) -> dict | None:
     """从一份单场精算报告（含第 8 节投注决策）抽出结构化决策，供串关裁判用。
 
@@ -1392,3 +1440,39 @@ def extract_decision(report: str, home: str = "", away: str = "",
         out["warnings"].append(msg)
         log.warning("extract_decision %s", msg)
     return out
+
+
+def extract_decision(report: str, home: str = "", away: str = "",
+                     visitor: bool = False) -> dict | None:
+    """保留串关抽取契约，并按独立 TypeSafe 模式选择路径。"""
+    mode = config.TYPESAFE_DECISION_MODE
+    if mode == "active":
+        result = typesafe_decisions.resolve_decision(report or "")
+        if result is not None:
+            deterministic = result.source in {
+                "explicit_id", "exact_name", "explicit_pass", "deterministic_pass",
+            }
+            threshold = config.TYPESAFE_DECISION_MIN_CONFIDENCE
+            confident_jev = (
+                result.source == "jev"
+                and threshold is not None
+                and result.confidence is not None
+                and result.confidence >= threshold
+            )
+            if deterministic or confident_jev:
+                resolved = typesafe_decisions.decision_to_extract_dict(result)
+                if resolved is not None:
+                    return resolved
+        return _extract_decision_llm(
+            report, home, away, visitor=visitor)
+
+    baseline = _extract_decision_llm(
+        report, home, away, visitor=visitor)
+    if mode == "shadow":
+        _start_typesafe_shadow(
+            typesafe_decisions.log_decision_shadow,
+            report or "",
+            baseline,
+            name="typesafe-decision-shadow",
+        )
+    return baseline
