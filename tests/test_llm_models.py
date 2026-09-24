@@ -168,6 +168,9 @@ class TestModelProfile(unittest.TestCase):
             {
                 "gpt-6-astra": ("ik_gpt",),
                 "gpt-5.6-sol": ("ik_gpt",),
+                "gpt-6-sol": ("ik_gpt",),
+                "grok-4.7": ("ik_grok",),
+                "gpt-6-luna": ("openai_gpt",),
                 "gemini-3.8-flash": ("ik_gemini",),
                 "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
@@ -213,16 +216,18 @@ class TestModelProfile(unittest.TestCase):
         balanced = set(config.llm_tier_eligible_models("balanced"))
         light = set(config.llm_tier_eligible_models("light"))
         self.assertEqual(heavy, {
-            "gpt-6-astra", "gpt-5.6-sol", "gemini-3.8-flash", "glm-5.3",
+            "gpt-6-astra", "gpt-6-sol", "gemini-3.8-flash", "glm-5.3",
             "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
-            "gpt-5.6-terra", "glm-5.3-flash",
+            "gpt-5.6-terra", "glm-5.3-flash", "grok-4.7",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
-                                    "glm-5.3-flash", "grok-4.5"})
-        self.assertEqual(light, {"gpt-5.6-luna"})
+                                    "glm-5.3-flash", "grok-4.5",
+                                    "gpt-6-sol", "grok-4.6"})
+        self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
+        self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {"gpt-5.6-terra", "deepseek-v4.1-flash",
-                          "glm-5.3-flash"})
+                          "glm-5.3-flash", "gpt-6-sol", "grok-4.6"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 
@@ -239,6 +244,12 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(config.llm_model_efforts("gpt-5.6-sol"),
                          ("none", "low", "medium", "high", "xhigh", "max",
                           "ultra"))
+        self.assertEqual(config.llm_model_efforts("gpt-6-sol"),
+                         config.llm_model_efforts("gpt-5.6-sol"))
+        self.assertEqual(config.llm_model_efforts("grok-4.7"),
+                         config.llm_model_efforts("grok-4.6"))
+        self.assertEqual(config.llm_model_efforts("gpt-6-luna"),
+                         config.llm_model_efforts("gpt-5.6-luna"))
         self.assertEqual(config.llm_model_efforts("gpt-5.6-terra"),
                          ("none", "low", "medium", "high", "xhigh", "max"))
         self.assertEqual(config.llm_model_efforts("glm-5.3"),
@@ -1284,8 +1295,8 @@ class TestModelProfile(unittest.TestCase):
             state = db.get_llm_runtime_state(conn)
             # 未登记的私有模型原样保留（不因档位校验被抹掉）
             self.assertEqual(state["model_heavy"], "custom-private-model")
-            # 同批里已登记但跨档的值（gpt-5.6-sol 现属重档）被拉回本档默认
-            self.assertEqual(state["model_balanced"], "gpt-5.6-terra")
+            # A saved Sol choice is upgraded while a private model is preserved.
+            self.assertEqual(state["model_balanced"], "gpt-6-sol")
         finally:
             conn.close()
 

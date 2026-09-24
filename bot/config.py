@@ -397,14 +397,16 @@ _EFFORT_GEMINI_38 = ("low", "medium", "high")
 
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
-    # 既有五个模型保持原顺序，兼容部署前已发出的索引型旧面板按钮。
+    # Existing consultation tasks may still use models with no menu tier.
     "gpt-6-astra":      {"label": "GPT-6 Astra", "tiers": ("heavy",),
                            "efforts": _EFFORT_OPENAI_ASTRA},
-    "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": ("heavy",),
+    "gpt-6-sol":        {"label": "GPT-6 Sol", "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_OPENAI_SOL},
+    "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": (),
                            "efforts": _EFFORT_OPENAI_SOL},
     "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
                            "efforts": _EFFORT_GLM_53},
-    "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy",),
+    "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GROK_46},
     "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
                            "efforts": _EFFORT_DEEPSEEK},
@@ -423,8 +425,12 @@ LLM_MODELS: dict[str, dict] = {
                            "efforts": _EFFORT_GLM_53_FLASH},
     "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
                            "efforts": _EFFORT_GROK_45},
+    "grok-4.7":         {"label": "Grok 4.7", "tiers": ("heavy",),
+                           "efforts": _EFFORT_GROK_46},
     # ── 轻型池：走地实时研判 ──
     "gpt-5.6-luna":     {"label": "GPT-5.6 Luna", "tiers": ("light",),
+                           "efforts": _EFFORT_OPENAI_LUNA},
+    "gpt-6-luna":      {"label": "GPT-6 Luna", "tiers": ("light",),
                            "efforts": _EFFORT_OPENAI_LUNA},
 }
 
@@ -495,7 +501,7 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
 # ⚠️ 回退模型同样必须落在【本档】池内——回退是「换模型不换档」，
 #    跨档回退会让走地档跑起重档推理（几十秒）或让主精算掉到轻档模型。
 #    刻意选与主模型【不同密钥组】的模型：主组整组挂掉（限流/密钥失效）时才有逃生价值。
-# 轻型池只有 gpt-5.6-luna 一个模型，故轻档无同档回退可选，留空 = 不做跨组逃生。
+# Both light models share one key group; leave fallback unset by default.
 LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     "heavy": {
         "admin": "grok-4.6",        # 主 astra 走 ik_gpt → 回退落 ik_grok
@@ -550,9 +556,10 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
 }
 
 # 显式覆盖：走官方供应商而非中转的少数模型。只有这里需要手写。
-# gpt-5.6-luna 走 OpenAI 官方，家族推导会把它错归到 ik_gpt，故必须覆盖。
+# Both Luna models use OpenAI's official key group.
 LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
     "gpt-5.6-luna": ("openai_gpt",),
+    "gpt-6-luna": ("openai_gpt",),
 }
 
 
@@ -595,7 +602,7 @@ def llm_models_in_group(group: str) -> list[str]:
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
 # 旧主模型映射到新主模型，旧回退模型映射到新回退模型；未知自定义值保持不动。
-LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-21-tier-pools-partitioned-v3"
+LLM_TIER_MODEL_PROFILE_VERSION = "2026-09-24-tier-pools-new-models-v4"
 
 # 精确识别上一版方案，解决 deepseek-v4-flash 在上一版中同时可能表示主轻档或
 # 回退轻档的歧义：主方案升级到 Luna，回退方案升级到 GLM Flash。
@@ -669,8 +676,10 @@ LLM_TIER_MODEL_UPGRADE_MAP: dict[str, dict[str, str]] = {
 
 # V4 Flash 更名为 V4.1 Flash。迁移函数会对所有运行时主/回退槽位
 # 统一替换；历史方案快照仍保留旧值，用于识别旧数据库版本。
+# Sol is retired from tier menus but remains registered for consultation tasks.
 LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
     "deepseek-v4-flash": "deepseek-v4.1-flash",
+    "gpt-5.6-sol": "gpt-6-sol",
 }
 
 # 全模型交叉会诊的固定任务。该模式不读取 /llm 面板当前的 tier 主模型，
