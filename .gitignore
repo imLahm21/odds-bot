@@ -59,3 +59,7 @@ Thumbs.db
 
 # 规则审查清单（本地工作文档，不进 git）
 CLAUDE_rules_audit.md
+
+# 本地 Jev 更新计划副本
+jev调用.md
+jev调研.md
