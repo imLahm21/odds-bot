@@ -1585,7 +1585,7 @@ def _lesson_topic_keyboard(token: str, route: dict) -> dict:
 
 
 def _lesson_step_route(chat_id: int, message_id: int, token: str) -> None:
-    """第1步：跑 route_lesson（重档模型），列候选主题让管理员选。"""
+    """跑既有路由并列候选按钮；analyzer 的 shadow 影子结果不改按钮数据。"""
     with _lesson_lock:
         info = _lesson_pending.get(token)
     if not info:
@@ -2742,7 +2742,7 @@ def _run_parlay(chat_id: int, fids: list[int], effort: str = "",
         if path:
             send(chat_id, f"📁 腿 {i+1} 报告已归档：{path}")
 
-        # 决策抽取继续继承调用者角色，访客不得偷用管理员 GPT 密钥组。
+        # analyzer 保持串关 dict 契约；shadow 异步且不改输入，LLM fallback 仍传 visitor。
         _llm_audit(chat_id, "parlay-extract", "balanced", fid=fid)
         dec = analyzer.extract_decision(
             report, meta["home"], meta["away"], visitor=_visitor)

@@ -338,6 +338,18 @@ LLM_INPUT_WARN_TOKENS=240000
 # 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。
 # 保存后先运行：./venv/bin/python -m bot.llm_client
 # 静态检查不会显示密钥；issues 应为空，需要使用的 group_counts 都应至少为 1。
+# 可选：TypeSafe/Jev 独立于 LLM_ROUTE_ENDPOINTS；评测及单独批准前保持 off。
+# TYPESAFE_API_KEY=
+# TYPESAFE_BASE_URL=
+# TYPESAFE_MODEL=jev-1.13.0
+# TYPESAFE_HTTP_TIMEOUT_SECONDS=5
+# TYPESAFE_MAX_RETRIES=2
+# TYPESAFE_RETRY_BUDGET_SECONDS=12
+TYPESAFE_LESSON_MODE=off
+TYPESAFE_DECISION_MODE=off
+# 置信度阈值不提供默认值；active 未配置经评测阈值时启动会降级为 shadow。
+# TYPESAFE_LESSON_MIN_CONFIDENCE=
+# TYPESAFE_DECISION_MIN_CONFIDENCE=
 
 # 可选：把精算报告一键发布到 Ghost 博客（/publish）
 # GHOST_ADMIN_API_KEY=id:secret     # Ghost 后台 Integrations 里生成
@@ -345,6 +357,17 @@ LLM_INPUT_WARN_TOKENS=240000
 # GHOST_DEFAULT_VISIBILITY=paid     # public / members / paid（付费墙：第7节结论付费解锁）
 EOF
 ```
+
+TypeSafe/Jev 是独立的可选决策服务，不属于 LLM 路由。两个模式默认均为 off，不会发起请求或产生费用。
+Shadow 只记录比较，现有 LLM 结果仍然生效。Active 必须配置经评测的置信度阈值，否则启动时会降级为 shadow。
+Jev 只能选择候选 ID，不能生成赔率、概率、edge 或注额。API Key 只放在服务器；离线评测和单独批准前不要启用 active。
+
+`TYPESAFE_DECISION_MODE` 作用于报告生成后的第 8 节选中项：
+- `off`：报告保持模型自己的选择。
+- `shadow`：报告不变，后台让 Jev 选一次，只记 `TYPESAFE_SHADOW` 日志（哈希 + 候选 ID，不含报告正文）。
+- `active`：代码筛出 eligible 且 edge>0 的候选（无则直接 pass、不调 Jev），Jev 在其中 + PASS 里选；
+  Jev 失败或置信度低于阈值时退回 edge 最高项，报告注明「Jev 未参与」。注额由代码按 SOP 7.5 重算，
+  模型原选择改名为「模型初选」保留，第 8 节写入 `decision_final` 注释供 `/parlay` 读取（TG/发布出口会剥掉）。
 
 > 不需要 Telegram bot 就只填 `APIFOOTBALL_KEY`，守护进程会自动退化为纯调度器模式。
 > `odds.db` 会在首次运行时自动创建，无需手动建。
