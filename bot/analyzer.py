@@ -28,6 +28,36 @@ def _start_typesafe_shadow(target, *args, name: str) -> None:
     except Exception as exc:
         log.warning("无法启动 TypeSafe 影子线程（%s）", type(exc).__name__)
 
+
+def finalize_decision(report: str, home: str = "", away: str = "",
+                      league: str = "") -> str:
+    """生成时定第 8 节选中项（TYPESAFE_DECISION_MODE）：
+      off    —— 原样返回，沿用报告模型自己的选择；
+      shadow —— 原样返回，后台跑一遍 Jev 选定并记 TYPESAFE_SHADOW 日志；
+      active —— 代码筛 eligible 且 edge>0 的候选 → Jev 在其中 + PASS 选定
+                → Jev 失败/低置信度退回 edge 最高 → 改写第 8 节并嵌入 decision_final。
+    任何异常都退回原报告，不影响精算主流程。"""
+    mode = config.TYPESAFE_DECISION_MODE
+    if mode == "off" or not (report or "").strip():
+        return report
+    if mode == "shadow":
+        _start_typesafe_shadow(
+            typesafe_decisions.log_selection_shadow, report, home, away, league,
+            name="typesafe-select-shadow")
+        return report
+    try:
+        selection = typesafe_decisions.select_decision(
+            report, home, away, league,
+            min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE)
+        typesafe_decisions.log_selection(report, selection)
+        if selection is None:
+            log.warning("第 8 节候选表无法解析，保留报告模型的选择")
+            return report
+        return typesafe_decisions.apply_selection(report, selection)
+    except Exception as exc:
+        log.warning("生成时选定失败（%s），保留原报告", type(exc).__name__)
+        return report
+
 # 请求头清洗迁至 llm_client.clean_header_value；此处保留别名兼容旧引用。
 _clean_header_value = llm_client.clean_header_value
 
@@ -163,8 +193,9 @@ _MANIFEST_OPEN = "<!-- rules_manifest 规则版本（可追溯性，审查第 35
 # 两种形态都吃掉：
 #   新：`<!-- rules_manifest … {json} -->` 单个注释
 #   旧：`<!-- 规则版本…-->` 后紧跟若干 `> **规则集**/> 内容指纹/> ⚠️ …` 引用行
+# 第 8 节的 `<!-- decision_final {json} -->`（生成时选定的机器可读结果）同理剥掉。
 _MANIFEST_RE = re.compile(
-    r"(?m)^[ \t]*<!--[ \t]*(?:rules_manifest|规则版本)[\s\S]*?-->[ \t]*$\n?"
+    r"(?m)^[ \t]*<!--[ \t]*(?:rules_manifest|规则版本|decision_final)[\s\S]*?-->[ \t]*$\n?"
     r"(?:^[ \t]*>.*(?:规则集|内容指纹|超预算丢弃|缺失文件).*$\n?)*")
 
 
@@ -342,6 +373,7 @@ def analyze(csv_text: str, fundamentals: str,
     report = _call_llm(system, user, effort, tier="heavy", visitor=visitor,
                        input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
+        report = finalize_decision(report, home, away, league)
         fund = fundamentals or ""
         mf = rules_manifest(
             league_name=league,
@@ -1153,7 +1185,8 @@ def analyze_stream(csv_text: str, fundamentals: str,
                 has_h2h=any(k in fund for k in ("交锋", "H2H", "h2h")),
                 has_form=any(k in fund for k in
                              ("近10场", "近 10 场", "近况", "战绩")))
-            yield ("done", payload + "\n\n" + format_rules_manifest(mf))
+            report = finalize_decision(payload, home, away, league)
+            yield ("done", report + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)
         elif kind == "warning":
@@ -1444,7 +1477,11 @@ def _extract_decision_llm(report: str, home: str = "", away: str = "",
 
 def extract_decision(report: str, home: str = "", away: str = "",
                      visitor: bool = False) -> dict | None:
-    """保留串关抽取契约，并按独立 TypeSafe 模式选择路径。"""
+    """保留串关抽取契约，并按独立 TypeSafe 模式选择路径。
+    报告已含生成时代码写入的 decision_final 时直接读取（任何模式，不调模型）。"""
+    final = typesafe_decisions.read_final_decision(report or "")
+    if final is not None:
+        return final
     mode = config.TYPESAFE_DECISION_MODE
     if mode == "active":
         result = typesafe_decisions.resolve_decision(report or "")

@@ -605,5 +605,301 @@ class TestShadowBehavior(unittest.TestCase):
         self.assertEqual(record["typesafe_choice"], "C01")
         self.assertEqual(len(record["case_hash"]), 20)
 
+
+SELECT_REPORT = """## 比赛：Home vs Away
+### 7. 最终精算结论
+- **亚盘判定**：上盘 conclusion_private_marker
+- **置信度**：72 / 100
+### 8. 投注决策
+| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |
+|----|------|------|-------------|--------|--------|------|------|
+| C01 | 主胜 | 2.00 | 50% | 52% | 54% | +8.0% | eligible |
+| C02 | 大 2.5 | 1.90 | 52.6% | 55% | 57% | +8.3% | eligible |
+| C03 | 客胜 | 4.00 | 25% | 22% | 22% | −12.0% | eligible |
+| C04 | 双进 Yes | 3.00 | 33.3% | 40% | 40% | +20.0% | excluded |
+- **选中候选 ID**：C01
+- **选中项**：主胜
+- **证据强度与凯利分数**：中，k=1/4
+- **注额**：$2.0
+"""
+
+LEGACY_SELECT_REPORT = """### 7. 最终精算结论
+- **置信度**：**68 / 100**
+### 8. 投注决策
+| 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge |
+|------|------|-------------|--------|--------|------|
+| 主胜 | 2.00 | 50% | 52% | 54% | +8.0% |
+| 客胜 | 4.00 | 25% | 22% | 22% | −12.0% |
+- **选中项**：主胜
+- **证据强度与凯利分数**：中
+- **注额**：$2.0
+
+### 9. 其他
+tail text
+"""
+
+
+def _judgment(choice: str, confidence: float) -> "decisions.ChoiceJudgment":
+    return decisions.ChoiceJudgment(
+        choice=choice, confidence=confidence,
+        probabilities={"C01": 0.1, "C02": 0.1, "PASS": 0.1, choice: confidence},
+        requested_model="jev-1.13.0", actual_model="jev-1.13.0",
+        request_id="req", latency_ms=3,
+    )
+
+
+class TestGenerationSelection(unittest.TestCase):
+    def _select(self, report=SELECT_REPORT, *, answer=None, reason=None,
+                min_confidence=0.8):
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(answer, reason)) as request:
+            selection = decisions.select_decision(
+                report, "Home", "Away", "League", min_confidence=min_confidence)
+        return selection, request
+
+    def test_no_positive_edge_passes_without_calling_jev(self):
+        report = SELECT_REPORT.replace("+8.0%", "−1.0%").replace("+8.3%", "−0.5%")
+        selection, request = self._select(report)
+        request.assert_not_called()
+        self.assertEqual(selection.selected_id, "PASS")
+        self.assertEqual(selection.source, "no_positive_edge")
+        self.assertEqual(selection.stake, 0.0)
+
+    def test_only_eligible_positive_rows_reach_jev(self):
+        selection, request = self._select(answer=_judgment("C01", 0.9))
+        criteria = request.call_args.args[1]
+        self.assertEqual(set(criteria), {"C01", "C02", "PASS"})   # C03 负、C04 excluded
+        state_text = json.dumps(request.call_args.args[0], ensure_ascii=False)
+        self.assertIn("conclusion_private_marker", state_text)
+        self.assertEqual(selection.positive_ids, ("C01", "C02"))
+
+    def test_confident_jev_choice_is_used_and_stake_is_computed(self):
+        selection, _ = self._select(answer=_judgment("C01", 0.9))
+        self.assertEqual(selection.source, "jev")
+        self.assertEqual(selection.selected_id, "C01")
+        self.assertEqual(selection.fallback_reason, "")
+        self.assertEqual(selection.k, 0.25)
+        self.assertEqual(selection.stake, 2.0)      # 100×0.25×0.08/1.0
+
+    def test_low_confidence_falls_back_to_max_edge(self):
+        selection, _ = self._select(answer=_judgment("C01", 0.5))
+        self.assertEqual(selection.source, "edge_max")
+        self.assertEqual(selection.selected_id, "C02")
+        self.assertEqual(selection.fallback_reason, "low_confidence")
+        self.assertEqual(selection.stake, 2.3)      # 100×0.25×0.083/0.9
+
+    def test_missing_threshold_never_trusts_jev(self):
+        selection, _ = self._select(answer=_judgment("C01", 0.99),
+                                    min_confidence=None)
+        self.assertEqual(selection.source, "edge_max")
+        self.assertEqual(selection.fallback_reason, "no_confidence_threshold")
+
+    def test_sdk_failure_falls_back_to_max_edge(self):
+        selection, _ = self._select(reason="request_error:RuntimeError")
+        self.assertEqual(selection.source, "edge_max")
+        self.assertEqual(selection.selected_id, "C02")
+        self.assertEqual(selection.fallback_reason, "request_error:RuntimeError")
+
+    def test_choice_outside_positive_pool_falls_back(self):
+        selection, _ = self._select(answer=_judgment("C03", 0.95))
+        self.assertEqual(selection.source, "edge_max")
+        self.assertEqual(selection.fallback_reason, "unknown_choice")
+
+    def test_confident_jev_pass_is_respected(self):
+        selection, _ = self._select(answer=_judgment("PASS", 0.9))
+        self.assertEqual(selection.source, "jev_pass")
+        self.assertEqual(selection.selected_id, "PASS")
+        self.assertIsNone(selection.candidate)
+
+    def test_zero_evidence_passes(self):
+        report = SELECT_REPORT.replace("中，k=1/4", "无，k=0")
+        selection, _ = self._select(report, answer=_judgment("C01", 0.9))
+        self.assertEqual(selection.source, "zero_kelly")
+        self.assertEqual(selection.selected_id, "PASS")
+
+    def test_confidence_below_60_caps_kelly_fraction(self):
+        report = SELECT_REPORT.replace("72 / 100", "55 / 100").replace(
+            "中，k=1/4", "强，k=1/2")
+        selection, _ = self._select(report, answer=_judgment("C01", 0.9))
+        self.assertEqual(selection.confidence_score, 55)
+        self.assertEqual(selection.k, 0.125)
+        self.assertEqual(selection.stake, 1.0)
+
+    def test_stake_rounding_to_zero_passes(self):
+        report = SELECT_REPORT.replace(
+            "| C01 | 主胜 | 2.00 | 50% | 52% | 54% | +8.0% |",
+            "| C01 | 平局 | 9.00 | 11.1% | 11% | 11.2% | +0.8% |",
+        ).replace("55% | 57% | +8.3%", "50% | 50% | −5.0%")
+        selection, _ = self._select(report, answer=_judgment("C01", 0.9))
+        self.assertEqual(selection.source, "zero_stake")
+        self.assertEqual(selection.selected_id, "PASS")
+        output = decisions.apply_selection(report, selection)
+        self.assertTrue(decisions.read_final_decision(output)["pass"])
+
+    def test_stake_is_capped(self):
+        report = SELECT_REPORT.replace("52% | 54% | +8.0%", "52% | 80% | +60.0%").replace(
+            "中，k=1/4", "强，k=1/2")
+        selection, _ = self._select(report, answer=_judgment("C01", 0.9))
+        self.assertEqual(selection.stake, config.PARLAY_STAKE_CAP)
+
+    def test_unparseable_table_returns_none(self):
+        report = SELECT_REPORT.replace("| C01 | 主胜 | 2.00 |", "| C01 | 主胜 |")
+        selection, request = self._select(report)
+        self.assertIsNone(selection)
+        request.assert_not_called()
+
+
+class TestApplySelection(unittest.TestCase):
+    def _apply(self, report, answer):
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(answer, None)):
+            selection = decisions.select_decision(report, min_confidence=0.8)
+        return selection, decisions.apply_selection(report, selection)
+
+    def test_block_is_written_and_model_pick_is_relabelled(self):
+        selection, output = self._apply(SELECT_REPORT, _judgment("C01", 0.9))
+        section = decisions.extract_decision_section(output)
+        self.assertIn("**模型初选**：主胜", section)
+        self.assertIn("**模型初选注额**：$2.0", section)
+        self.assertEqual(section.count("选中候选 ID"), 1)
+        self.assertIn("- **选中候选 ID**：C01", section)
+        self.assertIn("- **决策来源**：Jev", section)
+        parsed = decisions.parse_decision_section(output)
+        self.assertEqual(parsed.selected_id, "C01")
+        self.assertEqual(parsed.stake, selection.stake)
+
+    def test_fallback_block_states_jev_did_not_participate(self):
+        _, output = self._apply(SELECT_REPORT, _judgment("C01", 0.2))
+        self.assertIn("Jev 未参与", output)
+        self.assertIn("- **选中候选 ID**：C02", output)
+
+    def test_missing_id_column_is_inserted_and_rest_of_report_kept(self):
+        selection, output = self._apply(LEGACY_SELECT_REPORT, None)
+        self.assertEqual(selection.selected_id, "C01")
+        self.assertIn("| ID | 玩法 |", output)
+        self.assertIn("| C01 | 主胜 |", output)
+        self.assertIn("| C02 | 客胜 |", output)
+        self.assertIn("### 9. 其他\ntail text", output)
+        self.assertTrue(output.startswith("### 7. 最终精算结论"))
+
+    def test_apply_is_idempotent(self):
+        selection, output = self._apply(SELECT_REPORT, _judgment("C01", 0.9))
+        again = decisions.apply_selection(output, selection)
+        self.assertEqual(again, output)
+        self.assertEqual(len(decisions._DECISION_FINAL_RE.findall(again)), 1)
+
+    def test_reapplying_different_selection_replaces_block(self):
+        _, output = self._apply(SELECT_REPORT, _judgment("C01", 0.9))
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(None, "missing_api_key")):
+            second = decisions.select_decision(output, min_confidence=0.8)
+        rewritten = decisions.apply_selection(output, second)
+        self.assertEqual(rewritten.count("选中候选 ID"), 1)
+        self.assertEqual(decisions.read_final_decision(rewritten)["play"], "大 2.5")
+        self.assertNotIn("模型初选**：主胜 @", rewritten)
+
+
+class TestFinalDecisionContract(unittest.TestCase):
+    def _final_report(self, answer=None):
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(answer, None)):
+            selection = decisions.select_decision(SELECT_REPORT, min_confidence=0.8)
+        return decisions.apply_selection(SELECT_REPORT, selection)
+
+    def test_read_final_decision_returns_extract_contract(self):
+        final = decisions.read_final_decision(self._final_report(_judgment("C01", 0.9)))
+        self.assertEqual(final, {
+            "pass": False, "play": "主胜", "odds": 2.0, "edge": 0.08,
+            "p_final": 0.54, "evidence": "medium", "stake": 2.0, "warnings": [],
+        })
+
+    def test_pass_final_decision(self):
+        final = decisions.read_final_decision(self._final_report(_judgment("PASS", 0.9)))
+        self.assertTrue(final["pass"])
+        self.assertEqual(final["stake"], 0.0)
+
+    def test_invalid_payloads_are_rejected(self):
+        report = self._final_report(_judgment("C01", 0.9))
+        for old, new in (('"edge":0.08', '"edge":-0.08'),
+                         ('"odds":2.0', '"odds":1.0'),
+                         ('"p_final":0.54', '"p_final":1.54'),
+                         ('"schema":"decision_final/1"', '"schema":"x"'),
+                         ('"evidence":"medium"', '"evidence":"huge"'),
+                         ('"stake":2.0', '"stake":"2"')):
+            with self.subTest(old=old):
+                self.assertIn(old, report)
+                self.assertIsNone(
+                    decisions.read_final_decision(report.replace(old, new)))
+
+    def test_extract_decision_prefers_final_block_without_llm(self):
+        report = self._final_report(_judgment("C01", 0.9))
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "off"),
+            patch.object(analyzer, "_extract_decision_llm") as llm,
+        ):
+            result = analyzer.extract_decision(report)
+        llm.assert_not_called()
+        self.assertEqual(result["play"], "主胜")
+        self.assertEqual(result["stake"], 2.0)
+
+    def test_manifest_strip_removes_final_block_comment(self):
+        report = self._final_report(_judgment("C01", 0.9))
+        stripped = analyzer.strip_rules_manifest(report)
+        self.assertNotIn("decision_final", stripped)
+        self.assertIn("- **选中候选 ID**：C01", stripped)
+
+
+class TestFinalizeDecision(unittest.TestCase):
+    def test_off_mode_returns_report_unchanged(self):
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "off"),
+            patch.object(decisions, "select_decision") as select,
+        ):
+            self.assertIs(analyzer.finalize_decision(SELECT_REPORT), SELECT_REPORT)
+        select.assert_not_called()
+
+    def test_shadow_mode_schedules_log_and_returns_report(self):
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "shadow"),
+            patch.object(analyzer, "_start_typesafe_shadow") as schedule,
+        ):
+            result = analyzer.finalize_decision(SELECT_REPORT, "H", "A", "L")
+        self.assertIs(result, SELECT_REPORT)
+        schedule.assert_called_once()
+        self.assertIs(schedule.call_args.args[0], decisions.log_selection_shadow)
+
+    def test_active_mode_rewrites_section_8(self):
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "active"),
+            patch.object(config, "TYPESAFE_DECISION_MIN_CONFIDENCE", 0.8),
+            patch.object(decisions, "_request_choice_result",
+                         return_value=(_judgment("C01", 0.9), None)),
+        ):
+            result = analyzer.finalize_decision(SELECT_REPORT, "H", "A", "L")
+        self.assertEqual(decisions.read_final_decision(result)["play"], "主胜")
+
+    def test_active_mode_keeps_report_on_error(self):
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "active"),
+            patch.object(decisions, "select_decision", side_effect=RuntimeError("x")),
+        ):
+            self.assertIs(analyzer.finalize_decision(SELECT_REPORT), SELECT_REPORT)
+
+    def test_selection_log_contains_ids_not_report_text(self):
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(_judgment("C01", 0.9), None)):
+            selection = decisions.select_decision(SELECT_REPORT, min_confidence=0.8)
+        with self.assertLogs(decisions.log, level="INFO") as captured:
+            decisions.log_selection(SELECT_REPORT, selection)
+        line = "\n".join(captured.output)
+        self.assertNotIn("conclusion_private_marker", line)
+        self.assertNotIn("主胜", line)
+        record = json.loads(line.split("TYPESAFE_DECISION ", 1)[1])
+        self.assertEqual(record["final_choice"], "C01")
+        self.assertEqual(record["baseline_choice"], "C01")
+        self.assertTrue(record["agreement"])
+        self.assertEqual(record["positive_ids"], ["C01", "C02"])
+
+
 if __name__ == "__main__":
     unittest.main()

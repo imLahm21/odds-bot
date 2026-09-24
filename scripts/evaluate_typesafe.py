@@ -110,6 +110,99 @@ def evaluate_reports(root: Path) -> dict[str, Any]:
         stats["reports_scanned"] - stats["unreadable_reports"]
         - stats["section8_found"]
     )
+    stats["generation_selection"] = evaluate_selection_offline(root)
+    return stats
+
+
+def evaluate_selection_offline(root: Path) -> dict[str, Any]:
+    """Generation-time pick without Jev: code filter + highest-edge fallback.
+    Also checks that the rewritten section 8 round-trips through both parsers."""
+    stats: dict[str, Any] = {
+        "tables_unavailable": 0, "sources": {}, "positive_counts": {},
+        "model_pick_agrees": 0, "model_pick_differs": 0, "model_pick_unknown": 0,
+        "roundtrip_ok": 0, "roundtrip_failures": [], "legacy_parser_invalid": 0,
+    }
+    for path in _report_paths(root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if decisions.extract_decision_section(text) is None:
+            continue
+        selection = decisions.select_decision(text, min_confidence=None, use_jev=False)
+        if selection is None:
+            stats["tables_unavailable"] += 1
+            continue
+        stats["sources"][selection.source] = stats["sources"].get(selection.source, 0) + 1
+        bucket = str(min(len(selection.positive_ids), 3))
+        stats["positive_counts"][bucket] = stats["positive_counts"].get(bucket, 0) + 1
+        model_pick = decisions._model_pick_id(text)
+        if model_pick == "NONE":
+            stats["model_pick_unknown"] += 1
+        elif model_pick == selection.selected_id:
+            stats["model_pick_agrees"] += 1
+        else:
+            stats["model_pick_differs"] += 1
+
+        output = decisions.apply_selection(text, selection)
+        final = decisions.read_final_decision(output)
+        parsed = decisions.parse_decision_section(output)
+        # 旧解析器遇任一行数字不合法即整表判 invalid（原报告即如此）；
+        # 生产路径优先读 decision_final，故此类只计数、不算回读失败
+        legacy_invalid = parsed is not None and parsed.source == "invalid"
+        if legacy_invalid:
+            stats["legacy_parser_invalid"] += 1
+        consistent = (
+            final is not None
+            and decisions.apply_selection(output, selection) == output
+            and final["pass"] == (selection.candidate is None)
+            and math.isclose(final["stake"], selection.stake, abs_tol=1e-9)
+            and parsed is not None
+            and (legacy_invalid or parsed.selected_id == selection.selected_id)
+        )
+        if consistent:
+            stats["roundtrip_ok"] += 1
+        elif len(stats["roundtrip_failures"]) < 20:
+            stats["roundtrip_failures"].append(path.relative_to(root).as_posix())
+    return stats
+
+
+def evaluate_selection_live(root: Path) -> dict[str, Any]:
+    """Ask Jev on every report that has 2+ positive candidates; no report is rewritten."""
+    stats: dict[str, Any] = {
+        "reports_asked": 0, "failures": {}, "choices_pass": 0,
+        "agrees_with_max_edge": 0, "agrees_with_model_pick": 0,
+        "confidences": [],
+    }
+    for path in _report_paths(root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        pool = decisions.select_decision(text, min_confidence=None, use_jev=False)
+        if pool is None or len(pool.positive_ids) < 2:
+            continue
+        stats["reports_asked"] += 1
+        positives = [c for c in pool.candidates if c.candidate_id in pool.positive_ids]
+        judgment, reason = decisions._request_selection(
+            text, positives, "", "", "", pool.confidence_score)
+        if judgment is None:
+            key = (reason or "unknown").split(":", 1)[0]
+            stats["failures"][key] = stats["failures"].get(key, 0) + 1
+            continue
+        stats["confidences"].append(round(judgment.confidence, 3))
+        if judgment.choice == "PASS":
+            stats["choices_pass"] += 1
+        if judgment.choice == pool.selected_id:
+            stats["agrees_with_max_edge"] += 1
+        if judgment.choice == decisions._model_pick_id(text):
+            stats["agrees_with_model_pick"] += 1
+    values = sorted(stats["confidences"])
+    if values:
+        stats["confidence_quantiles"] = {
+            f"p{q}": values[min(len(values) - 1, int(q / 100 * len(values)))]
+            for q in (10, 25, 50, 75, 90)
+        }
     return stats
 
 
@@ -357,9 +450,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--lesson-live", action="store_true")
     parser.add_argument("--decision-live", action="store_true")
+    parser.add_argument("--select-live", action="store_true",
+                        help="ask Jev to pick among positive-edge candidates in --reports")
     args = parser.parse_args(argv)
 
-    live_flags = [args.probe, args.lesson_live, args.decision_live]
+    live_flags = [args.probe, args.lesson_live, args.decision_live, args.select_live]
     if args.offline and any(live_flags):
         parser.error("--offline cannot be combined with a live request")
     if sum(bool(flag) for flag in live_flags) > 1:
@@ -378,6 +473,13 @@ def main(argv: list[str] | None = None) -> int:
             _print({"decision_live": evaluate_decision_live(report_root)})
         except Exception as exc:
             print(f"decision live evaluation failed: {type(exc).__name__}", file=sys.stderr)
+            return 2
+    elif args.select_live:
+        report_root = args.reports or (ROOT / "report")
+        try:
+            _print({"select_live": evaluate_selection_live(report_root)})
+        except Exception as exc:
+            print(f"selection live evaluation failed: {type(exc).__name__}", file=sys.stderr)
             return 2
     elif args.reports:
         _print({"decision_offline": evaluate_reports(args.reports)})

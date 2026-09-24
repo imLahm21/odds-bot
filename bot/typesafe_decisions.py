@@ -376,10 +376,7 @@ def route_lesson_topic(
     )
 def extract_decision_section(report: str) -> str | None:
     """Return only section 8; never pass the surrounding match report to Jev."""
-    return _extract_heading_section(
-        report or "",
-        r"^###\s*8(?:[.．、]|\s)\s*(?:投注决策|decision)[^\r\n]*",
-    )
+    return _extract_heading_section(report or "", _SECTION_8_RE)
 
 
 def _plain(value: str) -> str:
@@ -462,10 +459,19 @@ def _eligibility(raw: str | None, odds_cell: str, row: str) -> str:
     return "invalid"
 
 
-def _table_rows(section: str) -> tuple[dict[str, int] | None,
-                                       list[tuple[list[str], str]],
-                                       str | None]:
-    lines = section.splitlines()
+@dataclass(frozen=True, slots=True)
+class _TableLayout:
+    header_index: int
+    headers: list[str]
+    columns: dict[str, int]
+    rows: list[tuple[int, list[str]]]      # (line index, cells) of candidate rows
+    table_lines: tuple[int, ...]           # every line index that belongs to the table
+    error: str | None
+
+
+def _table_layout(lines: list[str]) -> _TableLayout | None:
+    """Locate the candidate table. Parser and rewriter share this, so row N here
+    is always candidate C{N:02d} in both places."""
     for index, line in enumerate(lines):
         headers = _split_pipe_row(line)
         if not headers:
@@ -473,22 +479,38 @@ def _table_rows(section: str) -> tuple[dict[str, int] | None,
         columns = _column_indexes(headers)
         if columns is None:
             continue
-        rows: list[tuple[list[str], str]] = []
-        for row_line in lines[index + 1:]:
-            cells = _split_pipe_row(row_line)
+        rows: list[tuple[int, list[str]]] = []
+        table_lines = [index]
+        error = None
+        for offset in range(index + 1, len(lines)):
+            cells = _split_pipe_row(lines[offset])
             if cells is None:
                 if rows:
                     break
                 continue
+            table_lines.append(offset)
             if all(re.fullmatch(r":?-{3,}:?", _plain(cell)) for cell in cells):
                 continue
             if len(cells) != len(headers):
-                return columns, rows, "table_column_count_mismatch"
+                error = "table_column_count_mismatch"
+                break
             if not any(cell.strip() for cell in cells):
                 continue
-            rows.append((cells, row_line.strip()))
-        return columns, rows, None
-    return None, [], "candidate_table_not_found"
+            rows.append((offset, cells))
+        return _TableLayout(index, headers, columns, rows,
+                            tuple(table_lines), error)
+    return None
+
+
+def _table_rows(section: str) -> tuple[dict[str, int] | None,
+                                       list[tuple[list[str], str]],
+                                       str | None]:
+    lines = section.splitlines()
+    layout = _table_layout(lines)
+    if layout is None:
+        return None, [], "candidate_table_not_found"
+    rows = [(cells, lines[offset].strip()) for offset, cells in layout.rows]
+    return layout.columns, rows, layout.error
 
 
 def _selected_fields(section: str) -> tuple[str | None, str]:
@@ -841,6 +863,444 @@ def decision_to_extract_dict(result: DecisionParseResult) -> dict[str, Any] | No
         "stake": result.stake,
         "warnings": list(result.warnings),
     }
+
+
+# ─── 生成时选中项：代码筛正 edge → Jev 在正 edge 候选 + PASS 中选 → 失败退回 edge 最高 ──
+# Jev 只返回候选 ID；赔率/edge/p_final 一律从该行复制，k 与注额由代码按 SOP 7.5 算。
+
+_SECTION_8_RE = r"^###\s*8(?:[.．、]|\s)\s*(?:投注决策|decision)[^\r\n]*"
+_SECTION_7_RE = r"^###\s*7(?:[.．、]|\s)\s*最终精算结论[^\r\n]*"
+_SECTION_7_MAX_CHARS = 6000
+_DECISION_FINAL_RE = re.compile(
+    r"(?m)^[ \t]*<!--[ \t]*decision_final[ \t]+(\{.*\})[ \t]*-->[ \t]*(?:\r?\n)?")
+_EVIDENCE_LABELS = {
+    "strong": "强", "medium": "中", "weak": "弱", "none": "无", "unknown": "未写明",
+}
+_FALLBACK_LABELS = {
+    "jev_disabled": "未启用",
+    "missing_api_key": "未配置 TYPESAFE_API_KEY",
+    "sdk_missing": "未安装 TypeSafe SDK",
+    "section_7_missing": "报告缺第 7 节结论",
+    "no_confidence_threshold": "未配置 TYPESAFE_DECISION_MIN_CONFIDENCE",
+    "low_confidence": "Jev 置信度低于阈值",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionSelection:
+    selected_id: str                        # C01.. 或 PASS
+    candidate: DecisionCandidate | None
+    source: str                             # jev / jev_pass / edge_max / no_positive_edge / zero_kelly / zero_stake
+    fallback_reason: str                    # Jev 未参与或未被采纳的原因码；采纳时为空
+    evidence: str
+    confidence_score: int | None            # 第 7 节置信度 0~100
+    k: float
+    stake: float
+    candidates: tuple[DecisionCandidate, ...]
+    positive_ids: tuple[str, ...]
+    judgment: ChoiceJudgment | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+        object.__setattr__(self, "positive_ids", tuple(self.positive_ids))
+
+
+def extract_conclusion_section(report: str) -> str | None:
+    return _extract_heading_section(report or "", _SECTION_7_RE)
+
+
+def parse_report_confidence(report: str) -> int | None:
+    """第 7 节「置信度」数值；兼容 `**72 / 100**`、`**74** / 100` 等写法。"""
+    section = extract_conclusion_section(report)
+    if not section:
+        return None
+    match = re.search(r"(?m)^\s*[-*]?\s*置信度\s*[：:]\s*(\d{1,3})", _plain(section))
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 0 <= value <= 100 else None
+
+
+def kelly_fraction(evidence: str, confidence_score: int | None) -> float:
+    """SOP 7.5：证据强度定 k（未写明按默认中档 1/4）；置信度 <60 压至不高于 1/8。"""
+    k_table = config.PARLAY_EVIDENCE_K
+    k = k_table.get(evidence, k_table["medium"])
+    if confidence_score is not None and confidence_score < 60:
+        k = min(k, k_table["weak"])
+    return k
+
+
+def stake_for(candidate: DecisionCandidate, k: float) -> float:
+    """注额 = 本金 × k × edge/(赔率−1)，截到单注上限，保留 1 位小数。"""
+    if candidate.odds is None or candidate.odds <= 1.0 or candidate.edge is None:
+        return 0.0
+    raw = config.PARLAY_STAKE_BANKROLL * k * candidate.edge / (candidate.odds - 1.0)
+    return round(max(0.0, min(raw, config.PARLAY_STAKE_CAP)), 1)
+
+
+def _selection_pool(report: str) -> tuple[tuple[DecisionCandidate, ...], str] | None:
+    """候选表 → (按行序重编号的候选, 证据强度)。模型写的「选中候选 ID」不参与此处判断。"""
+    parsed = parse_decision_section(report)
+    if parsed is None or not parsed.candidates:
+        return None
+    if any(warning in {"table_column_count_mismatch", "candidate_table_not_found"}
+           for warning in parsed.warnings):
+        return None
+    candidates = tuple(
+        replace(candidate, candidate_id=f"C{index:02d}")
+        for index, candidate in enumerate(parsed.candidates, start=1)
+    )
+    return candidates, parsed.evidence
+
+
+def _positive_candidates(
+    candidates: tuple[DecisionCandidate, ...],
+) -> list[DecisionCandidate]:
+    # 解析时数字不合法的 eligible 行已被降为 invalid，这里只剩数字已校验的行
+    return [
+        candidate for candidate in candidates
+        if candidate.eligibility == "eligible"
+        and candidate.odds is not None and candidate.odds > 1.0
+        and candidate.p_final is not None
+        and candidate.edge is not None and candidate.edge > 0
+    ]
+
+
+def _request_selection(
+    report: str,
+    positives: list[DecisionCandidate],
+    home: str,
+    away: str,
+    league: str,
+    confidence_score: int | None,
+) -> tuple[ChoiceJudgment | None, str | None]:
+    conclusion = extract_conclusion_section(report)
+    if not conclusion:
+        return None, "section_7_missing"
+    criteria: dict[str, Any] = {
+        candidate.candidate_id: {
+            "play": candidate.play,
+            "odds": round(candidate.odds, 3),
+            "edge": f"{candidate.edge:+.1%}",
+            "p_final": f"{candidate.p_final:.1%}",
+        }
+        for candidate in positives
+    }
+    criteria["PASS"] = {
+        "when": "Every candidate contradicts the section 7 direction, or the "
+                "section 7 risk notes explicitly argue against each of them.",
+        "boundary": "A thin but positive edge alone is not a reason to pass.",
+    }
+    state = {
+        "match": {"home": home, "away": away, "league": league},
+        "section_7_conclusion": conclusion[:_SECTION_7_MAX_CHARS],
+        "report_confidence": confidence_score,
+        "candidates": criteria,
+    }
+    return _request_choice_result(
+        state,
+        criteria,
+        "Every listed candidate is a section 8 wager whose positive edge was "
+        "computed and checked by code. Using the section 7 final conclusion "
+        "(direction per market, confidence, key evidence, risks), which single "
+        "candidate should be the wager? Prefer the candidate whose side and market "
+        "agree with the section 7 judgments and key evidence; among equally "
+        "consistent candidates prefer the higher edge. Choose PASS only when no "
+        "candidate is consistent with section 7.",
+        question_id="decision_select",
+    )
+
+
+def select_decision(
+    report: str,
+    home: str = "",
+    away: str = "",
+    league: str = "",
+    *,
+    min_confidence: float | None,
+    use_jev: bool = True,
+) -> DecisionSelection | None:
+    """代码筛出 eligible 且 edge>0 的候选；无则直接 PASS（不调 Jev）。
+    否则 Jev 在正 edge 候选 + PASS 中选；Jev 失败/低置信度 → edge 最高的正值项。
+    候选表无法解析时返回 None（报告保持原样，串关抽取走既有 fallback）。"""
+    pool = _selection_pool(report)
+    if pool is None:
+        return None
+    candidates, evidence = pool
+    confidence_score = parse_report_confidence(report)
+    positives = _positive_candidates(candidates)
+    common = {
+        "evidence": evidence,
+        "confidence_score": confidence_score,
+        "candidates": candidates,
+        "positive_ids": tuple(c.candidate_id for c in positives),
+    }
+    if not positives:
+        return DecisionSelection(
+            selected_id="PASS", candidate=None, source="no_positive_edge",
+            fallback_reason="", k=0.0, stake=0.0, **common)
+
+    judgment: ChoiceJudgment | None = None
+    reason: str | None = "jev_disabled"
+    if use_jev:
+        judgment, reason = _request_selection(
+            report, positives, home, away, league, confidence_score)
+
+    chosen: DecisionCandidate | None = None
+    source = "edge_max"
+    fallback = reason or ""
+    if judgment is not None:
+        if min_confidence is None:
+            fallback = "no_confidence_threshold"
+        elif judgment.confidence < min_confidence:
+            fallback = "low_confidence"
+        elif judgment.choice == "PASS":
+            return DecisionSelection(
+                selected_id="PASS", candidate=None, source="jev_pass",
+                fallback_reason="", k=0.0, stake=0.0, judgment=judgment,
+                **common)
+        else:
+            chosen = next(
+                (c for c in positives if c.candidate_id == judgment.choice), None)
+            if chosen is None:
+                fallback = "unknown_choice"
+            else:
+                source, fallback = "jev", ""
+    if chosen is None:
+        chosen = max(positives, key=lambda c: c.edge)   # 并列取表中靠前者
+
+    k = kelly_fraction(evidence, confidence_score)
+    if k <= 0:
+        return DecisionSelection(
+            selected_id="PASS", candidate=None, source="zero_kelly",
+            fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment,
+            **common)
+    stake = stake_for(chosen, k)
+    if stake <= 0:                    # 薄 edge × 高赔率：注额舍入到 $0.0，等同空仓
+        return DecisionSelection(
+            selected_id="PASS", candidate=None, source="zero_stake",
+            fallback_reason=fallback, k=k, stake=0.0, judgment=judgment,
+            **common)
+    return DecisionSelection(
+        selected_id=chosen.candidate_id, candidate=chosen, source=source,
+        fallback_reason=fallback, k=k, stake=stake,
+        judgment=judgment, **common)
+
+
+def _k_label(k: float) -> str:
+    for label, value in (("1/2", 0.5), ("1/4", 0.25), ("1/8", 0.125), ("0", 0.0)):
+        if abs(k - value) < 1e-9:
+            return label
+    return f"{k:g}"
+
+
+def _fallback_label(reason: str) -> str:
+    if reason.startswith("request_error:"):
+        return f"调用失败（{reason.split(':', 1)[1]}）"
+    return _FALLBACK_LABELS.get(reason, reason or "未知原因")
+
+
+def _selection_block(selection: DecisionSelection) -> list[str]:
+    """第 8 节最终选定段（代码写入，替代模型初选）。"""
+    judgment = selection.judgment
+    jev_note = (
+        f"{judgment.actual_model}，置信度 {judgment.confidence:.2f}"
+        if judgment else ""
+    )
+    n_pos = len(selection.positive_ids)
+    if selection.source == "jev":
+        source_line = f"Jev（{jev_note}）在 {n_pos} 个正 edge 候选 + PASS 中选定"
+    elif selection.source == "jev_pass":
+        source_line = f"Jev（{jev_note}）判定 PASS：正 edge 候选均与第 7 节结论不一致"
+    elif selection.source == "no_positive_edge":
+        source_line = "代码判定：无 eligible 且 edge>0 的候选，直接 pass（未调用 Jev）"
+    elif selection.source == "zero_stake":
+        source_line = (f"选定项 edge 过薄，按 k={_k_label(selection.k)} 算出的注额舍入为 0，"
+                       f"不下注")
+    else:
+        fallback = _fallback_label(selection.fallback_reason)
+        if judgment and selection.fallback_reason in {"low_confidence",
+                                                      "no_confidence_threshold"}:
+            fallback += f"；Jev 选 {judgment.choice}，{jev_note}"
+        if selection.source == "zero_kelly":
+            source_line = (f"证据强度=无（k=0），不下注（edge 最高规则；"
+                           f"Jev 未参与：{fallback}）")
+        else:
+            source_line = f"代码 edge 最高规则（Jev 未参与：{fallback}）"
+
+    lines = [f"- **选中候选 ID**：{selection.selected_id}"]
+    candidate = selection.candidate
+    if candidate is None:
+        lines.append("- **选中项**：pass，空仓")
+    else:
+        lines.append(
+            f"- **选中项**：{candidate.play} @ {candidate.odds:.2f}"
+            f"（edge {candidate.edge:+.1%}，p_最终 {candidate.p_final:.1%}）")
+    lines.append(f"- **决策来源**：{source_line}")
+    if candidate is None:
+        lines.append("- **注额**：pass，空仓")
+    else:
+        low = (selection.confidence_score is not None
+               and selection.confidence_score < 60)
+        # 括注里不再出现 $ 金额：parse_decision_section 取该行最后一个 $ 数作注额
+        lines.append(
+            f"- **注额**：${selection.stake:.1f}"
+            f"（k={_k_label(selection.k)}，证据强度"
+            f"{_EVIDENCE_LABELS.get(selection.evidence, selection.evidence)}"
+            + (f"，置信度 {selection.confidence_score}<60 压至 ≤1/8" if low else "")
+            + f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，"
+              f"已截单注上限）")
+    payload = {
+        "schema": "decision_final/1",
+        "selected_id": selection.selected_id,
+        "pass": candidate is None,
+        "play": candidate.play if candidate else "",
+        "odds": round(candidate.odds, 6) if candidate else 0.0,
+        "edge": round(candidate.edge, 6) if candidate else 0.0,
+        "p_final": round(candidate.p_final, 6) if candidate else 0.0,
+        "evidence": selection.evidence,
+        "k": selection.k,
+        "stake": selection.stake,
+        "source": selection.source,
+        "fallback_reason": selection.fallback_reason,
+        "jev_confidence": judgment.confidence if judgment else None,
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                      allow_nan=False).replace("-->", "--\\u003e")
+    # 注释放在段首：放在注额行之后会被注额解析当作续行（含 "pass" 字样）
+    return [f"<!-- decision_final {body} -->"] + lines
+
+
+_MODEL_PICK_LABELS = (
+    (re.compile(r"^(\s*[-*]\s*)\*\*选中项\*\*"), r"\1**模型初选**"),
+    (re.compile(r"^(\s*[-*]\s*)\*\*注额\*\*"), r"\1**模型初选注额**"),
+)
+_MODEL_SELECTED_ID_RE = re.compile(r"^\s*[-*]\s*\*\*选中候选\s*ID\*\*")
+# 代码写入的最终选定段（紧跟 decision_final 注释的四行）
+_PRIOR_BLOCK_LINE_RE = re.compile(
+    r"^- \*\*(?:选中候选 ID|选中项|决策来源|注额)\*\*：")
+
+
+def _section_span(report: str) -> tuple[int, int] | None:
+    match = re.search(_SECTION_8_RE, report, re.I | re.M)
+    if not match:
+        return None
+    rest = report[match.end():]
+    following = re.search(r"(?m)^###\s+", rest)
+    end = match.end() + (following.start() if following else len(rest))
+    return match.start(), end
+
+
+def apply_selection(report: str, selection: DecisionSelection) -> str:
+    """把代码/Jev 的最终选定写回第 8 节：
+    · 候选表 ID 列归一为 C01..Cn（缺列则补），与 selected_id 对应；
+    · 模型原「选中项/注额」改名为「模型初选/模型初选注额」，删去其「选中候选 ID」；
+    · 表后插入最终选定段 + 机器可读的 decision_final 注释；
+    · 已有代码写入的最终选定段先整段移除，重复调用结果不叠加。"""
+    report = report or ""
+    span = _section_span(report)
+    if span is None:
+        return report
+    start, end = span
+    lines = report[start:end].split("\n")
+    layout = _table_layout(lines)
+    if layout is None or layout.error:
+        return report
+    prior_block: set[int] = set()
+    for index, line in enumerate(lines):
+        if not _DECISION_FINAL_RE.match(line + "\n"):
+            continue
+        prior_block.add(index)
+        follow = index + 1
+        while follow < len(lines) and _PRIOR_BLOCK_LINE_RE.match(lines[follow]):
+            prior_block.add(follow)
+            follow += 1
+        if follow < len(lines) and not lines[follow].strip():
+            prior_block.add(follow)
+
+    has_id = "id" in layout.columns
+    row_numbers = {offset: n for n, (offset, _) in enumerate(layout.rows, start=1)}
+    table_set = set(layout.table_lines)
+    table_end = layout.table_lines[-1]
+    output: list[str] = []
+    for index, line in enumerate(lines):
+        if index in prior_block:
+            continue
+        if index in table_set:
+            cells = _split_pipe_row(line) or []
+            if index == layout.header_index:
+                if not has_id:
+                    cells.insert(0, "ID")
+            elif index in row_numbers:
+                row_id = f"C{row_numbers[index]:02d}"
+                if has_id:
+                    cells[layout.columns["id"]] = row_id
+                else:
+                    cells.insert(0, row_id)
+            elif all(re.fullmatch(r":?-{3,}:?", _plain(c)) for c in cells):
+                if not has_id:
+                    cells.insert(0, "----")
+            else:
+                continue                      # 全空行不计编号，直接丢弃
+            output.append("| " + " | ".join(cells) + " |")
+            if index == table_end:
+                output.append("")
+                output.extend(_selection_block(selection))
+                if index + 1 < len(lines) and lines[index + 1].strip():
+                    output.append("")
+            continue
+        if _MODEL_SELECTED_ID_RE.match(line):
+            continue
+        for pattern, replacement in _MODEL_PICK_LABELS:
+            line = pattern.sub(replacement, line)
+        output.append(line)
+    return report[:start] + "\n".join(output) + report[end:]
+
+
+def read_final_decision(report: str) -> dict[str, Any] | None:
+    """读取 apply_selection 写入的 decision_final，转成 extract_decision 契约。
+    字段缺失或越界一律返回 None，由调用方走既有解析/LLM 路径。"""
+    matches = list(_DECISION_FINAL_RE.finditer(report or ""))
+    if not matches:
+        return None
+    try:
+        data = json.loads(matches[-1].group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("schema") != "decision_final/1":
+        return None
+    evidence = data.get("evidence")
+    if evidence not in _EVIDENCE_LABELS:
+        return None
+
+    def number(key: str) -> float | None:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    stake = number("stake")
+    if data.get("pass") is True:
+        return {
+            "pass": True, "play": "", "odds": 0.0, "edge": 0.0,
+            "p_final": 0.0, "evidence": evidence, "stake": 0.0, "warnings": [],
+        }
+    odds, edge, p_final = number("odds"), number("edge"), number("p_final")
+    play = data.get("play")
+    if (data.get("pass") is not False or not isinstance(play, str) or not play
+            or odds is None or odds <= 1.0
+            or edge is None or edge <= 0
+            or p_final is None or not 0.0 <= p_final <= 1.0
+            or stake is None or stake < 0):
+        return None
+    return {
+        "pass": False, "play": play, "odds": odds, "edge": edge,
+        "p_final": p_final, "evidence": evidence, "stake": stake,
+        "warnings": [],
+    }
+
+
 def _case_hash(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text or "").strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
@@ -976,3 +1436,64 @@ def log_decision_shadow(
         "token_usage": dict(metadata.token_usage) if metadata else {},
         "fallback_reason": fallback_reason,
     })
+
+
+def _model_pick_id(report: str) -> str:
+    """报告模型自己写的选中候选（影子对比基线）；无法确定时为 NONE。"""
+    parsed = parse_decision_section(report)
+    if parsed is None or parsed.source in {"invalid", "ambiguous"}:
+        return "NONE"
+    return parsed.selected_id or "NONE"
+
+
+def selection_record(
+    report: str,
+    selection: DecisionSelection | None,
+    *,
+    feature: str,
+) -> dict[str, Any]:
+    """选中项决策的结构化日志：只含哈希、候选 ID 和数值，不含报告正文。"""
+    section = extract_decision_section(report or "") or ""
+    judgment = selection.judgment if selection else None
+    baseline = _model_pick_id(report)
+    final_choice = selection.selected_id if selection else ""
+    probabilities = dict(judgment.probabilities) if judgment else {}
+    return {
+        "feature": feature,
+        "case_hash": _case_hash(section),
+        "baseline_choice": baseline,
+        "typesafe_choice": judgment.choice if judgment else "",
+        "final_choice": final_choice,
+        "source": selection.source if selection else "",
+        "positive_ids": list(selection.positive_ids) if selection else [],
+        "top3": [key for key, _ in sorted(
+            probabilities.items(), key=lambda item: item[1], reverse=True)[:3]],
+        "confidence": judgment.confidence if judgment else None,
+        "probabilities": probabilities,
+        "agreement": (baseline == final_choice) if selection else None,
+        "requested_model": judgment.requested_model if judgment else config.TYPESAFE_MODEL,
+        "actual_model": judgment.actual_model if judgment else "",
+        "request_id": judgment.request_id if judgment else "",
+        "latency_ms": judgment.latency_ms if judgment else 0,
+        "token_usage": dict(judgment.token_usage) if judgment else {},
+        "fallback_reason": (
+            selection.fallback_reason if selection
+            else "candidate_table_unavailable"),
+    }
+
+
+def log_selection_shadow(report: str, home: str, away: str, league: str) -> None:
+    """影子模式：后台跑一遍生成时选定，只记日志，不改报告。"""
+    selection = select_decision(
+        report, home, away, league,
+        min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE)
+    _log_shadow(selection_record(report, selection, feature="decision_select"))
+
+
+def log_selection(report: str, selection: DecisionSelection | None) -> None:
+    """active 模式的审计行（同 TYPESAFE_SHADOW 字段口径）。"""
+    log.info(
+        "TYPESAFE_DECISION %s",
+        json.dumps(selection_record(report, selection, feature="decision_select"),
+                   ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+    )

@@ -136,8 +136,9 @@ def _append_index_row(overview_text: str, case_no: int, row: dict,
     if not seg:
         return overview_text
     block = seg.group(0)
-    # 找到段内最后一个表格行，在其后插入
-    rows = list(re.finditer(r"^\|.*\|\s*$", block, re.M))
+    # 找到段内最后一个表格行，在其后插入（行尾只吃同行空白：\s* 会吞掉换行，
+    # 使新行落在空行之后、截断表格）
+    rows = list(re.finditer(r"^\|.*\|[ \t]*$", block, re.M))
     if not rows:
         return overview_text
     last = rows[-1]
@@ -318,7 +319,7 @@ def _insert_route_row(overview_text: str, row: str) -> str:
     if not seg:
         return overview_text
     block = seg.group(0)
-    rows = list(re.finditer(r"^\|.*\|\s*$", block, re.M))
+    rows = list(re.finditer(r"^\|.*\|[ \t]*$", block, re.M))
     if not rows:
         return overview_text
     last = rows[-1]

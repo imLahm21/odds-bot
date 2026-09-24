@@ -362,6 +362,13 @@ TypeSafe/Jev 是独立的可选决策服务，不属于 LLM 路由。两个模�
 Shadow 只记录比较，现有 LLM 结果仍然生效。Active 必须配置经评测的置信度阈值，否则启动时会降级为 shadow。
 Jev 只能选择候选 ID，不能生成赔率、概率、edge 或注额。API Key 只放在服务器；离线评测和单独批准前不要启用 active。
 
+`TYPESAFE_DECISION_MODE` 作用于报告生成后的第 8 节选中项：
+- `off`：报告保持模型自己的选择。
+- `shadow`：报告不变，后台让 Jev 选一次，只记 `TYPESAFE_SHADOW` 日志（哈希 + 候选 ID，不含报告正文）。
+- `active`：代码筛出 eligible 且 edge>0 的候选（无则直接 pass、不调 Jev），Jev 在其中 + PASS 里选；
+  Jev 失败或置信度低于阈值时退回 edge 最高项，报告注明「Jev 未参与」。注额由代码按 SOP 7.5 重算，
+  模型原选择改名为「模型初选」保留，第 8 节写入 `decision_final` 注释供 `/parlay` 读取（TG/发布出口会剥掉）。
+
 > 不需要 Telegram bot 就只填 `APIFOOTBALL_KEY`，守护进程会自动退化为纯调度器模式。
 > `odds.db` 会在首次运行时自动创建，无需手动建。
 

@@ -159,6 +159,16 @@ startup downgrades that feature to shadow. Jev selects only a candidate ID and n
 probabilities, edge, or stake. Keep the API key on the server and do not enable active before the
 offline evaluation and separate approval.
 
+`TYPESAFE_DECISION_MODE` applies to the section-8 pick after a report is generated:
+- `off`: the report keeps the model's own pick.
+- `shadow`: the report is unchanged; Jev picks in the background and only a `TYPESAFE_SHADOW` log
+  line is written (hash + candidate IDs, no report text).
+- `active`: code keeps only eligible rows with edge > 0 (none → pass without calling Jev), and Jev
+  picks among them or PASS. If Jev fails or is below the threshold, the highest-edge row is used and
+  the report says Jev did not participate. Code recomputes the stake per SOP 7.5, relabels the
+  model's pick as 「模型初选」, and writes a `decision_final` comment that `/parlay` reads (stripped from
+  Telegram and published output).
+
 > With only `APIFOOTBALL_KEY` set, the daemon runs as a pure scheduler. `odds.db` is created
 > automatically on first run. See code comments and the `deploy/` directory for advanced options
 > (multi-endpoint failover, circuit-breaker tuning, systemd units, backups).
