@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot import parlay, config   # noqa: E402
+from bot import parlay, config, typesafe_decisions   # noqa: E402
 
 
 def _leg(fid, edge, odds=2.0, p_final=0.55, evidence="medium", passed=False):
@@ -109,6 +109,31 @@ class TestRender(unittest.TestCase):
         legs = [_leg(1, 0.06), _leg(2, -0.02), _leg(3, 0.05)]
         md = parlay.render_report(parlay.evaluate(legs))
         self.assertIn("拆单关", md)
+
+
+class TestTypeSafeContract(unittest.TestCase):
+    def test_typesafe_result_keeps_parlay_input_shape(self):
+        report = """### 8. 投注决策
+| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |
+|----|------|------|-------------|--------|--------|------|------|
+| C01 | 主胜 | 2.00 | 50% | 52% | 54% | +8.0% | eligible |
+- **选中候选 ID**：C01
+- **选中项**：主胜
+- **证据强度与凯利分数**：中
+- **注额**：$2.5
+"""
+        parsed = typesafe_decisions.parse_decision_section(report)
+        decision = typesafe_decisions.decision_to_extract_dict(parsed)
+        self.assertEqual(
+            set(decision),
+            {"pass", "play", "odds", "edge", "p_final", "evidence", "stake", "warnings"},
+        )
+        legs = []
+        for fid in (1, 2, 3):
+            leg = dict(decision)
+            leg.update({"fid": fid, "home": f"H{fid}", "away": f"A{fid}"})
+            legs.append(leg)
+        self.assertTrue(parlay.evaluate(legs)["can_parlay"])
 
 
 if __name__ == "__main__":

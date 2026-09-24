@@ -136,8 +136,28 @@ LLM_INPUT_WARN_TOKENS=240000
 # they were the root cause of a key being silently misrouted to unauthorized models).
 # Validate without printing keys: ./venv/bin/python -m bot.llm_client
 # The issues list must be empty and every group your models depend on must show count >= 1.
+# Optional Jev integration. This is independent of LLM_ROUTE_ENDPOINTS.
+# Leave both modes off until evaluation and a separate approval.
+# TYPESAFE_API_KEY=
+# TYPESAFE_BASE_URL=
+# TYPESAFE_MODEL=jev-1.13.0
+# TYPESAFE_HTTP_TIMEOUT_SECONDS=5
+# TYPESAFE_MAX_RETRIES=2
+# TYPESAFE_RETRY_BUDGET_SECONDS=12
+TYPESAFE_LESSON_MODE=off
+TYPESAFE_DECISION_MODE=off
+# Thresholds have no defaults; active without an evaluated threshold falls back to shadow.
+# TYPESAFE_LESSON_MIN_CONFIDENCE=
+# TYPESAFE_DECISION_MIN_CONFIDENCE=
 EOF
 ```
+
+TypeSafe/Jev is an optional, separate decision service. Both modes default to off, so no TypeSafe
+request or charge occurs unless a mode is enabled. Shadow records comparisons while the existing
+LLM result remains authoritative. Active requires an evaluated confidence threshold; otherwise
+startup downgrades that feature to shadow. Jev selects only a candidate ID and never supplies odds,
+probabilities, edge, or stake. Keep the API key on the server and do not enable active before the
+offline evaluation and separate approval.
 
 > With only `APIFOOTBALL_KEY` set, the daemon runs as a pure scheduler. `odds.db` is created
 > automatically on first run. See code comments and the `deploy/` directory for advanced options

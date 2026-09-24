@@ -1243,6 +1243,26 @@ class TestModelProfile(unittest.TestCase):
         self.assertTrue(call.call_args.kwargs["visitor"])
         self.assertEqual(call.call_args.kwargs["tier"], "balanced")
 
+    def test_typesafe_failure_keeps_visitor_llm_fallback_route(self):
+        response = (
+            '{"pass":true,"play":"","odds":0,"edge":0,'
+            '"p_final":0,"evidence":"none","stake":null}'
+        )
+        with (
+            patch.object(config, "TYPESAFE_DECISION_MODE", "active"),
+            patch.object(config, "TYPESAFE_DECISION_MIN_CONFIDENCE", 0.9),
+            patch.object(analyzer.typesafe_decisions, "resolve_decision",
+                         return_value=None),
+            patch.object(analyzer, "available", return_value=True),
+            patch.object(analyzer, "_call_llm",
+                         return_value=response) as call,
+        ):
+            result = analyzer.extract_decision(
+                "### 8. decision\npass", visitor=True)
+        self.assertTrue(result["pass"])
+        self.assertTrue(call.call_args.kwargs["visitor"])
+        self.assertEqual(call.call_args.kwargs["tier"], "balanced")
+
     def test_old_primary_values_migrate_once(self):
         conn = sqlite3.connect(":memory:")
         try:
