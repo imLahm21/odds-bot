@@ -457,7 +457,8 @@ LLM_EFFORT_VISITOR_ALLOWED: set[str] = {"none", "low", "medium", "high"}
 LLM_EFFORT_DEFAULT = "high"
 
 # ─── 模型清单（/llm 面板可选池的唯一真相源）─────────────────────────────────
-# 加新模型只改这一处：登记模型名 + 中文标签 + 允许哪几档选它 + 支持的推理强度。
+# 新增候选在此登记模型名、标签、档位与实测强度；同时在部署 .env 的
+# LLM_MODEL_MAX_TOKENS / LLM_MODEL_INPUT_WARN_TOKENS 中登记预算及预警线。
 # 密钥组不在这里写 —— 由 llm_route_groups_for_model 按模型名前缀推导（见下文）。
 #   tiers —— 允许该模型出现在哪些档位的可选池里。
 #   efforts —— 该模型接受的 reasoning_effort 原始值；TG 只显示这些选项，请求层再兜底过滤。
@@ -470,17 +471,22 @@ LLM_EFFORT_DEFAULT = "high"
 _EFFORT_OPENAI_ASTRA = ("low", "medium", "high", "xhigh", "max", "ultra")
 _EFFORT_OPENAI_SOL = ("none", "low", "medium", "high", "xhigh", "max",
                       "ultra")
+# 2026-10-04 Mixed/Pro 探针均接受这五档；none/minimal/ultra 返回 400。
+_EFFORT_OPENAI_61_SOL = ("low", "medium", "high", "xhigh", "max")
 _EFFORT_OPENAI_TERRA = ("none", "low", "medium", "high", "xhigh", "max")
 # Luna max 在当前 OpenAI 端点实测返回 400，但按管理员明确要求保留。
 _EFFORT_OPENAI_LUNA = ("none", "low", "medium", "high", "xhigh", "max")
-# GLM-5.3 与 Flash 当前都接受 low/high/max，但分开声明：两者由不同服务实现时
-# 不再因为共用一个常量而被误同步修改。glm-5.3-flash 已在两条 ik_glm 端点实测。
+# 两款 GLM 独立维护能力，避免其中一款的端点变更误改另一款。
 _EFFORT_GLM_53 = ("low", "high", "max")
+# 2026-10-04 两条端点均完成 low/high/max 请求。其他值可能静默回落 max，
+# HTTP 200 不等于支持独立强度；只开放模型卡声明的三档。
 _EFFORT_GLM_53_FLASH = ("low", "high", "max")
 _EFFORT_GROK_46 = ("low", "medium", "high", "xhigh")
 _EFFORT_GROK_45 = ("low", "medium", "high")
 _EFFORT_DEEPSEEK = ("none", "low", "high", "max")
 _EFFORT_GEMINI_38 = ("low", "medium", "high")
+# 两款 Claude 5.5 按官方五档登记；IK 兼容接口已通过阻塞/流式探针。
+_EFFORT_CLAUDE_55 = ("low", "medium", "high", "xhigh", "max")
 
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
@@ -489,6 +495,12 @@ LLM_MODELS: dict[str, dict] = {
                            "efforts": _EFFORT_OPENAI_ASTRA},
     "gpt-6-sol":        {"label": "GPT-6 Sol", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_OPENAI_SOL},
+    "gpt-6.1-sol":      {"label": "GPT-6.1 Sol", "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_OPENAI_61_SOL},
+    "claude-opus-5-5":  {"label": "Claude Opus 5.5", "tiers": ("heavy",),
+                           "efforts": _EFFORT_CLAUDE_55},
+    "claude-sonnet-5-5": {"label": "Claude Sonnet 5.5", "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_CLAUDE_55},
     "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": (),
                            "efforts": _EFFORT_OPENAI_SOL},
     "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
@@ -497,7 +509,7 @@ LLM_MODELS: dict[str, dict] = {
                            "efforts": _EFFORT_GROK_46},
     "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
                            "efforts": _EFFORT_DEEPSEEK},
-    "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy",),
+    "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GEMINI_38},
     "deepseek-v4.1-flash": {
         "label": "DeepSeek V4.1 Flash", "tiers": ("heavy", "balanced"),
@@ -512,7 +524,7 @@ LLM_MODELS: dict[str, dict] = {
                            "efforts": _EFFORT_GLM_53_FLASH},
     "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
                            "efforts": _EFFORT_GROK_45},
-    "grok-4.7":         {"label": "Grok 4.7", "tiers": ("heavy",),
+    "grok-4.7":         {"label": "Grok 4.7", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GROK_46},
     # ── 轻型池：走地实时研判 ──
     "gpt-5.6-luna":     {"label": "GPT-5.6 Luna", "tiers": ("light",),
@@ -628,6 +640,8 @@ LLM_ROUTE_GROUPS: dict[str, dict] = {
                "families": ("glm",)},
     "ik_gemini": {"label": "IKuncode · Gemini", "provider": "ikuncode",
                   "families": ("gemini",)},
+    "ik_claude": {"label": "IKuncode · Claude", "provider": "ikuncode",
+                  "families": ("claude",)},
     "openai_gpt": {"label": "OpenAI 官方 · GPT", "provider": "openai",
                    "families": ("gpt",)},
 }
@@ -640,6 +654,7 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
     "deepseek": "ik_deepseek",
     "glm": "ik_glm",
     "gemini": "ik_gemini",
+    "claude": "ik_claude",
 }
 
 # 显式覆盖：走官方供应商而非中转的少数模型。只有这里需要手写。

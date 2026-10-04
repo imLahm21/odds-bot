@@ -130,23 +130,30 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 
 | 档位 | 用途 | 可选模型池 | 管理员主模型 | 访客主模型 |
 |------|------|------------------------|--------------|------------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-5.6-sol` `gemini-3.8-flash` `glm-5.3` `grok-4.6` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
-| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-5.6-terra` `deepseek-v4.1-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4.1-flash` |
-| 轻档 light | 走地实时研判 | `gpt-5.6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-6-sol` `gpt-6.1-sol` `claude-opus-5-5` `claude-sonnet-5-5` `gemini-3.8-flash` `glm-5.3` `grok-4.6` `grok-4.7` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-6-sol` `gpt-6.1-sol` `claude-sonnet-5-5` `grok-4.6` `grok-4.7` `gemini-3.8-flash` `gpt-5.6-terra` `deepseek-v4.1-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4.1-flash` |
+| 轻档 light | 走地实时研判 | `gpt-5.6-luna` `gpt-6-luna` | `gpt-5.6-luna` | `gpt-5.6-luna` |
 
 **按用途分池**：`/llm` 面板的模型选择器只列目标档允许的模型。为保留现有 balanced
 默认/回退，`gpt-5.6-terra`、`deepseek-v4.1-flash` 与 `glm-5.3-flash` 同时开放给 heavy 和 balanced；light
 仍严格隔离，不会把重档推理模型塞进走地 1min 循环。加新模型 / 调整分档只改 `bot/config.py` 的
-`LLM_MODELS`（改完需重启一次；之后面板内切换免重启）。
+`LLM_MODELS`（改完需重启一次；之后面板内切换免重启）。新增模型同时在部署 `.env` 的
+`LLM_MODEL_MAX_TOKENS` 和 `LLM_MODEL_INPUT_WARN_TOKENS` 两个映射中登记；模型 ID 必须完全一致。
+输出预算是 reasoning token 与正文的合计上限，输入预警线只做提醒；显式传入的任务输出预算优先。
 
-**密钥按授权组隔离**：不同模型家族（GPT/Grok/DeepSeek/GLM/Gemini）通常需要不同的密钥——
+**密钥按授权组隔离**：不同模型家族（GPT/Grok/DeepSeek/GLM/Gemini/Claude）通常需要不同的密钥——
 一条只授权 GPT 的密钥请求 Grok 必然 403。每个模型按名字前缀自动归到对应授权组
-（`ik_gpt`/`ik_grok`/`ik_deepseek`/`ik_glm`/`ik_gemini`/`openai_gpt`），一条密钥只属于一个组，
+（`ik_gpt`/`ik_grok`/`ik_deepseek`/`ik_glm`/`ik_gemini`/`ik_claude`/`openai_gpt`），一条密钥只属于一个组，
 组内可配多条密钥轮转。缺组时该组模型在 `/llm` 面板标 ❌，可用回退模型顶上。
+
+**Claude 接入**：`ik_claude` 使用 IK 的 OpenAI 兼容接口 `/v1/chat/completions`，
+复用现有阻塞/流式客户端。Base URL 填 `https://api.ikuncode.ai/v1`，不要填完整 `/messages`
+地址。Opus 5.5 开放重档，Sonnet 5.5 开放重档和平衡档；默认主模型和回退槽不变。
+管理员提供五档，访客仍只提供 low/medium/high。固定全模型会诊的任务分工保持原配置。
 
 **回退模型**默认刻意选与主模型**不同密钥组**的同档模型（如重档管理员主 `gpt-6-astra`
 走 `ik_gpt`、回退 `grok-4.6` 走 `ik_grok`），这样主组整组挂掉（限流/密钥失效/熔断）
-时才有逃生价值。轻型池只有一个模型，故轻档回退默认留空（不做跨档逃生）。
+时才有逃生价值。轻型池的两款 Luna 共用官方授权组，轻档回退默认留空（不做跨档逃生）。
 
 **全模型交叉会诊**：管理员在 `/analyze` 中可选择 `🧪 全模型交叉会诊`，再选择标准会诊或
 自定义侧重会诊。该模式固定调用模型池中的 11 个模型：各模型只处理自己的模块，最后由
@@ -168,11 +175,16 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
   |------|----------|
   | `gpt-6-astra` | `low` `medium` `high` `xhigh` `max` `ultra`（`ultra` 为当前 IK 网关实测扩展） |
   | `gpt-5.6-sol` | `none` `low` `medium` `high` `xhigh` `max` `ultra`（`ultra` 为当前 IK 网关实测扩展） |
+  | `gpt-6-sol` | `none` `low` `medium` `high` `xhigh` `max` `ultra` |
+  | `gpt-6.1-sol` | `low` `medium` `high` `xhigh` `max`（2026-10-04 Mixed/Pro 两条端点实测；none/minimal/ultra 返回 400） |
+  | `claude-opus-5-5` / `claude-sonnet-5-5` | `low` `medium` `high` `xhigh` `max`（官方五档；IK 兼容路径发送 reasoning_effort） |
   | `gpt-5.6-terra` | `none` `low` `medium` `high` `xhigh` `max` |
   | `gpt-5.6-luna` | `none` `low` `medium` `high` `xhigh` `max`（`max` 按管理要求保留；当前官方端点实测返回 400） |
   | `glm-5.3` | `low` `high` `max` |
-  | `glm-5.3-flash` | `low` `high` `max`（两条 `ik_glm` 端点均已实测接受） |
+  | `glm-5.3-flash` | `low` `high` `max`（2026-10-04 两条端点均完成请求；其他值可能回落 max，不能以 HTTP 200 判为独立强度） |
   | `grok-4.6` | `low` `medium` `high` `xhigh` |
+  | `grok-4.7` | `low` `medium` `high` `xhigh` |
+  | `gpt-6-luna` | `none` `low` `medium` `high` `xhigh` `max` |
   | `grok-4.5` | `low` `medium` `high` |
   | DeepSeek V4 系列 | `none` `low` `high` `max` |
   | `gemini-3.8-flash` | `low` `medium` `high` |
@@ -181,6 +193,7 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
   如需核对同组每条 key，追加 `--all-endpoints`。输出仅含端点标签、HTTP状态、延迟、
   响应模型及 usage，不输出密钥或回答正文；`accepted_budget_exhausted` 表示参数已被接受、
   只是探针输出预算不足，不应误判成模型/强度不可用。
+  `accepted` 仅证明请求正常返回；模型可能忽略参数或将未知值回落到默认强度。
 - **多端点故障转移**：同组内多条密钥自动轮转/切换；某模型所在组全部熔断/无密钥时，
   自动升级到该槽位设定的回退模型（可能落到另一个密钥组）。坏端点触发熔断后冷却自动
   恢复，熔断/恢复会 TG 告警管理员。
@@ -324,15 +337,15 @@ TELEGRAM_ADMIN_CHAT_IDS=你的chat_id
 
 # LLM 密钥按授权组配置；逗号分隔，格式：group|key|base_url|标签
 # 同一组可重复多条 key，bot 只在组内轮转；一条 key 不得重复放进多个组。
-LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,ik_claude|<IK_CLAUDE_KEY>|https://api.ikuncode.ai/v1|IK-Claude,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
 # 重档报告输出预算（推理 token + 可见正文），不写时默认 32000。
 LLM_MAX_TOKENS=32000
 # 可选：按模型覆盖；没有列出的模型继续使用 LLM_MAX_TOKENS。
-# LLM_MODEL_MAX_TOKENS=model-id:48000,another-model:64000
+# LLM_MODEL_MAX_TOKENS=gpt-6.1-sol:128000,glm-5.3-flash:131072,claude-opus-5-5:128000,claude-sonnet-5-5:128000
 # 输入 token 估算预警线；仅提醒和记录，绝不截断、压缩或阻止请求。
 LLM_INPUT_WARN_TOKENS=240000
 # 可选：按模型设置预警线。
-# LLM_MODEL_INPUT_WARN_TOKENS=model-id:220000,another-model:300000
+# LLM_MODEL_INPUT_WARN_TOKENS=gpt-6.1-sol:700000,glm-5.3-flash:700000,claude-opus-5-5:700000,claude-sonnet-5-5:700000
 # 旧 LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS 已彻底不参与路由（无论是否设置这个新变量都一样）；
 # 留着不会报错，但 /llm 面板会提示删除，避免误以为它们仍生效。
 # 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。

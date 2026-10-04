@@ -99,7 +99,8 @@ class TestMultiAnalyzer(unittest.TestCase):
         self.assertEqual(
             set(config.llm_tier_eligible_models("balanced")),
             {"gpt-6-sol", "grok-4.6", "gpt-5.6-terra", "deepseek-v4.1-flash",
-             "glm-5.3-flash", "grok-4.5"},
+             "glm-5.3-flash", "grok-4.5", "gpt-6.1-sol", "grok-4.7",
+             "gemini-3.8-flash", "claude-sonnet-5-5"},
         )
         models = {task["model"] for task in config.FULL_CONSULT_TASKS}
         models.add(config.FULL_CONSULT_SYNTHESIS["model"])

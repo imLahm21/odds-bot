@@ -16,6 +16,9 @@ from bot import config, llm_client
 
 DEFAULT_MODELS = (
     "gpt-6-astra",
+    "gpt-6.1-sol",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
     "gpt-5.6-sol",
     "glm-5.3",
     "grok-4.6",
@@ -34,7 +37,7 @@ def _endpoint_indices(model: str) -> tuple[int, ...]:
 
 
 def _probe_status(result: dict) -> str:
-    """区分参数拒绝与预算耗尽；reasoning_tokens=0 不能证明档位不可用。"""
+    """标记请求结果；accepted 不证明强度生效，端点可能忽略参数或回落。"""
     if not result.get("ok"):
         return "rejected"
     if result.get("finish_reason") == "length":

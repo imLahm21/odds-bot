@@ -169,6 +169,9 @@ class TestModelProfile(unittest.TestCase):
                 "gpt-6-astra": ("ik_gpt",),
                 "gpt-5.6-sol": ("ik_gpt",),
                 "gpt-6-sol": ("ik_gpt",),
+                "gpt-6.1-sol": ("ik_gpt",),
+                "claude-opus-5-5": ("ik_claude",),
+                "claude-sonnet-5-5": ("ik_claude",),
                 "grok-4.7": ("ik_grok",),
                 "gpt-6-luna": ("openai_gpt",),
                 "gemini-3.8-flash": ("ik_gemini",),
@@ -216,18 +219,21 @@ class TestModelProfile(unittest.TestCase):
         balanced = set(config.llm_tier_eligible_models("balanced"))
         light = set(config.llm_tier_eligible_models("light"))
         self.assertEqual(heavy, {
-            "gpt-6-astra", "gpt-6-sol", "gemini-3.8-flash", "glm-5.3",
+            "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gemini-3.8-flash", "glm-5.3",
             "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
             "gpt-5.6-terra", "glm-5.3-flash", "grok-4.7",
+            "claude-opus-5-5", "claude-sonnet-5-5",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "glm-5.3-flash", "grok-4.5",
-                                    "gpt-6-sol", "grok-4.6"})
+                                    "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
+                                    "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5"})
         self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {"gpt-5.6-terra", "deepseek-v4.1-flash",
-                          "glm-5.3-flash", "gpt-6-sol", "grok-4.6"})
+                          "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
+                          "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 
@@ -246,6 +252,11 @@ class TestModelProfile(unittest.TestCase):
                           "ultra"))
         self.assertEqual(config.llm_model_efforts("gpt-6-sol"),
                          config.llm_model_efforts("gpt-5.6-sol"))
+        self.assertEqual(config.llm_model_efforts("gpt-6.1-sol"),
+                         ("low", "medium", "high", "xhigh", "max"))
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            self.assertEqual(config.llm_model_efforts(model),
+                             ("low", "medium", "high", "xhigh", "max"))
         self.assertEqual(config.llm_model_efforts("grok-4.7"),
                          config.llm_model_efforts("grok-4.6"))
         self.assertEqual(config.llm_model_efforts("gpt-6-luna"),
@@ -256,6 +267,8 @@ class TestModelProfile(unittest.TestCase):
                          ("low", "high", "max"))
         self.assertEqual(config.llm_model_efforts("glm-5.3-flash"),
                          ("low", "high", "max"))
+        for effort in ("none", "minimal", "medium", "xhigh", "ultra"):
+            self.assertFalse(config.llm_model_supports_effort("glm-5.3-flash", effort))
         self.assertEqual(config.llm_model_efforts("grok-4.6"),
                          ("low", "medium", "high", "xhigh"))
         self.assertEqual(config.llm_model_efforts("deepseek-v4.1-flash"),
@@ -389,6 +402,51 @@ class TestModelProfile(unittest.TestCase):
             force_effort=True)
         self.assertEqual(forced["reasoning_effort"], "xhigh")
 
+    def test_gpt_61_sol_keyboard_and_request_efforts(self):
+        with (
+            patch.object(tgbot, "_is_admin", return_value=True),
+            patch.object(llm_client, "get_tier_model", return_value="gpt-6.1-sol"),
+        ):
+            buttons = [button["callback_data"]
+                       for row in tgbot._effort_keyboard(1, "p", 99)["inline_keyboard"]
+                       for button in row]
+        self.assertEqual(buttons, ["ae:p:99:low", "ae:p:99:medium", "ae:p:99:high",
+                                   "ae:p:99:xhigh", "ae:p:99:max"])
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                payload = llm_client._payload(
+                    "gpt-6.1-sol", "system", "user", 4096, effort, False, "ik_gpt")
+                self.assertEqual(payload["reasoning_effort"], effort)
+        for effort in ("none", "minimal", "ultra"):
+            with self.subTest(effort=effort), self.assertLogs("odds_bot.llm", level="WARNING"):
+                payload = llm_client._payload(
+                    "gpt-6.1-sol", "system", "user", 4096, effort, False, "ik_gpt")
+                self.assertNotIn("reasoning_effort", payload)
+
+    def test_added_tier_choices_can_be_saved_and_survive_seed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(db.SCHEMA)
+            db.seed_config(conn)
+            choices = {"heavy": ("gpt-6.1-sol", "claude-opus-5-5", "claude-sonnet-5-5"),
+                       "balanced": ("gpt-6.1-sol", "grok-4.7", "gemini-3.8-flash",
+                                    "claude-sonnet-5-5")}
+            for tier, models in choices.items():
+                for model in models:
+                    for role in ("", "_visitor"):
+                        for kind in ("model", "fallback"):
+                            key = f"{kind}_{tier}{role}"
+                            with self.subTest(key=key, model=model):
+                                self.assertTrue(db.set_llm_runtime_state(conn, key, model))
+                                db.seed_config(conn)
+                                self.assertEqual(db.get_llm_runtime_state(conn)[key], model)
+            self.assertFalse(db.set_llm_runtime_state(conn, "model_light", "gpt-6.1-sol"))
+            for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+                self.assertFalse(db.set_llm_runtime_state(conn, "model_light", model))
+            self.assertFalse(db.set_llm_runtime_state(conn, "model_balanced", "claude-opus-5-5"))
+        finally:
+            conn.close()
+
     def test_effort_probe_distinguishes_rejection_from_budget_exhaustion(self):
         self.assertEqual(probe_llm_efforts._probe_status({"ok": False}),
                          "rejected")
@@ -408,15 +466,58 @@ class TestModelProfile(unittest.TestCase):
             "ik_deepseek|key-deepseek|https://api.ikuncode.cc/v1|IK-DeepSeek,"
             "ik_glm|key-glm|https://api.ikuncode.cc/v1|IK-GLM,"
             "ik_gemini|key-gemini|https://api.ikuncode.cc/v1|IK-Gemini,"
+            "ik_claude|key-claude|https://api.ikuncode.ai/v1|IK-Claude,"
             "openai_gpt|key-openai|https://api.openai.com/v1|OpenAI-Luna"
         )
         endpoints = llm_client._parse_route_endpoints(raw)
-        self.assertEqual(len(endpoints), 7)
+        self.assertEqual(len(endpoints), 8)
         self.assertEqual(
             [ep["route_group"] for ep in endpoints].count("ik_gpt"), 2)
         self.assertEqual(
             {frozenset(ep) for ep in endpoints},
             {frozenset({"key", "base_url", "label", "route_group"})})
+
+    def test_claude_routes_only_to_its_credential_group(self):
+        endpoints = llm_client._parse_route_endpoints(
+            "ik_gpt|test-gpt-key|https://api.ikuncode.cc/v1|GPT,"
+            "ik_claude|test-claude-key|https://api.ikuncode.ai/v1|Claude")
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", [_FakeBreaker(), _FakeBreaker()]),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+        ):
+            for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+                with self.subTest(model=model):
+                    self.assertEqual(config.llm_route_groups_for_model(model), ("ik_claude",))
+                    self.assertEqual(llm_client.configured_count_for_model(model), 1)
+                    self.assertFalse(llm_client._supports_model(endpoints[0], model))
+                    self.assertEqual(llm_client._endpoints_by_priority(model), [(1, endpoints[1])])
+                    self.assertEqual(probe_llm_efforts._endpoint_indices(model), (1,))
+
+    def test_claude_effort_keyboard_and_compatible_payload(self):
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            for admin, efforts in ((True, ("low", "medium", "high", "xhigh", "max")),
+                                   (False, ("low", "medium", "high"))):
+                with (
+                    self.subTest(model=model, admin=admin),
+                    patch.object(tgbot, "_is_admin", return_value=admin),
+                    patch.object(llm_client, "get_tier_model", return_value=model),
+                ):
+                    callbacks = [button["callback_data"]
+                                 for row in tgbot._effort_keyboard(1, "p", 99)["inline_keyboard"]
+                                 for button in row]
+                    self.assertEqual(callbacks, [f"ae:p:99:{effort}" for effort in efforts])
+            for effort in ("low", "medium", "high", "xhigh", "max"):
+                with self.subTest(model=model, effort=effort):
+                    payload = llm_client._payload(
+                        model, "system", "user", 128000, effort, True, "ik_claude")
+                    self.assertEqual(payload["max_tokens"], 128000)
+                    self.assertNotIn("max_completion_tokens", payload)
+                    self.assertEqual(payload["reasoning_effort"], effort)
+                    self.assertTrue(payload["stream"])
+            for effort in ("none", "ultra"):
+                self.assertFalse(config.llm_model_supports_effort(model, effort))
 
     def test_legacy_env_vars_no_longer_produce_endpoints(self):
         """旧变量彻底不参与路由，但必须被显式报出来，不能沉默。"""
@@ -454,7 +555,7 @@ class TestModelProfile(unittest.TestCase):
         }
 
     def _all_group_endpoints(self):
-        """五个组各一条端点，供「全组齐备」场景复用。"""
+        """每个已注册组各一条端点，供「全组齐备」场景复用。"""
         return [self._group_endpoint(group, group)
                 for group in config.LLM_ROUTE_GROUPS]
 
