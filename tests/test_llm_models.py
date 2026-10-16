@@ -175,6 +175,7 @@ class TestModelProfile(unittest.TestCase):
                 "grok-4.7": ("ik_grok",),
                 "gpt-6-luna": ("openai_gpt",),
                 "gemini-3.8-flash": ("ik_gemini",),
+                "gemini-4-argon": ("ik_gemini",),
                 "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
                 "deepseek-v4-pro": ("ik_deepseek",),
@@ -222,18 +223,20 @@ class TestModelProfile(unittest.TestCase):
             "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gemini-3.8-flash", "glm-5.3",
             "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
             "gpt-5.6-terra", "glm-5.3-flash", "grok-4.7",
-            "claude-opus-5-5", "claude-sonnet-5-5",
+            "claude-opus-5-5", "claude-sonnet-5-5", "gemini-4-argon",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "glm-5.3-flash", "grok-4.5",
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
-                                    "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5"})
+                                    "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
+                                    "gemini-4-argon"})
         self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {"gpt-5.6-terra", "deepseek-v4.1-flash",
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
-                          "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5"})
+                          "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
+                          "gemini-4-argon"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 
@@ -244,6 +247,8 @@ class TestModelProfile(unittest.TestCase):
             "xhigh": "极高 / xhigh", "max": "最高 / max", "ultra": "超高 / ultra",
         })
         self.assertEqual(config.llm_model_efforts("gemini-3.8-flash"),
+                         ("low", "medium", "high"))
+        self.assertEqual(config.llm_model_efforts("gemini-4-argon"),
                          ("low", "medium", "high"))
         self.assertEqual(config.llm_model_efforts("gpt-6-astra"),
                          ("low", "medium", "high", "xhigh", "max", "ultra"))
@@ -428,9 +433,10 @@ class TestModelProfile(unittest.TestCase):
         try:
             conn.executescript(db.SCHEMA)
             db.seed_config(conn)
-            choices = {"heavy": ("gpt-6.1-sol", "claude-opus-5-5", "claude-sonnet-5-5"),
+            choices = {"heavy": ("gpt-6.1-sol", "claude-opus-5-5", "claude-sonnet-5-5",
+                                  "gemini-4-argon"),
                        "balanced": ("gpt-6.1-sol", "grok-4.7", "gemini-3.8-flash",
-                                    "claude-sonnet-5-5")}
+                                    "claude-sonnet-5-5", "gemini-4-argon")}
             for tier, models in choices.items():
                 for model in models:
                     for role in ("", "_visitor"):

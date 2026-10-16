@@ -485,6 +485,10 @@ _EFFORT_GROK_46 = ("low", "medium", "high", "xhigh")
 _EFFORT_GROK_45 = ("low", "medium", "high")
 _EFFORT_DEEPSEEK = ("none", "low", "high", "max")
 _EFFORT_GEMINI_38 = ("low", "medium", "high")
+# Google documents low/medium/high (default medium); IK support is not yet probed.
+# https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
+# https://ai.google.dev/gemini-api/docs/openai#thinking
+_EFFORT_GEMINI_4_ARGON = ("low", "medium", "high")
 # 两款 Claude 5.5 按官方五档登记；IK 兼容接口已通过阻塞/流式探针。
 _EFFORT_CLAUDE_55 = ("low", "medium", "high", "xhigh", "max")
 
@@ -531,6 +535,9 @@ LLM_MODELS: dict[str, dict] = {
                            "efforts": _EFFORT_OPENAI_LUNA},
     "gpt-6-luna":      {"label": "GPT-6 Luna", "tiers": ("light",),
                            "efforts": _EFFORT_OPENAI_LUNA},
+    # Append new candidates to preserve existing index-based menu callbacks.
+    "gemini-4-argon":   {"label": "Gemini 4 Argon", "tiers": ("heavy", "balanced"),
+                           "efforts": _EFFORT_GEMINI_4_ARGON},
 }
 
 
