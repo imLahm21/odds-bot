@@ -7,5 +7,5 @@ typesafe-sdk==0.7.1
 apscheduler==3.11.2
 
 # Ghost 博客发布（/publish 命令）
-PyJWT==2.13.0
+PyJWT==2.15.0
 markdown==3.10.2
