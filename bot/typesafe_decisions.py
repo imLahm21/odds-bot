@@ -1184,7 +1184,7 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
     elif selection.source == "jev_pass":
         source_line = f"Jev（{jev_note}）判定 PASS：正 edge 候选均与第 7 节结论不一致"
     elif selection.source == "no_positive_edge":
-        source_line = "代码判定：无 eligible 且 edge>0 的候选，直接 pass（未调用 Jev）"
+        source_line = "代码判定：无符合条件且 edge>0 的候选，直接 pass（未调用 Jev）"
     elif selection.source == "zero_stake":
         source_line = (f"选定项 edge 过薄，按 k={_k_label(selection.k)} 算出的注额舍入为 0，"
                        f"不下注")

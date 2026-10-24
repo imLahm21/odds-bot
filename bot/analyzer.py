@@ -14,7 +14,7 @@ import threading
 
 from dotenv import load_dotenv
 
-from . import config, llm_client, goals_model, typesafe_decisions
+from . import config, llm_client, goals_model, typesafe_decisions, report_display
 
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
@@ -206,6 +206,11 @@ def strip_rules_manifest(text: str) -> str:
     TG 是纯文本，HTML 注释会原样露出；发布正文不该带内部规则指纹。
     """
     return _MANIFEST_RE.sub("", text).rstrip() + "\n"
+
+
+def prepare_report_for_display(text: str) -> str:
+    """统一清理用户展示正文；原始报告、资格筛选与机器可读决策保持不变。"""
+    return report_display.hide_eligibility_column(strip_rules_manifest(text))
 
 
 def format_rules_manifest(mf: dict) -> str:

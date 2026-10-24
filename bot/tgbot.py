@@ -1396,10 +1396,10 @@ def _md_to_tg(text: str) -> str:
     - 列表符号 '- ' / '* ' → '• '（保留缩进层级）
     - 去掉引用符号 '> '
     - 剥掉末尾规则指纹区块（TG 是纯文本，HTML 注释会原样露出给用户）
-    表格行（含 |）保持原样不动。
+    候选表隐藏内部资格列；其他表格行（含 |）保持原样。
     """
     import re
-    text = analyzer.strip_rules_manifest(text)
+    text = analyzer.prepare_report_for_display(text)
     out = []
     for line in text.split("\n"):
         # 标题：行首 1~6 个 # + 空格 → 去掉
