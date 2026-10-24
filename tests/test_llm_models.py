@@ -171,12 +171,12 @@ class TestModelProfile(unittest.TestCase):
                 "gpt-5.6-sol": ("ik_gpt",),
                 "gpt-6-sol": ("ik_gpt",),
                 "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
-                "claude-opus-5-5": ("ik_claude", "cpa_claude"),
-                "claude-sonnet-5-5": ("ik_claude", "cpa_claude"),
+                "claude-opus-5-5": ("ik_claude",),
+                "claude-sonnet-5-5": ("ik_claude",),
                 "grok-4.7": ("ik_grok",),
                 "gpt-6-luna": ("cpa_gpt",),
-                "gemini-3.8-flash": ("ik_gemini", "cpa_gemini"),
-                "gemini-4-argon": ("ik_gemini", "cpa_gemini"),
+                "gemini-3.8-flash": ("ik_gemini",),
+                "gemini-4-argon": ("ik_gemini",),
                 "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
                 "deepseek-v4-pro": ("ik_deepseek",),
@@ -185,6 +185,10 @@ class TestModelProfile(unittest.TestCase):
                 "glm-5.3-flash": ("ik_glm",),
                 "grok-4.5": ("ik_grok",),
                 "gpt-5.6-luna": ("cpa_gpt",),
+                "claude-opus-5-5-high": ("cpa_claude",),
+                "claude-sonnet-5-5-high": ("cpa_claude",),
+                "gemini-3.8-flash-high": ("cpa_gemini",),
+                "gemini-4-argon-high": ("cpa_gemini",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -225,21 +229,40 @@ class TestModelProfile(unittest.TestCase):
             "grok-4.6", "deepseek-v4-pro", "deepseek-v4.1-flash",
             "gpt-5.6-terra", "glm-5.3-flash", "grok-4.7",
             "claude-opus-5-5", "claude-sonnet-5-5", "gemini-4-argon",
+            "claude-opus-5-5-high", "claude-sonnet-5-5-high",
+            "gemini-3.8-flash-high", "gemini-4-argon-high",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "glm-5.3-flash", "grok-4.5",
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                                     "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
-                                    "gemini-4-argon"})
+                                    "gemini-4-argon", "claude-sonnet-5-5-high",
+                                    "gemini-3.8-flash-high", "gemini-4-argon-high"})
         self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {"gpt-5.6-terra", "deepseek-v4.1-flash",
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
-                          "gemini-4-argon"})
+                          "gemini-4-argon", "claude-sonnet-5-5-high",
+                          "gemini-3.8-flash-high", "gemini-4-argon-high"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
+
+    def test_cpa_models_are_appended_without_reordering_existing_menu_indices(self):
+        new_models = (
+            "claude-opus-5-5-high", "claude-sonnet-5-5-high",
+            "gemini-3.8-flash-high", "gemini-4-argon-high",
+        )
+        self.assertEqual(tuple(config.LLM_MODELS)[-4:], new_models)
+        for tier, expected in (
+            ("heavy", new_models),
+            ("balanced", new_models[1:]),
+        ):
+            self.assertEqual(tuple(config.llm_tier_eligible_models(tier))[-len(expected):],
+                             expected)
+        self.assertEqual(config.llm_tier_eligible_models("light"),
+                         ["gpt-5.6-luna", "gpt-6-luna"])
 
     def test_effort_labels_and_per_model_capabilities(self):
         self.assertEqual(config.LLM_EFFORT_LABELS, {
@@ -312,6 +335,29 @@ class TestModelProfile(unittest.TestCase):
             self.assertEqual(
                 config.llm_input_warn_tokens_for_model("gpt-6-astra"),
                 240000)
+
+    def test_cpa_model_budgets_are_independent_from_ik_standard_names(self):
+        budgets = config._parse_model_token_limits(
+            "claude-opus-5-5:128000,claude-opus-5-5-high:64000,"
+            "claude-sonnet-5-5-high:128000,gemini-3.8-flash-high:65536,"
+            "gemini-4-argon-high:65536")
+        warnings = config._parse_model_token_limits(
+            "claude-opus-5-5:500000,claude-opus-5-5-high:700000,"
+            "claude-sonnet-5-5-high:700000,gemini-3.8-flash-high:700000,"
+            "gemini-4-argon-high:700000")
+        with (
+            patch.object(config, "LLM_MODEL_MAX_TOKENS", budgets),
+            patch.object(config, "LLM_MODEL_INPUT_WARN_TOKENS", warnings),
+        ):
+            self.assertEqual(config.llm_max_tokens_for_model("claude-opus-5-5"), 128000)
+            self.assertEqual(config.llm_max_tokens_for_model("claude-opus-5-5-high"), 64000)
+            self.assertEqual(config.llm_input_warn_tokens_for_model("claude-opus-5-5"), 500000)
+            for model in (
+                "claude-opus-5-5-high", "claude-sonnet-5-5-high",
+                "gemini-3.8-flash-high", "gemini-4-argon-high",
+            ):
+                self.assertEqual(config.llm_max_tokens_for_model(model), budgets[model])
+                self.assertEqual(config.llm_input_warn_tokens_for_model(model), 700000)
 
     def test_analyze_prompt_reports_component_sizes_without_changing_content(self):
         metrics = {}
@@ -435,9 +481,13 @@ class TestModelProfile(unittest.TestCase):
             conn.executescript(db.SCHEMA)
             db.seed_config(conn)
             choices = {"heavy": ("gpt-6.1-sol", "claude-opus-5-5", "claude-sonnet-5-5",
-                                  "gemini-4-argon"),
+                                  "gemini-4-argon", "claude-opus-5-5-high",
+                                  "claude-sonnet-5-5-high", "gemini-3.8-flash-high",
+                                  "gemini-4-argon-high"),
                        "balanced": ("gpt-6.1-sol", "grok-4.7", "gemini-3.8-flash",
-                                    "claude-sonnet-5-5", "gemini-4-argon")}
+                                    "claude-sonnet-5-5", "gemini-4-argon",
+                                    "claude-sonnet-5-5-high", "gemini-3.8-flash-high",
+                                    "gemini-4-argon-high")}
             for tier, models in choices.items():
                 for model in models:
                     for role in ("", "_visitor"):
@@ -448,9 +498,12 @@ class TestModelProfile(unittest.TestCase):
                                 db.seed_config(conn)
                                 self.assertEqual(db.get_llm_runtime_state(conn)[key], model)
             self.assertFalse(db.set_llm_runtime_state(conn, "model_light", "gpt-6.1-sol"))
-            for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            for model in ("claude-opus-5-5", "claude-sonnet-5-5",
+                          "claude-opus-5-5-high", "claude-sonnet-5-5-high",
+                          "gemini-3.8-flash-high", "gemini-4-argon-high"):
                 self.assertFalse(db.set_llm_runtime_state(conn, "model_light", model))
             self.assertFalse(db.set_llm_runtime_state(conn, "model_balanced", "claude-opus-5-5"))
+            self.assertFalse(db.set_llm_runtime_state(conn, "model_balanced", "claude-opus-5-5-high"))
         finally:
             conn.close()
 
@@ -496,8 +549,7 @@ class TestModelProfile(unittest.TestCase):
         ):
             for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
                 with self.subTest(model=model):
-                    self.assertEqual(config.llm_route_groups_for_model(model),
-                                     ("ik_claude", "cpa_claude"))
+                    self.assertEqual(config.llm_route_groups_for_model(model), ("ik_claude",))
                     self.assertEqual(llm_client.configured_count_for_model(model), 1)
                     self.assertFalse(llm_client._supports_model(endpoints[0], model))
                     self.assertEqual(llm_client._endpoints_by_priority(model), [(1, endpoints[1])])
@@ -588,11 +640,11 @@ class TestModelProfile(unittest.TestCase):
                 self.assertEqual(len(endpoints), 1)
                 self.assertNotIn("private-test-key", "\n".join(captured.output))
 
-    def test_cpa_routes_and_payloads_use_standard_model_names(self):
+    def test_cpa_routes_and_payloads_use_exact_provider_model_names(self):
         expected = {
             "cpa_gpt": {"gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-luna", "gpt-6-luna"},
-            "cpa_claude": {"claude-opus-5-5", "claude-sonnet-5-5"},
-            "cpa_gemini": {"gemini-3.8-flash", "gemini-4-argon"},
+            "cpa_claude": {"claude-opus-5-5-high", "claude-sonnet-5-5-high"},
+            "cpa_gemini": {"gemini-3.8-flash-high", "gemini-4-argon-high"},
         }
         endpoints = llm_client._parse_route_endpoints(
             ",".join(f"{group}|test-key-{group}|https://cpa.example.test:8443/v1|{group}"
@@ -615,11 +667,55 @@ class TestModelProfile(unittest.TestCase):
                         self.assertEqual(payload["reasoning_effort"], "high")
                         self.assertEqual(probe_llm_efforts._endpoint_indices(model),
                                          tuple(idx for idx, _ in routed))
-            for model in ("gpt-6-sol", "gpt-5.6-terra", "xhgj-v1-flash", "xhgj-v1-pro"):
+            for model in ("gpt-6-sol", "gpt-5.6-terra", "xhgj-v1-flash", "xhgj-v1-pro",
+                          "claude-opus-5-5", "claude-sonnet-5-5",
+                          "gemini-3.8-flash", "gemini-4-argon"):
                 self.assertEqual(llm_client.configured_count_for_model(model), 0)
         self.assertNotIn("openai_gpt", config.LLM_ROUTE_GROUPS)
         self.assertFalse(config.llm_model_registered("xhgj-v1-flash"))
         self.assertFalse(config.llm_model_registered("xhgj-v1-pro"))
+
+    def test_ik_and_cpa_probes_keep_exact_model_ids_and_do_not_cross_groups(self):
+        groups = ("ik_claude", "cpa_claude", "ik_gemini", "cpa_gemini")
+        endpoints = [self._group_endpoint(group, group) for group in groups]
+        cases = (
+            ("claude-opus-5-5", "ik_claude"),
+            ("claude-sonnet-5-5", "ik_claude"),
+            ("gemini-3.8-flash", "ik_gemini"),
+            ("gemini-4-argon", "ik_gemini"),
+            ("claude-opus-5-5-high", "cpa_claude"),
+            ("claude-sonnet-5-5-high", "cpa_claude"),
+            ("gemini-3.8-flash-high", "cpa_gemini"),
+            ("gemini-4-argon-high", "cpa_gemini"),
+        )
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", [_FakeBreaker() for _ in endpoints]),
+            patch.object(llm_client, "_last_probe", {}),
+            patch.object(llm_client, "get_settings",
+                         return_value={"non_stream_timeout": 180}),
+        ):
+            for model, group in cases:
+                response = types.SimpleNamespace(
+                    status_code=200, text="",
+                    json=lambda: {"model": model, "choices": [
+                        {"finish_reason": "stop", "message": {"content": "pong"}}]},
+                )
+                for index, endpoint in enumerate(endpoints):
+                    with (
+                        self.subTest(model=model, group=endpoint["route_group"]),
+                        patch.object(llm_client.requests, "post",
+                                     return_value=response) as post,
+                    ):
+                        result = llm_client.probe_model(index, model, effort="medium")
+                        if endpoint["route_group"] != group:
+                            self.assertTrue(result["skipped"])
+                            post.assert_not_called()
+                        else:
+                            self.assertTrue(result["ok"])
+                            self.assertEqual(post.call_args.kwargs["json"]["model"], model)
+                            self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"],
+                                             "medium")
 
     @staticmethod
     def _group_endpoint(label, group):
@@ -842,15 +938,20 @@ class TestModelProfile(unittest.TestCase):
         edit.assert_called_once()
 
     def test_group_probe_keyboard_requires_one_model_choice(self):
-        keyboard = tgbot._llm_group_probe_keyboard("ik_gpt")
-        callbacks = [button["callback_data"]
-                     for row in keyboard["inline_keyboard"] for button in row]
-        model_callbacks = [cb for cb in callbacks if cb.startswith("ltgm:ik_gpt:")]
-        self.assertEqual(len(model_callbacks),
-                         len(config.llm_models_in_group("ik_gpt")))
-        self.assertIn("ltgm:ik_gpt:gpt-6-astra", model_callbacks)
-        self.assertTrue(all(len(cb.encode("utf-8")) <= 64 for cb in callbacks))
-        self.assertIn("lm:", callbacks)
+        for group in ("ik_gpt", "ik_claude", "ik_gemini", "cpa_claude", "cpa_gemini"):
+            with self.subTest(group=group):
+                keyboard = tgbot._llm_group_probe_keyboard(group)
+                callbacks = [button["callback_data"]
+                             for row in keyboard["inline_keyboard"] for button in row]
+                prefix = f"ltgm:{group}:"
+                choices = {cb[len(prefix):] for cb in callbacks if cb.startswith(prefix)}
+                self.assertEqual(choices, set(config.llm_models_in_group(group)))
+                if group in {"cpa_claude", "cpa_gemini"}:
+                    self.assertTrue(all(choice.endswith("-high") for choice in choices))
+                elif group in {"ik_claude", "ik_gemini"}:
+                    self.assertFalse(any(choice.endswith("-high") for choice in choices))
+                self.assertTrue(all(len(cb.encode("utf-8")) <= 64 for cb in callbacks))
+                self.assertIn("lm:", callbacks)
 
     def test_resolve_model_chain_drops_model_with_no_configured_group(self):
         """访客重档默认 deepseek，只买了 GPT 密钥时——链应该跳过它、退到回退模型，

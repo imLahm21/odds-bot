@@ -126,20 +126,25 @@ TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
 LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,ik_claude|<IK_CLAUDE_KEY>|https://api.ikuncode.ai/v1|IK-Claude,cpa_gpt|<CPA_GPT_KEY>|https://cpa.example.com:8443/v1|CPA-GPT,cpa_claude|<CPA_CLAUDE_KEY>|https://cpa.example.com:8443/v1|CPA-CLAUDE,cpa_gemini|<CPA_GEMINI_KEY>|https://cpa.example.com:8443/v1|CPA-GEMINI
 # Replace the CPA address and use a different key for each CPA group. Omit unused groups.
 # Luna models now use cpa_gpt; the old openai_gpt group has been removed.
-# Listed CPA models can rotate across configured IK/CPA endpoints of the same family.
-# Standard model names are sent unchanged; reasoning_effort is a separate field.
+# GPT-6 Astra and GPT-6.1 Sol can rotate across their configured IK/CPA groups.
+# Claude/Gemini standard IDs route only to IK. CPA uses these four separate IDs:
+# claude-opus-5-5-high (heavy), claude-sonnet-5-5-high (heavy/balanced),
+# gemini-4-argon-high and gemini-3.8-flash-high (heavy/balanced).
+# Selected IDs are sent unchanged; reasoning_effort remains a separate field.
+# CPA variants inherit local effort options; endpoint support still needs live probing.
+# Existing selections are preserved. Select the CPA variants in /llm to use CPA.
 # Both light-tier defaults and consultation data audit now use gpt-6-luna.
 # Startup migrates saved gpt-5.6-luna light-tier slots once, preserving other choices.
 # Claude uses the existing OpenAI-compatible Chat Completions client.
 # Opus 5.5: heavy; Sonnet 5.5: heavy + balanced. Primary/fallback defaults are unchanged.
 # Heavy-report output budget (reasoning + visible answer). Default: 32000.
-LLM_MAX_TOKENS=32000
+LLM_MAX_TOKENS=64000
 # Optional per-model overrides; unspecified models keep LLM_MAX_TOKENS.
-# LLM_MODEL_MAX_TOKENS=gpt-6.1-sol:128000,glm-5.3-flash:131072,claude-opus-5-5:128000,claude-sonnet-5-5:128000
+# LLM_MODEL_MAX_TOKENS=gpt-6.1-sol:128000,glm-5.3-flash:131072,claude-opus-5-5:128000,claude-sonnet-5-5:128000,claude-opus-5-5-high:128000,claude-sonnet-5-5-high:128000,gemini-4-argon-high:65536,gemini-3.8-flash-high:65536
 # Warn-only estimated input threshold; requests are never truncated or blocked.
 LLM_INPUT_WARN_TOKENS=240000
 # Optional per-model warning thresholds.
-# LLM_MODEL_INPUT_WARN_TOKENS=gpt-6.1-sol:700000,glm-5.3-flash:700000,claude-opus-5-5:700000,claude-sonnet-5-5:700000
+# LLM_MODEL_INPUT_WARN_TOKENS=gpt-6.1-sol:700000,glm-5.3-flash:700000,claude-opus-5-5:700000,claude-sonnet-5-5:700000,claude-opus-5-5-high:700000,claude-sonnet-5-5-high:700000,gemini-4-argon-high:700000,gemini-3.8-flash-high:700000
 # Legacy LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS are NOT read at all anymore (removed —
 # they were the root cause of a key being silently misrouted to unauthorized models).
 # Validate without printing keys: ./venv/bin/python -m bot.llm_client

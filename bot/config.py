@@ -538,6 +538,25 @@ LLM_MODELS: dict[str, dict] = {
     # Append new candidates to preserve existing index-based menu callbacks.
     "gemini-4-argon":   {"label": "Gemini 4 Argon", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GEMINI_4_ARGON},
+    # CPA 返回的完整模型 ID，与 IK 标准名分开登记；追加以保留已有菜单回调编号。
+    # efforts 沿用基础模型的本地能力表，CPA 是否接受及落实各档仍需单独探针验证。
+    # -high 作为模型名的一部分原样发送，不据此改写用户选择的 reasoning_effort。
+    "claude-opus-5-5-high": {
+        "label": "CPA · Claude Opus 5.5 High", "tiers": ("heavy",),
+        "efforts": _EFFORT_CLAUDE_55,
+    },
+    "claude-sonnet-5-5-high": {
+        "label": "CPA · Claude Sonnet 5.5 High", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_CLAUDE_55,
+    },
+    "gemini-3.8-flash-high": {
+        "label": "CPA · Gemini 3.8 Flash High", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_GEMINI_38,
+    },
+    "gemini-4-argon-high": {
+        "label": "CPA · Gemini 4 Argon High", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_GEMINI_4_ARGON,
+    },
 }
 
 
@@ -668,7 +687,8 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
     "claude": "ik_claude",
 }
 
-# 两款 Luna 合并到 cpa_gpt；其他已列出的 CPA 模型允许使用同家族 IK / CPA 端点。
+# 两款 Luna 走 cpa_gpt；已列出的同名 GPT 允许使用 IK / CPA 两组。
+# Claude / Gemini 标准名按家族走 IK，CPA 的 -high 完整 ID 仅走对应 CPA 组。
 # 返回多个组表示都可参与现有轮转，不表示元组前面的组始终优先。
 # 这里只声明程序允许的请求名，具体上游是否提供仍需通过该端点探针验证。
 LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -676,10 +696,10 @@ LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
     "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
     "gpt-5.6-luna": ("cpa_gpt",),
     "gpt-6-luna": ("cpa_gpt",),
-    "claude-opus-5-5": ("ik_claude", "cpa_claude"),
-    "claude-sonnet-5-5": ("ik_claude", "cpa_claude"),
-    "gemini-3.8-flash": ("ik_gemini", "cpa_gemini"),
-    "gemini-4-argon": ("ik_gemini", "cpa_gemini"),
+    "claude-opus-5-5-high": ("cpa_claude",),
+    "claude-sonnet-5-5-high": ("cpa_claude",),
+    "gemini-3.8-flash-high": ("cpa_gemini",),
+    "gemini-4-argon-high": ("cpa_gemini",),
 }
 
 

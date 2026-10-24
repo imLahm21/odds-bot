@@ -128,10 +128,10 @@ scripts/             # 本地维护、校准和 API/LLM 探针工具；清单见
 LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/访客两个角色，每个角色各有
 **主模型 + 回退模型**，共 12 个槽位，运行时可在 `/llm` 面板随时切换、免重启：
 
-| 档位 | 用途 | 可选模型池 | 管理员主模型 | 访客主模型 |
+| 档位 | 用途 | 可选模型池（CPA 变体见下表） | 管理员主模型 | 访客主模型 |
 |------|------|------------------------|--------------|------------|
-| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-6-sol` `gpt-6.1-sol` `claude-opus-5-5` `claude-sonnet-5-5` `gemini-3.8-flash` `glm-5.3` `grok-4.6` `grok-4.7` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
-| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-6-sol` `gpt-6.1-sol` `claude-sonnet-5-5` `grok-4.6` `grok-4.7` `gemini-3.8-flash` `gpt-5.6-terra` `deepseek-v4.1-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4.1-flash` |
+| 重档 heavy | 主 SOP 精算（`/analyze` `/review` `/parlay`）| `gpt-6-astra` `gpt-6-sol` `gpt-6.1-sol` `claude-opus-5-5` `claude-sonnet-5-5` `gemini-3.8-flash` `gemini-4-argon` `glm-5.3` `grok-4.6` `grok-4.7` `deepseek-v4-pro` `deepseek-v4.1-flash` `gpt-5.6-terra` `glm-5.3-flash` | `gpt-6-astra` | `deepseek-v4-pro` |
+| 平衡 balanced | 基本面预分析 + SEO/科普段 + 教训提炼 | `gpt-6-sol` `gpt-6.1-sol` `claude-sonnet-5-5` `grok-4.6` `grok-4.7` `gemini-3.8-flash` `gemini-4-argon` `gpt-5.6-terra` `deepseek-v4.1-flash` `glm-5.3-flash` `grok-4.5` | `gpt-5.6-terra` | `deepseek-v4.1-flash` |
 | 轻档 light | 走地实时研判 | `gpt-5.6-luna` `gpt-6-luna` | `gpt-6-luna` | `gpt-6-luna` |
 
 **按用途分池**：`/llm` 面板的模型选择器只列目标档允许的模型。为保留现有 balanced
@@ -148,9 +148,21 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 组内可配多条密钥轮转。缺组时该组模型在 `/llm` 面板标 ❌，可用回退模型顶上。
 
 **CPA 接入**：两款 Luna 统一走 `cpa_gpt`，旧 `openai_gpt` 组已移除。`gpt-6-astra`、
-`gpt-6.1-sol`、两款 Claude 5.5、`gemini-3.8-flash`、`gemini-4-argon` 可同时使用已配置的同家族
-IK / CPA 端点，按现有健康状态排序及轮转选路；配置行先后不代表固定的供应商主备优先级。
-请求仍发送标准模型名，推理强度放在 `reasoning_effort`；CPA 需提供相同标准名或别名，程序不追加 `-high`。
+`gpt-6.1-sol` 保持同名，可使用 IK / CPA 两组已配置的端点，按健康状态排序及轮转选路。
+Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-high` 变体仅走 CPA。
+
+| CPA 专用模型 ID | 密钥组 | 可选档位 | 输出预算示例 | 输入预警线示例 |
+|---|---|---|---:|---:|
+| `claude-opus-5-5-high` | `cpa_claude` | heavy | 128000 | 700000 |
+| `claude-sonnet-5-5-high` | `cpa_claude` | heavy / balanced | 128000 | 700000 |
+| `gemini-4-argon-high` | `cpa_gemini` | heavy / balanced | 65536 | 700000 |
+| `gemini-3.8-flash-high` | `cpa_gemini` | heavy / balanced | 65536 | 700000 |
+
+选中哪个 ID，请求就原样发送该 ID，不剥离或自动追加后缀。推理强度仍独立传入 `reasoning_effort`；
+新变体暂沿用基础模型的本地强度选项，CPA 实际是否接受并落实各档需独立探针验证。
+预算数值是配置示例，不代表已验证的上游模型上限。新增选项追加到菜单末尾，保留原编号及已有槽位选择。
+仅启用 CPA 时，请在 `/llm` 手动把需要的 Claude / Gemini 主模型和回退模型改选为对应 `-high` 项；
+密钥组测试菜单也会分别列出 IK 标准名和 CPA 变体。
 `xhgj-v1-flash` / `xhgj-v1-pro` 不登记。管理员、访客的轻档默认和会诊数据审计使用 `gpt-6-luna`。
 部署后首次启动仅把轻档主/回退槽位中保存的 `gpt-5.6-luna` 一次性迁移为 `gpt-6-luna`，
 保留其他模型选择及空回退；之后再手动选择模型，重启不会重复覆盖。
@@ -350,13 +362,13 @@ LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_gro
 # CPA 地址换成自己的地址，三组分别填不同 Key；未使用的组整条删除。
 # 使用英文逗号分隔，不要把 Markdown 链接的 []() 复制进 .env。
 # 重档报告输出预算（推理 token + 可见正文），不写时默认 32000。
-LLM_MAX_TOKENS=32000
+LLM_MAX_TOKENS=64000
 # 可选：按模型覆盖；没有列出的模型继续使用 LLM_MAX_TOKENS。
-# LLM_MODEL_MAX_TOKENS=gpt-6.1-sol:128000,glm-5.3-flash:131072,claude-opus-5-5:128000,claude-sonnet-5-5:128000
+# LLM_MODEL_MAX_TOKENS=gpt-6.1-sol:128000,glm-5.3-flash:131072,claude-opus-5-5:128000,claude-sonnet-5-5:128000,claude-opus-5-5-high:128000,claude-sonnet-5-5-high:128000,gemini-4-argon-high:65536,gemini-3.8-flash-high:65536
 # 输入 token 估算预警线；仅提醒和记录，绝不截断、压缩或阻止请求。
 LLM_INPUT_WARN_TOKENS=240000
 # 可选：按模型设置预警线。
-# LLM_MODEL_INPUT_WARN_TOKENS=gpt-6.1-sol:700000,glm-5.3-flash:700000,claude-opus-5-5:700000,claude-sonnet-5-5:700000
+# LLM_MODEL_INPUT_WARN_TOKENS=gpt-6.1-sol:700000,glm-5.3-flash:700000,claude-opus-5-5:700000,claude-sonnet-5-5:700000,claude-opus-5-5-high:700000,claude-sonnet-5-5-high:700000,gemini-4-argon-high:700000,gemini-3.8-flash-high:700000
 # 旧 LLM_BASE_URL/LLM_API_KEY/LLM_ENDPOINTS 已彻底不参与路由（无论是否设置这个新变量都一样）；
 # 留着不会报错，但 /llm 面板会提示删除，避免误以为它们仍生效。
 # 管理员发 /llm 可按密钥组测试、开关端点并实时调整熔断参数。
