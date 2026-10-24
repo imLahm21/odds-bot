@@ -5,11 +5,11 @@ analyzer.py 只负责构造 prompt，真正的 HTTP 调用、重试、失败隔�
 设计对标 cc switch 的「多供应商 + 熔断」思路，落到本项目的既有模式：
 
   - 端点只来自 .env 的 LLM_ROUTE_ENDPOINTS（group|key|url|label），每条 key
-    只属于一个授权组（IKuncode 按模型家族授权，一条 key 覆盖不了别的家族）。
+    只属于一个授权组（IKuncode / CPA 均按模型家族分别配置 key）。
     多 key 轮换/标记坏点/切换的模式移植自 api_client.py 的 _switch_key/api_get。
-  - 每个槽位（档位×角色）有【主模型 + 回退模型】：先按主模型定组、组内轮转与故障转移；
-    该组端点全走完仍无成功（全熔断/全停用/组内无端点）才升级到回退模型那组密钥。
-  - 先按角色/档位选模型，再按模型选密钥组，只在组内轮转和故障转移；每端点一个
+  - 每个槽位（档位×角色）有【主模型 + 回退模型】：先按主模型的授权组轮转与故障转移；
+    允许的端点全走完仍无成功（全熔断/全停用/无端点）才升级到回退模型的密钥组。
+  - 先按角色/档位选模型，再按模型选允许的密钥组，在这些组的端点间轮转和故障转移；每端点一个
     内存态 Breaker（CLOSED→OPEN→HALF_OPEN→CLOSED），10 个可调参数
     来自 db.llm_settings（TG /llm 面板实时改，免重启），缺库/缺键回退 config 默认。
   - chat()：阻塞，按端点顺序故障转移，跳过 OPEN 端点，全挂返回错误串（不抛异常，
@@ -112,7 +112,7 @@ def _parse_route_endpoints(raw: str | None = None) -> list[dict]:
     """解析新分组格式：group|key|base_url|label。
 
     每条凭据只属于一个授权组；同一组可重复多条 key。未知组、缺 key/url、或同一
-    key+url 被分配到多个组时拒绝该条，日志永不输出 key。
+    key 被分配到多个组时拒绝该条，日志永不输出 key。
     """
     source = os.getenv("LLM_ROUTE_ENDPOINTS", "") if raw is None else raw
     eps: list[dict] = []
@@ -703,8 +703,8 @@ def reset_breaker(idx: int) -> bool:
 def _token_limit_field(route_group: str) -> str:
     """按供应商选择 Chat Completions 的输出 token 参数名。
 
-    OpenAI 官方已用 max_completion_tokens 取代 max_tokens；IKuncode 当前仍接受
-    max_tokens。按端点所属 provider 判断，避免只凭 gpt-* 模型名前缀误伤中转端点。
+    按端点所属 provider 判断；IKuncode / CPA 的兼容载荷使用 max_tokens，
+    保留 provider=openai 的 max_completion_tokens 支持供明确登记的官方端点使用。
     """
     provider = (config.LLM_ROUTE_GROUPS.get(route_group) or {}).get("provider")
     return "max_completion_tokens" if provider == "openai" else "max_tokens"
@@ -984,7 +984,7 @@ def _endpoints_by_priority(model: str = "") -> list[tuple[int, dict]]:
     正常/半开(0) < OPEN(1) < 降级(2)。降级端点排最后——健康端点先跑，
     降级的只在健康端点都用不上时才轮到。
 
-    先按 model 限定授权组，再只在该组内轮转：GPT 的 key 永远不会被拿去请求 grok。
+    先按 model 限定允许的授权组，再在这些组的端点间轮转：GPT 的 key 不会被拿去请求 grok。
     """
     disabled = _get_disabled()
     groups = config.llm_route_groups_for_model(model)

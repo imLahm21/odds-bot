@@ -244,6 +244,7 @@ def seed_config(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO llm_runtime_state (key, value, updated_at) "
         "VALUES (?,?,?)", tier_rows)
     _migrate_llm_tier_model_profile(conn, now)
+    _migrate_cpa_light_models(conn, now)
     # 版本化迁移之后只【报告】指向未登记模型的槽位，不改值——
     # 用户可能故意把某槽位指到网关上的私有模型（见 set_llm_runtime_state 的
     # allow_any 与「未知自定义值保持不动」契约）。已下线的旧模型名由
@@ -261,6 +262,30 @@ def seed_config(conn: sqlite3.Connection) -> None:
 
 
 _LLM_MODEL_PROFILE_KEY = "_tier_model_profile_version"
+_LLM_CPA_LIGHT_PROFILE_KEY = "_cpa_light_model_version"
+
+
+def _migrate_cpa_light_models(conn: sqlite3.Connection, now: str) -> None:
+    """单独迁移旧 Luna 轻档；不重跑旧的全档位迁移，后续保留人工选择。"""
+    version = "2026-10-24-luna6"
+    row = conn.execute(
+        "SELECT value FROM llm_runtime_state WHERE key=?",
+        (_LLM_CPA_LIGHT_PROFILE_KEY,)).fetchone()
+    if row and row[0] == version:
+        return
+    light_slots = ("model_light", "model_light_visitor",
+                   "fallback_light", "fallback_light_visitor")
+    changed = conn.executemany(
+        "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=? AND value=?",
+        [("gpt-6-luna", now, key, "gpt-5.6-luna") for key in light_slots],
+    ).rowcount
+    conn.execute(
+        "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (_LLM_CPA_LIGHT_PROFILE_KEY, version, now))
+    if changed:
+        log.info("CPA 轻档升级：%d 个旧 Luna 槽位已改为 gpt-6-luna", changed)
 
 
 def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:

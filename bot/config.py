@@ -379,7 +379,7 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
 
 # ─── LLM 精算 (/analyze) ─────────────────────────────────────────────────────
 # 密钥按授权组从 .env 的 LLM_ROUTE_ENDPOINTS 读取；格式 group|key|url|label。
-# 模型先由档位×角色选定，再由 llm_route_groups_for_model 定位唯一密钥组。
+# 模型先由档位×角色选定，再由 llm_route_groups_for_model 定位允许的密钥组。
 # LLM_MODEL 是【重档默认模型】的兼容常量：等于 LLM_TIER_MODELS["heavy"]["default"]。
 # 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 astra/grok），
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
@@ -584,8 +584,8 @@ LLM_TIER_MODELS: dict[str, dict] = {
                  "default": "gpt-5.6-terra",
                  "visitor_default": "deepseek-v4.1-flash"},
     "light":    {"label": "轻档·走地",
-                 "default": "gpt-5.6-luna",
-                 "visitor_default": "gpt-5.6-luna"},
+                 "default": "gpt-6-luna",
+                 "visitor_default": "gpt-6-luna"},
 }
 
 
@@ -610,7 +610,7 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
 # Both light models share one key group; leave fallback unset by default.
 LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     "heavy": {
-        "admin": "grok-4.6",        # 主 astra 走 ik_gpt → 回退落 ik_grok
+        "admin": "grok-4.6",        # 主 astra 走 ik_gpt / cpa_gpt → 回退落 ik_grok
         "visitor": "glm-5.3",       # 主 deepseek-v4-pro → 回退落 ik_glm
     },
     "balanced": {
@@ -631,8 +631,8 @@ def llm_tier_fallback(tier: str, visitor: bool = False) -> str:
 
 
 # ─── 模型 → 密钥授权分组（非 secret，唯一真相源）────────────────────────────
-# IKuncode 的 key 按模型家族授权：一条 key 只属于一个分组，一个分组只含一个系列的
-# 模型，所以绝不能把某条 key 当成万能端点（GPT 的 key 拿去请求 grok 必然 403）。
+# IKuncode / CPA 的 key 均按模型家族分组，一条 key 只属于一个授权组。
+# 已知的 CPA 模型单独声明路由，避免把只在 IK 上存在的模型发给 CPA。
 # 组 ID 是稳定的内部路由名，真实 key/base_url 只放 .env 的 LLM_ROUTE_ENDPOINTS。
 #   provider —— 供应商（同一家族可能同时有中转与官方两个组）
 #   families —— 该组承载的模型家族（模型名第一个 '-' 前的段）
@@ -649,8 +649,12 @@ LLM_ROUTE_GROUPS: dict[str, dict] = {
                   "families": ("gemini",)},
     "ik_claude": {"label": "IKuncode · Claude", "provider": "ikuncode",
                   "families": ("claude",)},
-    "openai_gpt": {"label": "OpenAI 官方 · GPT", "provider": "openai",
-                   "families": ("gpt",)},
+    "cpa_gpt": {"label": "CPA · GPT", "provider": "cpa",
+                "families": ("gpt",)},
+    "cpa_claude": {"label": "CPA · Claude", "provider": "cpa",
+                   "families": ("claude",)},
+    "cpa_gemini": {"label": "CPA · Gemini", "provider": "cpa",
+                   "families": ("gemini",)},
 }
 
 # 家族 → 默认密钥组。IKuncode 是主供应商，故各家族默认落到对应 ik_* 组；
@@ -664,11 +668,18 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
     "claude": "ik_claude",
 }
 
-# 显式覆盖：走官方供应商而非中转的少数模型。只有这里需要手写。
-# Both Luna models use OpenAI's official key group.
+# 两款 Luna 合并到 cpa_gpt；其他已列出的 CPA 模型允许使用同家族 IK / CPA 端点。
+# 返回多个组表示都可参与现有轮转，不表示元组前面的组始终优先。
+# 这里只声明程序允许的请求名，具体上游是否提供仍需通过该端点探针验证。
 LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "gpt-5.6-luna": ("openai_gpt",),
-    "gpt-6-luna": ("openai_gpt",),
+    "gpt-6-astra": ("ik_gpt", "cpa_gpt"),
+    "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
+    "gpt-5.6-luna": ("cpa_gpt",),
+    "gpt-6-luna": ("cpa_gpt",),
+    "claude-opus-5-5": ("ik_claude", "cpa_claude"),
+    "claude-sonnet-5-5": ("ik_claude", "cpa_claude"),
+    "gemini-3.8-flash": ("ik_gemini", "cpa_gemini"),
+    "gemini-4-argon": ("ik_gemini", "cpa_gemini"),
 }
 
 
@@ -804,6 +815,7 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "grok-4.6": "flagship",
     "deepseek-v4-pro": "flagship",
     "gpt-5.6-luna": "specialized_fast",
+    "gpt-6-luna": "specialized_fast",
     "gpt-5.6-terra": "specialized_fast",
     "glm-5.3-flash": "specialized_fast",
     "grok-4.5": "specialized_fast",
@@ -812,7 +824,7 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
 }
 
 FULL_CONSULT_TASKS: tuple[dict, ...] = (
-    {"id": "data_audit", "label": "数据审计", "model": "gpt-5.6-luna",
+    {"id": "data_audit", "label": "数据审计", "model": "gpt-6-luna",
      "effort": "low", "max_tokens": 0,
      "fallbacks": (
          {"model": "deepseek-v4.1-flash", "effort": "high"},
@@ -935,7 +947,7 @@ LLM_SETTING_SPECS: dict[str, dict] = {
 # 赛前 7 步精算继续使用上面的重档模型。
 # LLM_LIVE_MODEL 是【轻档默认模型】兼容常量（=LLM_TIER_MODELS["light"]["default"]）；走地用。
 # 运行时实际模型由 db.llm_runtime_state 决定，按档位和角色路由。
-LLM_LIVE_MODEL = "gpt-5.6-luna"     # 走地轻量模型（OpenAI 官方轻档默认）
+LLM_LIVE_MODEL = llm_tier_default("light")  # 与 CPA 轻档默认模型保持一致
 LLM_LIVE_EFFORT = "low"           # 走地推理强度（最低档，求快）
 LLM_LIVE_TIMEOUT = 30             # 走地超时（秒）：超过即跳过研判，不阻塞盘口快报
 LLM_LIVE_MAX_TOKENS = 1200        # 走地输出上限：留足 Luna 的少量推理 + 3~5 句正文

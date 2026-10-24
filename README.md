@@ -123,7 +123,13 @@ TELEGRAM_ADMIN_CHAT_IDS=your_chat_id
 # grok/deepseek/glm/gemini/claude will 403. Add a line per group you actually bought a key for;
 # leave the rest out (that tier/role falls back to its configured fallback model,
 # or errors out naming the missing group — it will NOT silently mix keys).
-LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,ik_claude|<IK_CLAUDE_KEY>|https://api.ikuncode.ai/v1|IK-Claude,openai_gpt|<OPENAI_KEY>|https://api.openai.com/v1|OpenAI-Luna
+LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_grok|<IK_GROK_KEY>|https://api.ikuncode.cc/v1|IK-Grok,ik_deepseek|<IK_DEEPSEEK_KEY>|https://api.ikuncode.cc/v1|IK-DeepSeek,ik_glm|<IK_GLM_KEY>|https://api.ikuncode.cc/v1|IK-GLM,ik_gemini|<IK_GEMINI_KEY>|https://api.ikuncode.cc/v1|IK-Gemini,ik_claude|<IK_CLAUDE_KEY>|https://api.ikuncode.ai/v1|IK-Claude,cpa_gpt|<CPA_GPT_KEY>|https://cpa.example.com:8443/v1|CPA-GPT,cpa_claude|<CPA_CLAUDE_KEY>|https://cpa.example.com:8443/v1|CPA-CLAUDE,cpa_gemini|<CPA_GEMINI_KEY>|https://cpa.example.com:8443/v1|CPA-GEMINI
+# Replace the CPA address and use a different key for each CPA group. Omit unused groups.
+# Luna models now use cpa_gpt; the old openai_gpt group has been removed.
+# Listed CPA models can rotate across configured IK/CPA endpoints of the same family.
+# Standard model names are sent unchanged; reasoning_effort is a separate field.
+# Both light-tier defaults and consultation data audit now use gpt-6-luna.
+# Startup migrates saved gpt-5.6-luna light-tier slots once, preserving other choices.
 # Claude uses the existing OpenAI-compatible Chat Completions client.
 # Opus 5.5: heavy; Sonnet 5.5: heavy + balanced. Primary/fallback defaults are unchanged.
 # Heavy-report output budget (reasoning + visible answer). Default: 32000.

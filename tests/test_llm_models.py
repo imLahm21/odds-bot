@@ -52,8 +52,8 @@ PRIMARY = {
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "gpt-5.6-terra",
     "model_balanced_visitor": "deepseek-v4.1-flash",
-    "model_light": "gpt-5.6-luna",
-    "model_light_visitor": "gpt-5.6-luna",
+    "model_light": "gpt-6-luna",
+    "model_light_visitor": "gpt-6-luna",
 }
 
 # 上一版（v1）的主模型方案，被 PROFILE_UPGRADES 第一条精确识别。
@@ -82,8 +82,8 @@ RETIRED_UPGRADED = {
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "grok-4.5",
     "model_balanced_visitor": "deepseek-v4.1-flash",
-    "model_light": "gpt-5.6-luna",
-    "model_light_visitor": "gpt-5.6-luna",
+    "model_light": "gpt-6-luna",
+    "model_light_visitor": "gpt-6-luna",
 }
 
 # 上一版（v1）的回退方案，被 PROFILE_UPGRADES 第二条精确识别。
@@ -101,8 +101,8 @@ V1_FALLBACK_UPGRADED = {
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "grok-4.5",
     "model_balanced_visitor": "deepseek-v4.1-flash",
-    "model_light": "gpt-5.6-luna",
-    "model_light_visitor": "gpt-5.6-luna",
+    "model_light": "gpt-6-luna",
+    "model_light_visitor": "gpt-6-luna",
 }
 
 # 回退槽（fallback_*）的 seed 默认值。db 现在存 12 个键 = 6 主 + 6 回退。
@@ -162,20 +162,21 @@ class TestModelProfile(unittest.TestCase):
             "light": {"admin": "", "visitor": ""},
         })
         self.assertEqual(config.LLM_MODEL, "gpt-6-astra")
+        self.assertEqual(config.LLM_LIVE_MODEL, "gpt-6-luna")
         self.assertEqual(
             {model: config.llm_route_groups_for_model(model)
              for model in config.LLM_MODELS},
             {
-                "gpt-6-astra": ("ik_gpt",),
+                "gpt-6-astra": ("ik_gpt", "cpa_gpt"),
                 "gpt-5.6-sol": ("ik_gpt",),
                 "gpt-6-sol": ("ik_gpt",),
-                "gpt-6.1-sol": ("ik_gpt",),
-                "claude-opus-5-5": ("ik_claude",),
-                "claude-sonnet-5-5": ("ik_claude",),
+                "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
+                "claude-opus-5-5": ("ik_claude", "cpa_claude"),
+                "claude-sonnet-5-5": ("ik_claude", "cpa_claude"),
                 "grok-4.7": ("ik_grok",),
-                "gpt-6-luna": ("openai_gpt",),
-                "gemini-3.8-flash": ("ik_gemini",),
-                "gemini-4-argon": ("ik_gemini",),
+                "gpt-6-luna": ("cpa_gpt",),
+                "gemini-3.8-flash": ("ik_gemini", "cpa_gemini"),
+                "gemini-4-argon": ("ik_gemini", "cpa_gemini"),
                 "glm-5.3": ("ik_glm",),
                 "grok-4.6": ("ik_grok",),
                 "deepseek-v4-pro": ("ik_deepseek",),
@@ -183,11 +184,11 @@ class TestModelProfile(unittest.TestCase):
                 "gpt-5.6-terra": ("ik_gpt",),
                 "glm-5.3-flash": ("ik_glm",),
                 "grok-4.5": ("ik_grok",),
-                "gpt-5.6-luna": ("openai_gpt",),
+                "gpt-5.6-luna": ("cpa_gpt",),
             })
 
     def test_group_inferred_from_model_prefix(self):
-        """同系列新模型无需登记路由表即可归组；只有走官方的才需显式覆盖。"""
+        """新模型沿用 IK 家族路由；CPA 模型按明确清单开放。"""
         self.assertEqual(
             config.llm_route_groups_for_model("grok-4.7"), ("ik_grok",))
         self.assertEqual(
@@ -202,7 +203,7 @@ class TestModelProfile(unittest.TestCase):
             config.llm_route_groups_for_model("gpt-7-nova"), ("ik_gpt",))
         self.assertEqual(
             config.llm_route_groups_for_model("gpt-5.6-luna"),
-            ("openai_gpt",))
+            ("cpa_gpt",))
         self.assertEqual(config.llm_route_groups_for_model("llama-4"), ())
         self.assertEqual(config.llm_route_groups_for_model(""), ())
         self.assertTrue(config.llm_model_registered("gpt-6-astra"))
@@ -387,13 +388,13 @@ class TestModelProfile(unittest.TestCase):
         self.assertNotIn("max_completion_tokens", ik)
         self.assertEqual(ik["reasoning_effort"], "xhigh")
 
-        official = llm_client._payload(
+        cpa = llm_client._payload(
             "gpt-5.6-luna", "system", "user", 50, "high", True,
-            "openai_gpt")
-        self.assertEqual(official["max_completion_tokens"], 50)
-        self.assertNotIn("max_tokens", official)
-        self.assertTrue(official["stream"])
-        self.assertEqual(official["stream_options"], {"include_usage": True})
+            "cpa_gpt")
+        self.assertEqual(cpa["max_tokens"], 50)
+        self.assertNotIn("max_completion_tokens", cpa)
+        self.assertTrue(cpa["stream"])
+        self.assertEqual(cpa["stream_options"], {"include_usage": True})
 
         with self.assertLogs("odds_bot.llm", level="WARNING"):
             filtered = llm_client._payload(
@@ -473,7 +474,7 @@ class TestModelProfile(unittest.TestCase):
             "ik_glm|key-glm|https://api.ikuncode.cc/v1|IK-GLM,"
             "ik_gemini|key-gemini|https://api.ikuncode.cc/v1|IK-Gemini,"
             "ik_claude|key-claude|https://api.ikuncode.ai/v1|IK-Claude,"
-            "openai_gpt|key-openai|https://api.openai.com/v1|OpenAI-Luna"
+            "cpa_gpt|key-cpa|https://cpa.example.test:8443/v1|CPA-GPT"
         )
         endpoints = llm_client._parse_route_endpoints(raw)
         self.assertEqual(len(endpoints), 8)
@@ -495,7 +496,8 @@ class TestModelProfile(unittest.TestCase):
         ):
             for model in ("claude-opus-5-5", "claude-sonnet-5-5"):
                 with self.subTest(model=model):
-                    self.assertEqual(config.llm_route_groups_for_model(model), ("ik_claude",))
+                    self.assertEqual(config.llm_route_groups_for_model(model),
+                                     ("ik_claude", "cpa_claude"))
                     self.assertEqual(llm_client.configured_count_for_model(model), 1)
                     self.assertFalse(llm_client._supports_model(endpoints[0], model))
                     self.assertEqual(llm_client._endpoints_by_priority(model), [(1, endpoints[1])])
@@ -549,12 +551,82 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(len(endpoints), 1)
         self.assertEqual(endpoints[0]["route_group"], "ik_gpt")
 
+    def test_cpa_distinct_keys_are_kept_once_per_group(self):
+        raw = (
+            "cpa_gpt|private-cpa-gpt|https://cpa.example.test:8443/v1/|CPA-GPT,"
+            "cpa_claude|private-cpa-claude|https://cpa.example.test:8443/v1|CPA-Claude,"
+            "cpa_gemini|private-cpa-gemini|https://cpa.example.test:8443/v1|CPA-Gemini,"
+            "cpa_claude|private-cpa-claude|https://cpa.example.test:8443/v1|Duplicate"
+        )
+        endpoints = llm_client._parse_route_endpoints(raw)
+        self.assertEqual([ep["route_group"] for ep in endpoints],
+                         ["cpa_gpt", "cpa_claude", "cpa_gemini"])
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_runtime_models", dict(RUNTIME_MODELS)),
+            patch.object(llm_client, "_legacy_env_present", return_value=[]),
+        ):
+            rendered = json.dumps(llm_client.routing_snapshot())
+        for endpoint in endpoints:
+            self.assertNotIn(endpoint["key"], rendered)
+
+    def test_cpa_key_cannot_be_assigned_to_another_group(self):
+        first = "cpa_gpt|private-test-key|https://cpa.example.test:8443/v1|CPA-GPT,"
+        for other in (
+            "cpa_claude|private-test-key|https://cpa.example.test:8443/v1|CPA-Claude",
+            "cpa_gemini|private-test-key|https://cpa.example.test:8443/v1|CPA-Gemini",
+            "ik_claude|private-test-key|https://cpa.example.test:8443/v1|IK",
+            "cpa_claude|private-test-key|https://other.example.test:8443/v1|Other",
+            "cpa_claude|private-test-key|https://cpa.example.test:9443/v1|Other-Port",
+            "cpa_claude|private-test-key|https://cpa.example.test:8443/other|Other-Path",
+        ):
+            for raw in (first + other, other + "," + first.rstrip(",")):
+                with self.subTest(raw=raw), self.assertLogs(
+                    "odds_bot.llm", level="ERROR"
+                ) as captured:
+                    endpoints = llm_client._parse_route_endpoints(raw)
+                self.assertEqual(len(endpoints), 1)
+                self.assertNotIn("private-test-key", "\n".join(captured.output))
+
+    def test_cpa_routes_and_payloads_use_standard_model_names(self):
+        expected = {
+            "cpa_gpt": {"gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-luna", "gpt-6-luna"},
+            "cpa_claude": {"claude-opus-5-5", "claude-sonnet-5-5"},
+            "cpa_gemini": {"gemini-3.8-flash", "gemini-4-argon"},
+        }
+        endpoints = llm_client._parse_route_endpoints(
+            ",".join(f"{group}|test-key-{group}|https://cpa.example.test:8443/v1|{group}"
+                     for group in expected))
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", [_FakeBreaker() for _ in endpoints]),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+        ):
+            for group, models in expected.items():
+                self.assertEqual(set(config.llm_models_in_group(group)), models)
+                for model in models:
+                    with self.subTest(model=model):
+                        routed = llm_client._endpoints_by_priority(model)
+                        self.assertEqual([ep["route_group"] for _, ep in routed], [group])
+                        payload = llm_client._payload(
+                            model, "system", "user", 1024, "high", True, group)
+                        self.assertEqual(payload["model"], model)
+                        self.assertEqual(payload["reasoning_effort"], "high")
+                        self.assertEqual(probe_llm_efforts._endpoint_indices(model),
+                                         tuple(idx for idx, _ in routed))
+            for model in ("gpt-6-sol", "gpt-5.6-terra", "xhgj-v1-flash", "xhgj-v1-pro"):
+                self.assertEqual(llm_client.configured_count_for_model(model), 0)
+        self.assertNotIn("openai_gpt", config.LLM_ROUTE_GROUPS)
+        self.assertFalse(config.llm_model_registered("xhgj-v1-flash"))
+        self.assertFalse(config.llm_model_registered("xhgj-v1-pro"))
+
     @staticmethod
     def _group_endpoint(label, group):
         """构造与 _parse_route_endpoints 输出同形的假端点（四个键，不多不少）。"""
         return {
             "key": f"key-{label}",
-            "base_url": ("https://api.openai.com/v1" if group == "openai_gpt"
+            "base_url": ("https://cpa.example.test:8443/v1" if group.startswith("cpa_")
                          else "https://api.ikuncode.cc/v1"),
             "label": label,
             "route_group": group,
@@ -572,7 +644,7 @@ class TestModelProfile(unittest.TestCase):
             self._group_endpoint("Grok", "ik_grok"),
             self._group_endpoint("DeepSeek", "ik_deepseek"),
             self._group_endpoint("GLM", "ik_glm"),
-            self._group_endpoint("OpenAI", "openai_gpt"),
+            self._group_endpoint("CPA", "cpa_gpt"),
         ]
         breakers = [_FakeBreaker() for _ in endpoints]
         with (
@@ -590,9 +662,9 @@ class TestModelProfile(unittest.TestCase):
             self.assertEqual(llm_client.routing_issues(), [])
 
         self.assertEqual([ep["label"] for _, ep in grok], ["Grok"])
-        self.assertEqual([ep["label"] for _, ep in luna], ["OpenAI"])
+        self.assertEqual([ep["label"] for _, ep in luna], ["CPA"])
         self.assertEqual(
-            {ep["label"] for _, ep in first_gpt}, {"GPT-1", "GPT-2"})
+            {ep["label"] for _, ep in first_gpt}, {"GPT-1", "GPT-2", "CPA"})
         self.assertNotEqual(
             first_gpt[0][1]["label"], second_gpt[0][1]["label"])
 
@@ -601,7 +673,7 @@ class TestModelProfile(unittest.TestCase):
             self._group_endpoint("GPT", "ik_gpt"),
             self._group_endpoint("Grok", "ik_grok"),
             self._group_endpoint("DeepSeek", "ik_deepseek"),
-            self._group_endpoint("OpenAI", "openai_gpt"),
+            self._group_endpoint("CPA", "cpa_gpt"),
         ]
         with (
             patch.object(llm_client, "_ENDPOINTS", endpoints),
@@ -1238,23 +1310,23 @@ class TestModelProfile(unittest.TestCase):
         self.assertEqual(breaker.records, [False])
 
     def test_probe_skips_unsupported_model_without_http(self):
-        official = self._group_endpoint("OpenAI", "openai_gpt")
+        cpa = self._group_endpoint("CPA", "cpa_gpt")
         breaker = _FakeBreaker()
         with (
-            patch.object(llm_client, "_ENDPOINTS", [official]),
+            patch.object(llm_client, "_ENDPOINTS", [cpa]),
             patch.object(llm_client, "_breakers", [breaker]),
             patch.object(llm_client, "get_tier_model",
-                         return_value="gpt-6-astra"),
+                         return_value="grok-4.6"),
             patch.object(llm_client.requests, "post") as post,
         ):
             result = llm_client.probe(0, "heavy")
         self.assertTrue(result["skipped"])
-        self.assertEqual(result["req_model"], "gpt-6-astra")
+        self.assertEqual(result["req_model"], "grok-4.6")
         post.assert_not_called()
         self.assertEqual(breaker.records, [])
 
-    def test_official_probe_uses_max_completion_tokens(self):
-        official = self._group_endpoint("OpenAI", "openai_gpt")
+    def test_cpa_probe_uses_max_tokens(self):
+        cpa = self._group_endpoint("CPA", "cpa_gpt")
         breaker = _FakeBreaker()
 
         class Response:
@@ -1267,7 +1339,7 @@ class TestModelProfile(unittest.TestCase):
                         "choices": [{"message": {"content": "pong"}}]}
 
         with (
-            patch.object(llm_client, "_ENDPOINTS", [official]),
+            patch.object(llm_client, "_ENDPOINTS", [cpa]),
             patch.object(llm_client, "_breakers", [breaker]),
             patch.object(llm_client, "get_settings",
                          return_value={"non_stream_timeout": 180}),
@@ -1277,8 +1349,8 @@ class TestModelProfile(unittest.TestCase):
             result = llm_client.probe_model(0, "gpt-5.6-luna")
         self.assertTrue(result["ok"])
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["max_completion_tokens"], 256)
-        self.assertNotIn("max_tokens", payload)
+        self.assertEqual(payload["max_tokens"], 256)
+        self.assertNotIn("max_completion_tokens", payload)
 
     def test_probe_line_marks_length_as_budget_exhaustion_not_unavailable(self):
         line = tgbot._fmt_probe_line({
@@ -1292,7 +1364,7 @@ class TestModelProfile(unittest.TestCase):
         self.assertIn("探针预算耗尽", line)
 
     def test_effort_probe_sends_level_and_reports_safe_usage(self):
-        official = self._group_endpoint("OpenAI", "openai_gpt")
+        cpa = self._group_endpoint("CPA", "cpa_gpt")
         breaker = _FakeBreaker()
 
         class Response:
@@ -1314,7 +1386,7 @@ class TestModelProfile(unittest.TestCase):
                 }
 
         with (
-            patch.object(llm_client, "_ENDPOINTS", [official]),
+            patch.object(llm_client, "_ENDPOINTS", [cpa]),
             patch.object(llm_client, "_breakers", [breaker]),
             patch.object(llm_client.requests, "post",
                          return_value=Response()) as post,
@@ -1324,7 +1396,7 @@ class TestModelProfile(unittest.TestCase):
                 timeout_seconds=120, prompt="calc")
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["reasoning_effort"], "max")
-        self.assertEqual(payload["max_completion_tokens"], 64)
+        self.assertEqual(payload["max_tokens"], 64)
         self.assertEqual(payload["messages"][0]["content"], "calc")
         self.assertEqual(post.call_args.kwargs["timeout"][1], 120)
         self.assertEqual(result["sent_effort"], "max")
@@ -1427,6 +1499,55 @@ class TestModelProfile(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_cpa_light_migration_is_scoped_and_runs_once_on_existing_profile(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(db.SCHEMA)
+            saved = full_state(PRIMARY)
+            saved.update({
+                "model_heavy": "claude-opus-5-5",
+                "model_balanced": "gpt-6.1-sol",
+                "model_light": "gpt-5.6-luna",
+                "model_light_visitor": "gpt-5.6-luna",
+                "fallback_light": "gpt-5.6-luna",
+                "fallback_light_visitor": "gpt-5.6-luna",
+            })
+            conn.executemany(
+                "INSERT INTO llm_runtime_state (key, value) VALUES (?,?)",
+                [*saved.items(), (db._LLM_MODEL_PROFILE_KEY,
+                                  config.LLM_TIER_MODEL_PROFILE_VERSION)])
+            db.seed_config(conn)
+            expected = dict(saved)
+            for key in ("model_light", "model_light_visitor",
+                        "fallback_light", "fallback_light_visitor"):
+                expected[key] = "gpt-6-luna"
+            self.assertEqual(db.get_llm_runtime_state(conn), expected)
+
+            # 之后管理员主动改选旧模型，重启时不重复迁移覆盖。
+            self.assertTrue(db.set_llm_runtime_state(
+                conn, "model_light", "gpt-5.6-luna"))
+            db.seed_config(conn)
+            expected["model_light"] = "gpt-5.6-luna"
+            self.assertEqual(db.get_llm_runtime_state(conn), expected)
+        finally:
+            conn.close()
+
+    def test_cpa_light_migration_preserves_private_model_and_empty_fallbacks(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(db.SCHEMA)
+            saved = full_state(PRIMARY)
+            saved["model_light"] = "custom-cpa-light"
+            conn.executemany(
+                "INSERT INTO llm_runtime_state (key, value) VALUES (?,?)",
+                [*saved.items(), (db._LLM_MODEL_PROFILE_KEY,
+                                  config.LLM_TIER_MODEL_PROFILE_VERSION)])
+            with self.assertLogs("odds_bot.db", level="WARNING"):
+                db.seed_config(conn)
+            self.assertEqual(db.get_llm_runtime_state(conn), saved)
+        finally:
+            conn.close()
+
     def test_retired_model_names_upgrade_by_single_value_map(self):
         """已彻底下线的旧名字按单值映射改写到当前档位的合法模型。"""
         conn = sqlite3.connect(":memory:")
@@ -1509,7 +1630,7 @@ class TestModelProfile(unittest.TestCase):
                 # 轻档回退为空，apply_fallback 仍写入但写的是空串，
                 # get_tier_model 空串等价于未设置、返回档位默认 luna
                 self.assertEqual(
-                    llm_client.get_tier_model("light"), "gpt-5.6-luna")
+                    llm_client.get_tier_model("light"), "gpt-6-luna")
                 # 回退槽本身不动（幂等，可反复点）
                 self.assertEqual(
                     llm_client.get_fallback_model("heavy"), "grok-4.6")
@@ -1525,7 +1646,7 @@ class TestModelProfile(unittest.TestCase):
                 self.assertEqual(
                     llm_client.get_tier_model("balanced"), "gpt-5.6-terra")
                 self.assertEqual(
-                    llm_client.get_tier_model("light"), "gpt-5.6-luna")
+                    llm_client.get_tier_model("light"), "gpt-6-luna")
                 self.assertEqual(
                     llm_client.get_fallback_model("heavy"), "grok-4.6")
 
