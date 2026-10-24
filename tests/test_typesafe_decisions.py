@@ -93,6 +93,61 @@ class TestDecisionParsing(unittest.TestCase):
         self.assertEqual(result.candidates[0].p_final, 0.54)
         self.assertEqual(result.candidates[0].edge, -0.025)
 
+    def test_real_report_shorthand_p_final_bold_id_and_stake_variants(self):
+        report = """### 7. 最终精算结论
+- **置信度**：**74 / 100**
+### 8. 投注决策
+| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **C01** | **让球主线 Norway -1.0** | 1.93 | 51.8% | 状态式(赢38.9%/走22.0%) | 状态式微调 | **+4.0%** | eligible |
+| C02 | 让球次线 Everton 0 | 2.40 | 41.7% | 胜30.7/走25.6 | 同 | −0.7% | eligible |
+| C03 | 全场大小球 大 3.25 | 1.71 | 58.48% | 50.80% (全赢) + 19.7% (半赢) | 同前 | +3.79% | eligible |
+| **C04** | **全场大小球主线 大 3.0** | **1.84** | **54.3%** | 状态式(赢41.1%/走21.0%) | 状态式校准 | **+5.8%** | **eligible** |
+- **选中候选 ID**：**C04**（全场大小球 大 3.0；若偏好让步玩法则首推 **C01**）
+- **选中项**：**全场大 3.0 球 @1.84**
+- **证据强度与凯利分数**：证据强度为【强】（10 节点完备），取凯利分数 **k = 1/4**。
+- **注额计算**：
+  - 代入：`100 × 0.25 × 0.058 / 0.84 = $1.73`
+  - 建议注额：**$1.8**（按 $100 本金计）
+"""
+        result = decisions.parse_decision_section(report)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.source, "explicit_id")
+        self.assertEqual(result.selected_id, "C04")
+        self.assertEqual(result.evidence, "strong")
+        self.assertEqual(result.stake, 1.8)
+        self.assertEqual(result.warnings, ())
+        self.assertAlmostEqual(result.candidates[0].p_final, 0.389)
+        self.assertAlmostEqual(result.candidates[1].p_final, 0.307)
+        self.assertAlmostEqual(result.candidates[2].p_final, 0.508)
+        self.assertAlmostEqual(result.candidates[3].p_final, 0.411)
+
+        selection = decisions.select_decision(report, min_confidence=None, use_jev=False)
+        self.assertEqual(selection.positive_ids, ("C01", "C03", "C04"))
+        rewritten = decisions.apply_selection(report, selection)
+        self.assertIn("- **模型初选注额**：", rewritten)
+        self.assertNotIn("- **注额计算**：", rewritten)
+
+    def test_evidence_strength_variants_and_colon_inside_bold_pass(self):
+        for raw_ev, expected in (
+            ("中（k = 1/4）（10 节点完整）", "medium"),
+            ("**中等证据强度（k = 1/4）**", "medium"),
+            ("证据强度为**中**，凯利分数取 **k = 1/4**", "medium"),
+            ("弱至中，取 k=1/8", "weak"),
+            ("无（edge ≤ 0 → k=0）", "none"),
+        ):
+            with self.subTest(raw_ev=raw_ev):
+                sec = f"- **证据强度与凯利分数**：{raw_ev}"
+                self.assertEqual(decisions._extract_evidence(sec), expected)
+
+        colon_bold_pass = STANDARD_REPORT.replace(
+            "- **选中候选 ID**：C01\n- **选中项**：主胜",
+            "- **选中项：pass，空仓。**",
+        )
+        parsed = decisions.parse_decision_section(colon_bold_pass)
+        self.assertTrue(parsed.is_pass)
+        self.assertEqual(parsed.selected_id, "PASS")
+
     def test_pass_is_normalized_to_existing_contract(self):
         report = STANDARD_REPORT.replace(
             "- **选中候选 ID**：C01", "- **选中候选 ID**：PASS"
@@ -710,6 +765,24 @@ class TestGenerationSelection(unittest.TestCase):
         self.assertEqual(selection.source, "jev_pass")
         self.assertEqual(selection.selected_id, "PASS")
         self.assertIsNone(selection.candidate)
+
+    def test_low_confidence_preserves_explicit_model_pass(self):
+        report = SELECT_REPORT.replace(
+            "- **选中候选 ID**：C01\n- **选中项**：主胜",
+            "- **选中候选 ID**：PASS\n- **选中项**：pass，空仓",
+        ).replace("- **注额**：$2.0", "- **注额**：pass，空仓")
+        selection, _ = self._select(report, answer=_judgment("PASS", 0.56))
+        self.assertEqual(selection.source, "model_pass")
+        self.assertEqual(selection.selected_id, "PASS")
+        self.assertEqual(selection.fallback_reason, "low_confidence")
+        self.assertIsNone(selection.candidate)
+        self.assertEqual(selection.stake, 0.0)
+        rewritten = decisions.apply_selection(report, selection)
+        self.assertIn("保留模型初选 PASS", rewritten)
+        self.assertTrue(decisions.read_final_decision(rewritten)["pass"])
+        again = decisions.select_decision(rewritten, min_confidence=None, use_jev=False)
+        self.assertEqual(again.source, "model_pass")
+        self.assertEqual(again.selected_id, "PASS")
 
     def test_zero_evidence_passes(self):
         report = SELECT_REPORT.replace("中，k=1/4", "无，k=0")

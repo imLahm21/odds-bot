@@ -430,7 +430,11 @@ def _numeric_value(raw: str, *, percent: bool = False) -> float | None:
         value = float(match.group(0))
     except ValueError:
         return None
-    if has_percent:
+    if has_percent or (
+        percent
+        and 1.0 < value <= 100.0
+        and re.search(r"(?:全?[赢胜负输]|半[赢输]|走)\s*\d", text)
+    ):
         value /= 100.0
     return value if math.isfinite(value) else None
 
@@ -513,14 +517,31 @@ def _table_rows(section: str) -> tuple[dict[str, int] | None,
     return layout.columns, rows, layout.error
 
 
+_SAME_AS_MARKET_RE = re.compile(
+    r"^(?:[-—–]+(?:\s*[（(]\s*未融合\s*[)）])?"
+    r"|=\s*p_?市场"
+    r"|同(?:左|前|上|市场)?(?:\s*[,，、]\s*状态式.*)?"
+    r"|(?:归一后)?不变"
+    r"|未融合"
+    r"|状态(?:式(?:微调|校准)?|模型)"
+    r")$",
+    re.I,
+)
+
+
+def _inherits_market_prob(raw: str) -> bool:
+    return bool(_SAME_AS_MARKET_RE.fullmatch(_plain(raw)))
+
+
 def _selected_fields(section: str) -> tuple[str | None, str]:
+    plain = _plain(section)
     id_match = re.search(
-        r"(?im)^\s*[-*]\s*\*\*选中候选\s*ID\*\*\s*[：:]\s*([A-Za-z0-9_-]+)",
-        section,
+        r"(?im)^\s*[-*]\s*选中候选\s*ID\s*[：:]\s*[\[【(（]*([A-Za-z0-9_-]+)",
+        plain,
     )
     text_match = re.search(
-        r"(?im)^\s*[-*]\s*\*\*选中项\*\*\s*[：:]\s*(.*)$",
-        section,
+        r"(?im)^\s*[-*]\s*选中项\s*[：:]\s*(.*)$",
+        plain,
     )
     return (
         id_match.group(1).strip().upper() if id_match else None,
@@ -542,22 +563,57 @@ def _normalized_play(text: str) -> str:
 def _extract_evidence(section: str) -> str:
     normalized = _plain(section)
     match = re.search(
-        r"(?im)证据强度(?:与凯利分数)?\s*[：:]\s*([^\r\n]+)", normalized)
-    value = (match.group(1) if match else "").casefold()
-    if re.search(r"\bstrong\b", value) or re.match(r"[\s*]*强(?:\s|[,，/]|$)", value):
+        r"(?im)证据强度(?:与凯利分数)?\s*[：:]\s*([^\r\n]*(?:\r?\n\s*[-*]\s*[^\r\n]+)?)",
+        normalized,
+    )
+    raw = (match.group(1) if match else "").strip()
+    value = " ".join(line.strip() for line in raw.splitlines() if line.strip()).casefold()
+    if re.search(r"\bstrong\b", value):
         return "strong"
-    if re.search(r"\bmedium\b", value) or re.match(r"[\s*]*中(?:\s|等|[,，/]|$)", value):
+    if re.search(r"\bmedium\b", value):
         return "medium"
-    if re.search(r"\bweak\b", value) or re.match(r"[\s*]*弱(?:\s|[,，/]|$)", value):
+    if re.search(r"\bweak\b", value):
         return "weak"
-    if re.search(r"\bnone\b", value) or re.match(r"[\s*]*无(?:\s|[,，/]|$)", value):
+    if re.search(r"\bnone\b", value):
+        return "none"
+    cleaned = re.sub(
+        r"^(?:[-*\s]|(?:本场|方向|盘口)?证据(?:强度)?(?:评定)?(?:为|属|取)?|[\s\[【「(（\"“”'’])+",
+        "",
+        value,
+    )
+    if re.match(r"^强(?:[\s,，.。;；:：/()\[【\]】「」\"“”'’—–-]|证据|档|$)", cleaned):
+        return "strong"
+    if re.match(
+        r"^中(?:等(?:偏[强弱])?|强|偏[强弱])?(?:[\s,，.。;；:：/()\[【\]】「」\"“”'’—–-]|证据|档|k\b|$)",
+        cleaned,
+    ):
+        return "medium"
+    if re.match(
+        r"^弱(?:至中(?:等)?|[~～-]\s*中|→无|证据)?(?:[\s,，.。;；:：/()\[【\]】「」\"“”'’—–-]|k\b|$)",
+        cleaned,
+    ):
+        return "weak"
+    if re.match(r"^(?:无|k\s*=\s*0|edge\s*[≤<=]+\s*0)", cleaned):
+        return "none"
+    inline = re.search(
+        r"(?:证据(?:强度)?(?:评定)?(?:为|属)\s*[\[【「(（\"“”'’]*)(强|中(?:等|强)?|弱|无)",
+        value,
+    )
+    if inline:
+        hit = inline.group(1)
+        return {"强": "strong", "弱": "weak", "无": "none"}.get(hit, "medium")
+    if re.search(r"弱证据|证据偏弱|上限\s*k\s*=\s*1/8", value):
+        return "weak"
+    if (re.search(r"(?:实际|执行|取|[→>-])\s*k\s*=\s*0\b", value)
+            and not re.search(r"k\s*=\s*1/[248]", value)):
         return "none"
     return "unknown"
+
 
 def _extract_stake(section: str) -> tuple[float | None, bool]:
     lines = section.splitlines()
     for index, line in enumerate(lines):
-        if not re.search(r"(?i)\*\*注额\*\*\s*[：:]", line):
+        if not re.search(r"(?i)\*\*(?:模型初选)?注额(?:计算)?(?:\*\*\s*[：:]|\s*[：:])", line):
             continue
         block = [line]
         for following in lines[index + 1:]:
@@ -569,8 +625,15 @@ def _extract_stake(section: str) -> tuple[float | None, bool]:
             return None, True
         if _looks_like_pass(text):
             return 0.0, False
+        cleaned_text = re.sub(
+            r"[$￥¥]\s*100(?:\.0+)?\s*本金|本金\s*[$￥¥]\s*100(?:\.0+)?",
+            "",
+            text,
+        )
         money = re.findall(
-            r"(?:[$￥¥]\s*)([+-]?(?:\d[\d,]*(?:\.\d*)?|\.\d+))", text)
+            r"(?:[$￥¥]\s*)([+-]?(?:\d[\d,]*(?:\.\d*)?|\.\d+))",
+            cleaned_text,
+        )
         if money:
             value = _numeric_value(money[-1])
             return value, value is None or value < 0
@@ -631,7 +694,10 @@ def parse_decision_section(report: str) -> DecisionParseResult | None:
 
         odds = _numeric_value(odds_cell)
         p_market = _numeric_value(cells[columns["p_market"]], percent=True)
-        p_final = _numeric_value(cells[columns["p_final"]], percent=True)
+        p_final_cell = cells[columns["p_final"]]
+        p_final = _numeric_value(p_final_cell, percent=True)
+        if p_final is None and p_market is not None and _inherits_market_prob(p_final_cell):
+            p_final = p_market
         edge = _numeric_value(cells[columns["edge"]], percent=True)
         eligibility_cell = (
             cells[columns["eligibility"]]
@@ -1067,6 +1133,11 @@ def select_decision(
             else:
                 source, fallback = "jev", ""
     if chosen is None:
+        if _model_pick_is_pass(report):
+            return DecisionSelection(
+                selected_id="PASS", candidate=None, source="model_pass",
+                fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment,
+                **common)
         chosen = max(positives, key=lambda c: c.edge)   # 并列取表中靠前者
 
     k = kelly_fraction(evidence, confidence_score)
@@ -1125,6 +1196,8 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
         if selection.source == "zero_kelly":
             source_line = (f"证据强度=无（k=0），不下注（edge 最高规则；"
                            f"Jev 未参与：{fallback}）")
+        elif selection.source == "model_pass":
+            source_line = f"保留模型初选 PASS（Jev 未参与：{fallback}）"
         else:
             source_line = f"代码 edge 最高规则（Jev 未参与：{fallback}）"
 
@@ -1173,12 +1246,48 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
 
 _MODEL_PICK_LABELS = (
     (re.compile(r"^(\s*[-*]\s*)\*\*选中项\*\*"), r"\1**模型初选**"),
-    (re.compile(r"^(\s*[-*]\s*)\*\*注额\*\*"), r"\1**模型初选注额**"),
+    (re.compile(r"^(\s*[-*]\s*)\*\*选中项\s*([：:])\s*(.*?)\*\*"), r"\1**模型初选**\2 \3"),
+    (re.compile(r"^(\s*[-*]\s*)\*\*注额(?:计算)?\*\*"), r"\1**模型初选注额**"),
+    (re.compile(r"^(\s*[-*]\s*)\*\*注额(?:计算)?\s*([：:])\s*(.*?)\*\*"), r"\1**模型初选注额**\2 \3"),
 )
-_MODEL_SELECTED_ID_RE = re.compile(r"^\s*[-*]\s*\*\*选中候选\s*ID\*\*")
+_MODEL_SELECTED_ID_RE = re.compile(r"^\s*[-*]\s*\*\*选中候选\s*ID(?:\*\*|\s*[：:])")
 # 代码写入的最终选定段（紧跟 decision_final 注释的四行）
 _PRIOR_BLOCK_LINE_RE = re.compile(
     r"^- \*\*(?:选中候选 ID|选中项|决策来源|注额)\*\*：")
+
+
+def _strip_prior_selection_block(section: str) -> str:
+    lines = (section or "").split("\n")
+    prior_block: set[int] = set()
+    for index, line in enumerate(lines):
+        if not _DECISION_FINAL_RE.match(line + "\n"):
+            continue
+        prior_block.add(index)
+        follow = index + 1
+        while follow < len(lines) and _PRIOR_BLOCK_LINE_RE.match(lines[follow]):
+            prior_block.add(follow)
+            follow += 1
+        if follow < len(lines) and not lines[follow].strip():
+            prior_block.add(follow)
+    return "\n".join(
+        line for index, line in enumerate(lines) if index not in prior_block
+    )
+
+
+def _model_pick_is_pass(report: str) -> bool:
+    section = extract_decision_section(report or "")
+    if not section:
+        return False
+    cleaned = _strip_prior_selection_block(section)
+    selected_id, selected_text = _selected_fields(cleaned)
+    if selected_id == "PASS" or _looks_like_pass(selected_text):
+        return True
+    plain = _plain(cleaned)
+    model_match = re.search(
+        r"(?im)^\s*[-*]\s*模型初选\s*[：:]\s*(.*)$",
+        plain,
+    )
+    return bool(model_match and _looks_like_pass(model_match.group(1)))
 
 
 def _section_span(report: str) -> tuple[int, int] | None:
