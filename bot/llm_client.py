@@ -1361,7 +1361,7 @@ def chat_model(system: str, user: str, model: str, effort: str = "",
                input_metrics: dict | None = None) -> str:
     """按明确模型调用，不读取 tier 运行时主模型。
 
-    供全模型会诊使用：同一模型仍可在其授权组的多个 endpoint 间故障转移，
+    供全模型交叉精算/复盘使用：同一模型仍可在其授权组的多个 endpoint 间故障转移，
     但默认不会静默切换到另一模型。只有调用方显式提供 fallback_models 时，
     才会在首字节/正文前进入指定的模型回退链。
     """
@@ -1421,11 +1421,14 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                       max_tokens: int = 0,
                       fallback_models: tuple[str, ...] = (),
                       fallback_efforts: tuple[str, ...] = (),
-                      input_metrics: dict | None = None):
+                      input_metrics: dict | None = None,
+                      on_model_used=None):
     """按明确模型流式调用；只在首字节前进入调用方指定的模型回退链。
 
     fallback_efforts 与 fallback_models 按位置对应；未提供时沿用主模型
     effort，旧调用方因此保持兼容。
+    on_model_used(model, effort) 只在实际产出正文时报告真实路由模型；
+    用于跨模型审计隔离，不改变既有流式事件契约。
     """
     if not available():
         yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
@@ -1478,6 +1481,8 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
             for ev in _stream_one(ep, payload, first_byte_to, idle_to,
                                   int(st["max_retries"])):
                 if ev[0] == "delta":
+                    if not endpoint_produced and on_model_used is not None:
+                        on_model_used(current_model, current_effort)
                     endpoint_produced = True
                     produced = True
                     yield ev
@@ -1485,6 +1490,8 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                     usage_logged = True
                     _log_usage(request_id, current_model, ep["label"], ev[1])
                 elif ev[0] == "done":
+                    if not endpoint_produced and on_model_used is not None and ev[1]:
+                        on_model_used(current_model, current_effort)
                     if not usage_logged:
                         _log_usage(request_id, current_model, ep["label"], None)
                     br.record(True)

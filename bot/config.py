@@ -822,18 +822,27 @@ LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
     "gpt-5.6-sol": "gpt-6-sol",
 }
 
-# 全模型交叉会诊的固定任务。该模式不读取 /llm 面板当前的 tier 主模型，
-# 而是按模型能力把每个模型固定到一个可审计的职责；密钥仍按模型家族路由。
-# consult_grade 是会诊专用能力等级，不等同于运行时 heavy/balanced/light 档位。
+# 全模型交叉精算/复盘的职责及初始值；各自的手动覆盖保存在 full_model_routes。
+# 不读取普通三档主模型；/llm 的全模型设置可分别调整两套配置及恢复默认。
+# consult_grade 是全模型专用能力等级，不等同于运行时 heavy/balanced/light 档位。
 # 同一模块的回退模型必须保持同等级；每个回退模型独立声明 effort。
 # max_tokens=0 表示不在模块层覆盖，让 llm_client 按 LLM_MODEL_MAX_TOKENS
 # （未单列时 LLM_MAX_TOKENS）读取服务器 .env 的逐模型预算。
 FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gpt-6-astra": "flagship",
+    "gpt-6-sol": "flagship",
+    "gpt-6.1-sol": "flagship",
     "gpt-5.6-sol": "flagship",
     "glm-5.3": "flagship",
     "grok-4.6": "flagship",
+    "grok-4.7": "flagship",
     "deepseek-v4-pro": "flagship",
+    "claude-opus-5-5": "flagship",
+    "claude-sonnet-5-5": "flagship",
+    "claude-opus-5-5-high": "flagship",
+    "claude-sonnet-5-5-high": "flagship",
+    "gemini-4-argon": "flagship",
+    "gemini-4-argon-high": "flagship",
     "gpt-5.6-luna": "specialized_fast",
     "gpt-6-luna": "specialized_fast",
     "gpt-5.6-terra": "specialized_fast",
@@ -841,77 +850,78 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "grok-4.5": "specialized_fast",
     "deepseek-v4.1-flash": "specialized_fast",
     "gemini-3.8-flash": "specialized_fast",
+    "gemini-3.8-flash-high": "specialized_fast",
 }
 
 FULL_CONSULT_TASKS: tuple[dict, ...] = (
     {"id": "data_audit", "label": "数据审计", "model": "gpt-6-luna",
      "effort": "low", "max_tokens": 0,
      "fallbacks": (
-         {"model": "deepseek-v4.1-flash", "effort": "high"},
-         {"model": "glm-5.3-flash", "effort": "high"},
+          {"model": "glm-5.3-flash", "effort": "low"},
+          {"model": "deepseek-v4.1-flash", "effort": "low"},
      )},
-    {"id": "fundamentals", "label": "基本面主分析", "model": "gpt-5.6-terra",
-     "effort": "medium", "max_tokens": 0,
-     "fallbacks": (
-         {"model": "gemini-3.8-flash", "effort": "high"},
-         {"model": "glm-5.3-flash", "effort": "high"},
-     )},
-    {"id": "fundamentals_review", "label": "基本面复核", "model": "glm-5.3-flash",
+    {"id": "fundamentals", "label": "基本面主分析", "model": "claude-sonnet-5-5-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gemini-3.8-flash", "effort": "high"},
-         {"model": "gpt-5.6-terra", "effort": "high"},
+         {"model": "glm-5.3", "effort": "high"},
+         {"model": "gpt-6.1-sol", "effort": "high"},
      )},
-    {"id": "market_primary", "label": "盘口主分析", "model": "grok-4.6",
+    {"id": "fundamentals_review", "label": "基本面复核", "model": "glm-5.3",
+     "effort": "high", "max_tokens": 0,
+     "fallbacks": (
+         {"model": "gemini-4-argon-high", "effort": "high"},
+         {"model": "deepseek-v4-pro", "effort": "high"},
+     )},
+    {"id": "market_primary", "label": "盘口主分析", "model": "gpt-6.1-sol",
      "effort": "xhigh", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-6-astra", "effort": "xhigh"},
          {"model": "deepseek-v4-pro", "effort": "max"},
+         {"model": "gemini-4-argon-high", "effort": "high"},
      )},
-    {"id": "market_challenge", "label": "盘口反方分析", "model": "grok-4.5",
+    {"id": "market_challenge", "label": "盘口反方分析", "model": "grok-4.7",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-5.6-terra", "effort": "high"},
-         {"model": "gemini-3.8-flash", "effort": "high"},
+         {"model": "claude-opus-5-5-high", "effort": "high"},
+         {"model": "glm-5.3", "effort": "high"},
      )},
     {"id": "numeric_summary", "label": "数字整理", "model": "deepseek-v4.1-flash",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
          {"model": "glm-5.3-flash", "effort": "high"},
-         {"model": "gemini-3.8-flash", "effort": "high"},
+         {"model": "gpt-6-luna", "effort": "medium"},
      )},
     {"id": "risk_review", "label": "风险复核", "model": "deepseek-v4-pro",
      "effort": "max", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-5.6-sol", "effort": "max"},
-         {"model": "gpt-6-astra", "effort": "max"},
+         {"model": "claude-opus-5-5-high", "effort": "high"},
+         {"model": "glm-5.3", "effort": "max"},
      )},
-    {"id": "cross_market", "label": "跨市场检查", "model": "gemini-3.8-flash",
+    {"id": "cross_market", "label": "跨市场检查", "model": "gemini-4-argon-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-5.6-terra", "effort": "high"},
-         {"model": "glm-5.3-flash", "effort": "high"},
+         {"model": "deepseek-v4-pro", "effort": "max"},
+         {"model": "gpt-6.1-sol", "effort": "xhigh"},
      )},
     {"id": "lesson_match", "label": "教训匹配", "model": "glm-5.3",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-5.6-sol", "effort": "high"},
-         {"model": "gpt-6-astra", "effort": "high"},
+         {"model": "claude-sonnet-5-5-high", "effort": "high"},
+         {"model": "gpt-6.1-sol", "effort": "high"},
      )},
 )
 
 FULL_CONSULT_SYNTHESIS = {
     "model": "gpt-6-astra", "effort": "xhigh", "max_tokens": 0,
     "fallbacks": (
+        {"model": "claude-opus-5-5-high", "effort": "high"},
         {"model": "deepseek-v4-pro", "effort": "max"},
-        {"model": "grok-4.6", "effort": "xhigh"},
     ),
 }
 FULL_CONSULT_AUDIT = {
-    "model": "gpt-5.6-sol", "effort": "high", "max_tokens": 0,
+    "model": "claude-opus-5-5-high", "effort": "high", "max_tokens": 0,
     "fallbacks": (
-        {"model": "deepseek-v4-pro", "effort": "high"},
-        {"model": "glm-5.3", "effort": "high"},
+        {"model": "glm-5.3", "effort": "max"},
+        {"model": "deepseek-v4-pro", "effort": "max"},
     ),
 }
 FULL_CONSULT_MAX_WORKERS = 4

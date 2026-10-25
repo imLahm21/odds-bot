@@ -1,17 +1,33 @@
-"""全模型交叉会诊。"""
+"""全模型交叉精算。"""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
+import sqlite3
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from . import analyzer, config, llm_client
+from . import analyzer, config, db, full_model_settings, llm_client
 
 log = logging.getLogger("odds_bot.multi_analyzer")
+
+
+def profile_snapshot(profile: str = "analyze") -> dict[str, dict]:
+    """Take one job-local snapshot; menu edits only affect subsequent jobs."""
+    fallback = full_model_settings.defaults(profile)
+    try:
+        conn = db.get_conn()
+        try:
+            return db.get_full_model_profile(conn, profile)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        log.warning("读取全模型配置 %s 失败，使用代码默认：%s", profile, exc)
+        return fallback
 
 _ERR_PREFIXES = tuple(getattr(analyzer, "_LLM_ERR_PREFIXES", ())) + (
     "未配置 LLM_ROUTE_ENDPOINTS",
@@ -45,7 +61,7 @@ def _json_instruction(module_id: str, role: str,
                       extra_instruction: str) -> str:
     focus = extra_instruction.strip() or "无额外侧重。"
     return (
-        "你是全模型交叉会诊中的【%s】。模块ID=%s。\n"
+        "你是全模型交叉精算中的【%s】。模块ID=%s。\n"
         "只分析本模块职责，不生成完整赛前报告，不替其他模块下结论。\n"
         "所有事实必须来自输入；缺失就写无数据，不得编造。\n"
         "输出必须是合法 JSON，不要 Markdown、代码围栏或 JSON 外说明，"
@@ -179,71 +195,26 @@ def _parse_json(raw: str) -> tuple[dict | None, str]:
 
 def _route_candidates(spec: dict) -> list[dict]:
     """Return the primary and explicit per-model fallback route."""
-    raw = [{"model": spec.get("model", ""),
-            "effort": spec.get("effort", "")}]
-    raw.extend(spec.get("fallbacks", ()))
-    # Read the old shape while migrating local worktrees, but do not use it
-    # in the committed configuration because it cannot carry per-model effort.
-    if not spec.get("fallbacks"):
-        raw.extend({"model": model, "effort": spec.get("effort", "")}
-                   for model in spec.get("fallback_models", ()))
-    candidates = []
-    seen = set()
-    for item in raw:
-        if isinstance(item, str):
-            item = {"model": item, "effort": spec.get("effort", "")}
-        model = str(item.get("model", "")).strip()
-        if not model or model in seen:
-            continue
-        seen.add(model)
-        candidates.append({"model": model,
-                           "effort": str(item.get("effort", "")).strip()})
-    return candidates
+    return full_model_settings.candidates(spec)
 
 
 def _route_problems(spec: dict) -> list[str]:
     """Validate grade, registration, group escape, and effort declarations."""
-    candidates = _route_candidates(spec)
-    if not candidates:
-        return ["未指定模型"]
-    problems = []
-    primary = candidates[0]["model"]
-    primary_grade = config.FULL_CONSULT_MODEL_GRADES.get(primary)
-    if not config.llm_model_registered(primary):
-        problems.append(f"主模型未登记：{primary}")
-    if not primary_grade:
-        problems.append(f"主模型未声明会诊等级：{primary}")
-    primary_groups = set(config.llm_route_groups_for_model(primary))
-    for item in candidates:
-        model, effort = item["model"], item["effort"]
-        if not config.llm_model_registered(model):
-            problems.append(f"模型未登记：{model}")
-        if config.FULL_CONSULT_MODEL_GRADES.get(model) != primary_grade:
-            problems.append(
-                f"模型等级不一致：{primary}({primary_grade}) -> "
-                f"{model}({config.FULL_CONSULT_MODEL_GRADES.get(model)})")
-        if not config.llm_model_supports_effort(model, effort):
-            problems.append(f"{model} 不支持 effort={effort}")
-    if len(candidates) > 1:
-        first_groups = set(config.llm_route_groups_for_model(
-            candidates[1]["model"]))
-        if primary_groups and first_groups and primary_groups & first_groups:
-            problems.append(
-                f"第一回退未离开主授权组：{primary} -> "
-                f"{candidates[1]['model']}")
-    return problems
+    return full_model_settings.route_problems(spec)
 
 
-def validate_full_consult_routes() -> list[str]:
+def validate_full_consult_routes(routes: dict | None = None) -> list[str]:
     """Return configuration errors before any live request is attempted."""
-    specs = list(config.FULL_CONSULT_TASKS) + [
-        config.FULL_CONSULT_SYNTHESIS, config.FULL_CONSULT_AUDIT,
-    ]
+    defaults = full_model_settings.defaults("analyze")
+    if routes is None:
+        routes = defaults
     problems = []
-    for spec in specs:
-        name = spec.get("id") or spec.get("model", "route")
+    for name in defaults:
+        if name not in routes:
+            problems.append(f"缺少职责配置：{name}")
+            continue
         problems.extend(f"{name}: {problem}"
-                        for problem in _route_problems(spec))
+                        for problem in _route_problems(routes[name]))
     return problems
 
 
@@ -255,28 +226,38 @@ def _route_meta(spec: dict, candidate: dict, position: int,
         "requested_effort": spec.get("effort", ""),
         "effort": candidate.get("effort", ""),
         "fallback_used": position > 0,
-        "fallback_attempted": len(attempts) > 1 or position > 0,
+        "fallback_attempted": sum(item.get("status") != "skipped" for item in attempts) > 1 or position > 0,
         "attempts": attempts,
         "error": error,
     }
 
 
 def _call_route(system: str, user: str, spec: dict, *, parse_json: bool,
-                phase: str, input_metrics: dict | None = None
+                phase: str, input_metrics: dict | None = None,
+                excluded_models=()
                 ) -> tuple[object | None, dict]:
     """Call a route one model at a time so contract errors also fail over."""
     problems = _route_problems(spec)
     if problems:
-        error = "会诊路由配置错误：" + "；".join(problems)
+        error = "精算路由配置错误：" + "；".join(problems)
         log.error("全模型路由拒绝 phase=%s reason=%s", phase, error)
-        candidates = _route_candidates(spec)
+        candidates = []
         meta = _route_meta(spec, candidates[0] if candidates else {}, 0, [],
                            error=error)
         return None, meta
 
     attempts = []
-    candidates = _route_candidates(spec)
-    for position, candidate in enumerate(candidates):
+    excluded = {full_model_settings.model_identity(model) for model in excluded_models}
+    candidates = []
+    for position, candidate in enumerate(_route_candidates(spec)):
+        if full_model_settings.model_identity(candidate["model"]) in excluded:
+            attempts.append({**candidate, "status": "skipped", "error": "避免合并模型自审"})
+        else:
+            candidates.append((position, candidate))
+    if not candidates:
+        error = "无独立审计模型：配置中的模型均参与了本次合并或修复"
+        return None, _route_meta(spec, {"model": "", "effort": ""}, 0, attempts, error=error)
+    for chain_index, (position, candidate) in enumerate(candidates):
         model, effort = candidate["model"], candidate["effort"]
         try:
             raw = llm_client.chat_model(
@@ -318,8 +299,8 @@ def _call_route(system: str, user: str, spec: dict, *, parse_json: bool,
                 error = "模型返回空内容"
         attempts.append({"model": model, "effort": effort,
                          "status": "error", "error": str(error)[:500]})
-        next_model = (candidates[position + 1]["model"]
-                      if position + 1 < len(candidates) else "")
+        next_model = (candidates[chain_index + 1][1]["model"]
+                      if chain_index + 1 < len(candidates) else "")
         log.warning(
             "全模型故障转移尝试失败 phase=%s requested=%s failed=%s "
             "reason=%s%s",
@@ -329,7 +310,7 @@ def _call_route(system: str, user: str, spec: dict, *, parse_json: bool,
     error = "；".join(
         f"{item['model']}：{item.get('error', '失败')}"
         for item in attempts)[:1500]
-    meta = _route_meta(spec, candidates[-1], len(candidates) - 1,
+    meta = _route_meta(spec, candidates[-1][1], candidates[-1][0],
                        attempts, error=error)
     log.error("全模型故障转移耗尽 phase=%s requested=%s attempts=%d",
               phase, spec.get("model"), len(attempts))
@@ -387,7 +368,8 @@ def _basic_report_issues(report: str) -> list[str]:
     return issues
 
 
-def _audit_report(bundle: dict, report: str, cards: list[dict]) -> dict:
+def _audit_report(bundle: dict, report: str, cards: list[dict], *,
+                  spec: dict | None = None, excluded_models=()) -> dict:
     deterministic = _basic_report_issues(report)
     system = (
         "你是最终报告审计员。只输出合法JSON，不要Markdown。\n"
@@ -399,7 +381,8 @@ def _audit_report(bundle: dict, report: str, cards: list[dict]) -> dict:
     )
     parsed, route = _call_route(
         system, _audit_input(bundle, report, cards),
-        config.FULL_CONSULT_AUDIT, parse_json=True, phase="audit",
+        spec if spec is not None else config.FULL_CONSULT_AUDIT,
+        parse_json=True, phase="audit", excluded_models=excluded_models,
     )
     if parsed is None:
         return {"ok": False, "issues": deterministic + [
@@ -421,7 +404,7 @@ def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
     user += (
         "\n### 全模型专家卡片（失败模块也必须保留其状态）\n"
         + card_text
-        + "\n\n===== 会诊合并要求 =====\n"
+        + "\n\n===== 精算合并要求 =====\n"
         "请基于同一份原始数据完成最终报告。专家卡片是证据辅助，不是投票结果。\n"
         "A层盘口定性和操盘手法决定方向；B层仅在SOP明文条件覆盖时改方向；"
         "C/D层不得改方向，只能扣置信度、列次选和风险。\n"
@@ -431,20 +414,26 @@ def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
 
 
 def _synthesize(bundle: dict, cards: list[dict], cancel=None,
-                progress: Callable[[str], None] | None = None) -> str:
+                progress: Callable[[str], None] | None = None, *,
+                spec: dict | None = None, trace: dict | None = None) -> str:
     if cancel is not None and cancel.is_set():
         return ""
     system, user, metrics = _synthesis_prompt(bundle, cards)
-    fallbacks = config.FULL_CONSULT_SYNTHESIS.get("fallbacks", ())
+    spec = spec if spec is not None else config.FULL_CONSULT_SYNTHESIS
+    fallbacks = _route_candidates(spec)[1:]
+
+    def model_used(model, effort):
+        if trace is not None:
+            trace.update(model=model, effort=effort)
     accumulated = ""
     for event in llm_client.stream_chat_model(
             system, user,
-            model=config.FULL_CONSULT_SYNTHESIS["model"],
-            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
-            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+            model=spec["model"],
+            effort=spec["effort"],
+            max_tokens=spec["max_tokens"],
             fallback_models=tuple(item["model"] for item in fallbacks),
             fallback_efforts=tuple(item["effort"] for item in fallbacks),
-            input_metrics=metrics):
+            input_metrics=metrics, on_model_used=model_used):
         if cancel is not None and cancel.is_set():
             return ""
         kind, payload = event[0], event[1]
@@ -462,8 +451,8 @@ def _synthesize(bundle: dict, cards: list[dict], cancel=None,
     return accumulated.strip()
 
 
-def _render_appendix(results: list[dict], audit: dict) -> str:
-    lines = ["### 模型会诊记录"]
+def _render_appendix(results: list[dict], audit: dict, synthesis: dict | None = None) -> str:
+    lines = ["### 全模型执行记录"]
     for result in results:
         status = "✅" if result.get("status") == "ok" else "❌"
         error = result.get("error", "")
@@ -479,24 +468,36 @@ def _render_appendix(results: list[dict], audit: dict) -> str:
             f"{model_text} / {result.get('effort')} / "
             f"{result.get('elapsed_ms', 0)}ms{tail}"
         )
+    if synthesis:
+        lines.append(f"- ✅ 最终合并：{synthesis['model']} / {synthesis['effort'] or '模型默认'}")
     if audit.get("ok"):
         route = audit.get("route") or {}
-        lines.append(f"- ✅ {route.get('model', '审计模型')}最终审计：通过")
+        lines.append(f"- ✅ {route.get('model') or '独立审计模型'}最终审计：通过")
     else:
         issues = audit.get("issues") or []
         route = audit.get("route") or {}
         lines.append(
-            f"- ⚠️ {route.get('model', '审计模型')}最终审计："
-            f"{len(issues)}项问题，已标注或尝试修复")
+            f"- ⚠️ {route.get('model') or '独立审计模型'}最终审计："
+            f"{len(issues)}项问题，已标注或尝试修复；{str(issues[:1])[:180]}")
     return "\n".join(lines)
 
 
 def run(csv_text: str, fundamentals: str, home: str, away: str,
         league: str, goals_block: str = "", extra_instruction: str = "",
         cancel=None,
-        progress: Callable[[str, dict | None], None] | None = None
+        progress: Callable[[str, dict | None], None] | None = None, *,
+        profile: str = "analyze", settings: dict | None = None
         ) -> tuple[str, dict]:
-    """执行全模型会诊，返回 (报告, 执行摘要)。"""
+    """执行全模型精算，返回 (报告, 执行摘要)。"""
+    if profile not in full_model_settings.PROFILES:
+        return "", {"results": [], "error": "未知全模型配置"}
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": []}
+    routes = deepcopy(settings if settings is not None else profile_snapshot(profile))
+    problems = validate_full_consult_routes(routes)
+    if problems:
+        return "", {"results": [], "error": "全模型配置错误：" + "；".join(problems)}
+    tasks = [routes[task["id"]] for task in config.FULL_CONSULT_TASKS]
     bundle = {
         "csv_text": csv_text or "",
         "fundamentals": fundamentals or "",
@@ -511,7 +512,7 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         max_workers=config.FULL_CONSULT_MAX_WORKERS,
         thread_name_prefix="full-consult")
     futures = [executor.submit(_run_one, task, bundle)
-               for task in config.FULL_CONSULT_TASKS]
+               for task in tasks]
     try:
         for future in as_completed(futures):
             if cancel is not None and cancel.is_set():
@@ -528,7 +529,7 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
     if cancel is not None and cancel.is_set():
         return "", {"cancelled": True, "results": results}
 
-    order = {task["id"]: i for i, task in enumerate(config.FULL_CONSULT_TASKS)}
+    order = {task["id"]: i for i, task in enumerate(tasks)}
     results.sort(key=lambda item: order.get(item.get("id"), 999))
     cards = [
         {
@@ -541,14 +542,17 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         }
         for item in results
     ]
+    synthesis = {"model": routes["synthesis"]["model"], "effort": routes["synthesis"]["effort"]}
     report = _synthesize(
         bundle, cards, cancel=cancel,
         progress=(lambda kind: progress(kind, None) if progress else None),
+        spec=routes["synthesis"], trace=synthesis,
     )
     if not report:
         return "", {"results": results, "error": "最终合并模型链全部失败"}
 
-    audit = _audit_report(bundle, report, cards)
+    writers = {synthesis["model"]}
+    audit = _audit_report(bundle, report, cards, spec=routes["audit"], excluded_models=writers)
     if not audit["ok"] and not (cancel is not None and cancel.is_set()):
         issues = json.dumps(audit["issues"], ensure_ascii=False)
         repair_system = (
@@ -558,14 +562,27 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         repaired, repair_route = _call_route(
             repair_system,
             "### 原报告\n" + report + "\n### 审计问题\n" + issues,
-            config.FULL_CONSULT_SYNTHESIS, parse_json=False,
+            routes["synthesis"], parse_json=False,
             phase="repair",
         )
         if repaired:
             report = str(repaired).strip()
-            audit = _audit_report(bundle, report, cards)
-    report += "\n\n" + _render_appendix(results, audit)
-    return report, {"results": results, "audit": audit}
+            if repair_route.get("model"):
+                writers.add(repair_route["model"])
+                synthesis.update(model=repair_route["model"], effort=repair_route.get("effort", ""))
+            audit = _audit_report(bundle, report, cards, spec=routes["audit"], excluded_models=writers)
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": results, "audit": audit}
+
+    # Reuse the ordinary SOP's bounded decision layer only after the last LLM
+    # repair. This also finalizes review's result-blind first-stage forecast;
+    # run_review must never reselect a wager after seeing the actual result.
+    report = analyzer.finalize_decision(report, home, away, league)
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": results, "audit": audit}
+    report += "\n\n" + _render_appendix(results, audit, synthesis)
+    return report, {"results": results, "audit": audit, "synthesis": synthesis,
+                    "profile": profile, "writers": sorted(writers)}
 
 
 def _basic_review_issues(report: str) -> list[str]:
@@ -578,7 +595,8 @@ def _basic_review_issues(report: str) -> list[str]:
     return issues
 
 
-def _review_audit(bundle: dict, report: str, cards: list[dict]) -> dict:
+def _review_audit(bundle: dict, report: str, cards: list[dict], *,
+                  spec: dict | None = None, excluded_models=()) -> dict:
     deterministic = _basic_review_issues(report)
     system = (
         "你是全模型赛后复盘审计员。只输出合法JSON，不要Markdown。"
@@ -593,8 +611,8 @@ def _review_audit(bundle: dict, report: str, cards: list[dict]) -> dict:
         + "\n### 实际结果\n" + bundle.get("result_text", "")
     )
     parsed, route = _call_route(
-        system, audit_user, config.FULL_CONSULT_AUDIT,
-        parse_json=True, phase="review_audit",
+        system, audit_user, spec if spec is not None else config.FULL_CONSULT_AUDIT,
+        parse_json=True, phase="review_audit", excluded_models=excluded_models,
     )
     if parsed is None:
         return {"ok": False, "issues": deterministic + [
@@ -623,7 +641,7 @@ def _review_synthesis_prompt(bundle: dict,
     user += (
         "\n### 全模型复盘专家卡片\n"
         + json.dumps(cards, ensure_ascii=False, indent=2)
-        + "\n\n===== 会诊合并要求 =====\n"
+        + "\n\n===== 精算合并要求 =====\n"
         "专家卡片是分模块证据，不按多数投票。必须以第一阶段盲推原文为"
         "事前基准，严格输出现有复盘格式的 ### 1 到 ### 6。\n"
     )
@@ -631,18 +649,24 @@ def _review_synthesis_prompt(bundle: dict,
 
 
 def _review_synthesize(bundle: dict, cards: list[dict], cancel=None,
-                       progress: Callable[[str], None] | None = None) -> str:
+                       progress: Callable[[str], None] | None = None, *,
+                       spec: dict | None = None, trace: dict | None = None) -> str:
     system, user, metrics = _review_synthesis_prompt(bundle, cards)
-    fallbacks = config.FULL_CONSULT_SYNTHESIS.get("fallbacks", ())
+    spec = spec if spec is not None else config.FULL_CONSULT_SYNTHESIS
+    fallbacks = _route_candidates(spec)[1:]
+
+    def model_used(model, effort):
+        if trace is not None:
+            trace.update(model=model, effort=effort)
     accumulated = ""
     for event in llm_client.stream_chat_model(
             system, user,
-            model=config.FULL_CONSULT_SYNTHESIS["model"],
-            effort=config.FULL_CONSULT_SYNTHESIS["effort"],
-            max_tokens=config.FULL_CONSULT_SYNTHESIS["max_tokens"],
+            model=spec["model"],
+            effort=spec["effort"],
+            max_tokens=spec["max_tokens"],
             fallback_models=tuple(item["model"] for item in fallbacks),
             fallback_efforts=tuple(item["effort"] for item in fallbacks),
-            input_metrics=metrics):
+            input_metrics=metrics, on_model_used=model_used):
         if cancel is not None and cancel.is_set():
             return ""
         kind, payload = event[0], event[1]
@@ -664,9 +688,20 @@ def run_review(csv_text: str, forecast: str, result_text: str,
                fundamentals: str, home: str, away: str, league: str,
                goals_block: str = "", extra_instruction: str = "",
                cancel=None,
-               progress: Callable[[str, dict | None], None] | None = None
+               progress: Callable[[str, dict | None], None] | None = None, *,
+               settings: dict | None = None
                ) -> tuple[str, dict]:
-    """执行第二阶段全模型对照复盘，返回 (六段报告, 执行摘要)。"""
+    """执行第二阶段全模型对照复盘，返回 (六段报告, 执行摘要)。
+
+    第一阶段盲推已在 run 中完成有界决策；揭晓结果后不再重选或改写盲推。
+    """
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": []}
+    routes = deepcopy(settings if settings is not None else profile_snapshot("review"))
+    problems = validate_full_consult_routes(routes)
+    if problems:
+        return "", {"results": [], "error": "全模型复盘配置错误：" + "；".join(problems)}
+    tasks = [routes[task["id"]] for task in config.FULL_CONSULT_TASKS]
     bundle = {
         "review_mode": True,
         "csv_text": csv_text or "",
@@ -684,7 +719,7 @@ def run_review(csv_text: str, forecast: str, result_text: str,
         max_workers=config.FULL_CONSULT_MAX_WORKERS,
         thread_name_prefix="full-review")
     futures = [executor.submit(_run_one, task, bundle)
-               for task in config.FULL_CONSULT_TASKS]
+               for task in tasks]
     try:
         for future in as_completed(futures):
             if cancel is not None and cancel.is_set():
@@ -701,7 +736,7 @@ def run_review(csv_text: str, forecast: str, result_text: str,
     if cancel is not None and cancel.is_set():
         return "", {"cancelled": True, "results": results}
 
-    order = {task["id"]: i for i, task in enumerate(config.FULL_CONSULT_TASKS)}
+    order = {task["id"]: i for i, task in enumerate(tasks)}
     results.sort(key=lambda item: order.get(item.get("id"), 999))
     cards = [
         {
@@ -714,14 +749,17 @@ def run_review(csv_text: str, forecast: str, result_text: str,
         }
         for item in results
     ]
+    synthesis = {"model": routes["synthesis"]["model"], "effort": routes["synthesis"]["effort"]}
     report = _review_synthesize(
         bundle, cards, cancel=cancel,
         progress=(lambda kind: progress(kind, None) if progress else None),
+        spec=routes["synthesis"], trace=synthesis,
     )
     if not report:
         return "", {"results": results, "error": "复盘合并模型链全部失败"}
 
-    audit = _review_audit(bundle, report, cards)
+    writers = {synthesis["model"]}
+    audit = _review_audit(bundle, report, cards, spec=routes["audit"], excluded_models=writers)
     if not audit["ok"] and not (cancel is not None and cancel.is_set()):
         repair_system = (
             "你是复盘报告修复器。只修复审计指出的问题，保留第一阶段盲推原文"
@@ -731,11 +769,17 @@ def run_review(csv_text: str, forecast: str, result_text: str,
             repair_system,
             "### 原复盘\n" + report + "\n### 审计问题\n"
             + json.dumps(audit["issues"], ensure_ascii=False),
-            config.FULL_CONSULT_SYNTHESIS, parse_json=False,
+            routes["synthesis"], parse_json=False,
             phase="review_repair",
         )
         if repaired:
             report = str(repaired).strip()
-            audit = _review_audit(bundle, report, cards)
-    report += "\n\n" + _render_appendix(results, audit)
-    return report, {"results": results, "audit": audit}
+            if repair_route.get("model"):
+                writers.add(repair_route["model"])
+                synthesis.update(model=repair_route["model"], effort=repair_route.get("effort", ""))
+            audit = _review_audit(bundle, report, cards, spec=routes["audit"], excluded_models=writers)
+    if cancel is not None and cancel.is_set():
+        return "", {"cancelled": True, "results": results, "audit": audit}
+    report += "\n\n" + _render_appendix(results, audit, synthesis)
+    return report, {"results": results, "audit": audit, "synthesis": synthesis,
+                    "profile": "review", "writers": sorted(writers)}

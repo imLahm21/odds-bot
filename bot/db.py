@@ -8,11 +8,12 @@ SQLite 数据层 —— 建表、批量插入、连接管理
 """
 
 import os
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from . import config
+from . import config, full_model_settings
 
 log = logging.getLogger("odds_bot.db")
 
@@ -114,6 +115,15 @@ CREATE TABLE IF NOT EXISTS llm_runtime_state (
     key        TEXT PRIMARY KEY,             -- 12 个 model_*/fallback_* 键；另含方案版本标记
     value      TEXT NOT NULL,                -- 选定的模型名或方案版本
     updated_at TEXT
+);
+
+-- Only manual overrides; missing rows always use the current code defaults.
+CREATE TABLE IF NOT EXISTS full_model_routes (
+    profile    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    slots_json TEXT NOT NULL,
+    updated_at TEXT,
+    PRIMARY KEY (profile, role)
 );
 
 -- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
@@ -669,6 +679,58 @@ def reset_llm_runtime_state(conn: sqlite3.Connection) -> None:
         "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
         "updated_at=excluded.updated_at", rows)
+    conn.commit()
+
+
+# ─── 全模型交叉精算/复盘的独立模型与强度覆盖 ────────────────────────────
+def get_full_model_profile(conn: sqlite3.Connection, profile: str) -> dict[str, dict]:
+    """Read independent full-model overrides, without rewriting saved choices."""
+    roles = full_model_settings.defaults(profile)
+    rows = conn.execute(
+        "SELECT role, slots_json FROM full_model_routes WHERE profile=?", (profile,))
+    for role, raw in rows:
+        if role not in roles:
+            continue
+        try:
+            roles[role] = full_model_settings.with_slots(roles[role], json.loads(raw))
+        except (ValueError, TypeError, AttributeError) as exc:
+            log.warning("全模型配置 %s/%s 无效，使用代码默认但保留存档：%s", profile, role, exc)
+    return roles
+
+
+def set_full_model_slot(conn: sqlite3.Connection, profile: str, role: str,
+                        position: int, model: str, effort: str) -> tuple[bool, str]:
+    """Validate and atomically save a model/effort pair; ordinary tiers are untouched."""
+    with conn:
+        # Serialize read/modify/write so edits to different slots cannot erase
+        # one another when two admin callbacks arrive concurrently.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            roles = get_full_model_profile(conn, profile)
+            if role not in roles:
+                return False, "职责不存在"
+            spec = full_model_settings.replace_slot(roles[role], position, model, effort)
+        except (ValueError, TypeError) as exc:
+            return False, str(exc)
+        conn.execute(
+            "INSERT INTO full_model_routes (profile, role, slots_json, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(profile, role) DO UPDATE SET slots_json=excluded.slots_json, "
+            "updated_at=excluded.updated_at",
+            (profile, role, json.dumps(full_model_settings.slots(spec), ensure_ascii=False),
+             _now_utc_iso()))
+    return True, ""
+
+
+def reset_full_model_profile(conn: sqlite3.Connection, profile: str,
+                             role: str | None = None) -> None:
+    roles = full_model_settings.defaults(profile)
+    if role is not None and role not in roles:
+        raise ValueError("职责不存在")
+    if role is None:
+        conn.execute("DELETE FROM full_model_routes WHERE profile=?", (profile,))
+    else:
+        conn.execute("DELETE FROM full_model_routes WHERE profile=? AND role=?", (profile, role))
     conn.commit()
 
 

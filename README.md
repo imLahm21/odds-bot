@@ -83,16 +83,40 @@ When `TELEGRAM_BOT_TOKEN` is set, the daemon also runs a TG bot with inline-butt
 | `/analyze` | Pre-match projection: preview fundamentals + odds movement, then run SOP (preset or custom focus) |
 | `/review` | Post-match review: fetch final score + odds movement → LLM attribution |
 
-Administrators also see `🧪 Full-model cross consultation` under `/analyze`.
-It assigns the configured model pool to separate modules, then uses Astra to
-compose and Sol to audit the report. Each module has a same-grade, cross-group
-fallback chain, with the fallback model's own effort and token budget. The
-consultation supports an optional custom focus and archives to a separate
-`_consult.md` file.
+Administrators also see `🧪 全模型交叉精算` (full-model cross analysis) under
+`/analyze`. Its 9 expert modules, final synthesis and independent audit each have
+a primary model, two optional fallbacks and a separate reasoning effort per model.
+Code defaults use Astra for synthesis and Claude Opus for audit. The actual
+synthesis and repair models cannot audit their own report, including equivalent
+CPA `-high` / IK standard-name variants. If no independent auditor is available,
+the report is explicitly marked as not passing audit, never silently self-audited.
+Same-grade and first-effective-fallback cross-group checks remain enforced;
+each actual model uses its own environment-configured token budget.
+Custom focus is supported. The `_consult.md` archive suffix is retained.
 Administrators also see `🧪 Full-model cross review` under `/review`. It runs
 a result-blind full-model forecast first, reveals the final score only in the
 second-stage attribution, and archives the combined result as
 `_review_consult.md`.
+
+Under `/llm`, administrators can open `🎛️ 全模型精算配置` or `🎛️ 全模型复盘配置`,
+select a role and slot, then a model and its reasoning effort. Selecting the
+effort saves the pair together. The two profiles are persisted independently in
+`odds.db` (`full_model_routes`) and do not change the ordinary heavy/balanced/light
+slots. Each role or whole profile can be reset to code defaults, with confirmation.
+Only manual overrides are stored; restart/initialization preserves them. Each job
+takes one configuration snapshot, shared across both stages of a full-model review,
+so later menu edits only affect subsequent jobs. Changing a primary's model grade
+requires clearing incompatible fallbacks first. An empty effort means omit the
+parameter, not `reasoning_effort=none`. Menu options reflect local registration,
+not proof of upstream acceptance; CPA `-high` IDs and independent effort support
+still require separate endpoint probes. Existing callback IDs and archive names
+remain compatible; historical reports are not rewritten.
+
+The full-model report and the review's first-stage blind forecast use the same
+optional Jev decision finalization as ordinary SOP analysis, after report auditing
+and any repair, before display and archiving. It follows `TYPESAFE_DECISION_MODE`
+and its confidence threshold. Second-stage post-match attribution never reruns
+that selection or rewrites the blind forecast after the result is revealed.
 
 **Two-tier permissions**: the bot only responds to whitelisted chat IDs. `TELEGRAM_ALLOWED_CHAT_IDS`
 are users who can query/analyze; `TELEGRAM_ADMIN_CHAT_IDS` are admins who can change config. If ADMIN
@@ -177,8 +201,9 @@ offline evaluation and separate approval.
 - `shadow`: the report is unchanged; Jev picks in the background and only a `TYPESAFE_SHADOW` log
   line is written (hash + candidate IDs, no report text).
 - `active`: code keeps only eligible rows with edge > 0 (none → pass without calling Jev), and Jev
-  picks among them or PASS. If Jev fails or is below the threshold, the highest-edge row is used and
-  the report says Jev did not participate. Code recomputes the stake per SOP 7.5, relabels the
+  picks among them or PASS. If Jev fails or is below the threshold, an explicit original PASS is
+  preserved; otherwise the highest-edge row is used. The report says Jev did not participate.
+  Code recomputes the stake per SOP 7.5, relabels the
   model's pick as 「模型初选」, and writes a `decision_final` comment that `/parlay` reads (stripped from
   Telegram and published output).
 

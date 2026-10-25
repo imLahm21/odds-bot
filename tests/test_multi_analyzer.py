@@ -1,4 +1,4 @@
-"""全模型交叉会诊的离线单元测试。"""
+"""全模型交叉精算的离线单元测试。"""
 
 import os
 import sys
@@ -8,7 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("APIFOOTBALL_KEY", "offline-test-key")
 
-from bot import config, llm_client, multi_analyzer  # noqa: E402
+from bot import config, full_model_settings, llm_client, multi_analyzer  # noqa: E402
 
 
 def _card(module_id: str) -> str:
@@ -20,6 +20,11 @@ def _card(module_id: str) -> str:
 
 
 class TestMultiAnalyzer(unittest.TestCase):
+    def setUp(self):
+        snapshot = patch.object(multi_analyzer, "profile_snapshot", side_effect=full_model_settings.defaults)
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+
     def test_explicit_chat_uses_requested_model_and_effort(self):
         class Breaker:
             def allow(self):
@@ -106,7 +111,9 @@ class TestMultiAnalyzer(unittest.TestCase):
         models = {task["model"] for task in config.FULL_CONSULT_TASKS}
         models.add(config.FULL_CONSULT_SYNTHESIS["model"])
         models.add(config.FULL_CONSULT_AUDIT["model"])
-        self.assertEqual(len(models), 11)
+        self.assertEqual(len(models), 10)
+        self.assertIn("claude-sonnet-5-5-high", models)
+        self.assertIn("claude-opus-5-5-high", models)
         self.assertIn("deepseek-v4.1-flash", models)
         self.assertIn("gpt-6-luna", models)
         self.assertNotIn("gpt-5.6-luna", models)
@@ -147,12 +154,12 @@ class TestMultiAnalyzer(unittest.TestCase):
                        "csv_text": "csv", "fundamentals": "fund"})
 
         self.assertEqual([item[0] for item in calls], [
-            "grok-4.6", "gpt-6-astra",
+            "gpt-6.1-sol", "deepseek-v4-pro",
         ])
         self.assertEqual(calls[0][1]["effort"], "xhigh")
-        self.assertEqual(calls[1][1]["effort"], "xhigh")
+        self.assertEqual(calls[1][1]["effort"], "max")
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["model"], "gpt-6-astra")
+        self.assertEqual(result["model"], "deepseek-v4-pro")
         self.assertTrue(result["fallback_used"])
         self.assertEqual(result["attempts"][0]["status"], "error")
 
@@ -220,8 +227,8 @@ class TestMultiAnalyzer(unittest.TestCase):
                  "extra_instruction": ""}, report, [])
 
         self.assertTrue(audit["ok"])
-        self.assertEqual(calls[0][0], "gpt-5.6-sol")
-        self.assertEqual(calls[1][0], "deepseek-v4-pro")
+        self.assertEqual(calls[0][0], "claude-opus-5-5-high")
+        self.assertEqual(calls[1][0], "glm-5.3")
         self.assertEqual(calls[1][1]["max_tokens"], 0)
         self.assertTrue(audit["route"]["fallback_used"])
 
@@ -281,7 +288,7 @@ class TestMultiAnalyzer(unittest.TestCase):
 
     def test_failed_expert_transfers_and_does_not_block_synthesis(self):
         def fake_chat(system, user, model, **kwargs):
-            if model == "grok-4.5":
+            if model == "grok-4.7":
                 return "LLM 请求失败（测试失败）"
             if "最终报告审计员" in system:
                 return '{"ok":true,"issues":[]}'
@@ -304,12 +311,12 @@ class TestMultiAnalyzer(unittest.TestCase):
             result, summary = multi_analyzer.run(
                 "csv", "fund", "h", "a", "league")
 
-        self.assertIn("### 模型会诊记录", result)
+        self.assertIn("### 全模型执行记录", result)
         transferred = [item for item in summary["results"]
                        if item["id"] == "market_challenge"]
         self.assertEqual(len(transferred), 1)
         self.assertEqual(transferred[0]["status"], "ok")
-        self.assertEqual(transferred[0]["model"], "gpt-5.6-terra")
+        self.assertEqual(transferred[0]["model"], "claude-opus-5-5-high")
         self.assertTrue(transferred[0]["fallback_used"])
 
     def test_full_review_uses_all_models_and_preserves_custom_focus(self):
