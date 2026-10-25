@@ -2518,6 +2518,7 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
     display_models = {task["id"]: task["model"]
                       for task in tasks}
     display_efforts = {task["id"]: task["effort"] for task in tasks}
+    display_results = {}
     statuses.update({"synthesis": "⬜", "audit": "⬜"})
     title = (f"⏳ 全模型交叉精算：{meta['home']} vs {meta['away']}\n"
              f"共 {len(tasks) + 2} 个职责，使用已保存的精算模型与推理强度")
@@ -2527,8 +2528,12 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
     def progress_text() -> str:
         lines = [title, ""]
         for task in tasks:
+            result = display_results.get(task["id"])
+            note = " — " + multi_analyzer.execution_note(result) if result else ""
+            last = "最后尝试 " if result and result.get("status") == "error" else ""
             lines.append(f"{statuses[task['id']]} {task['label']} "
-                         f"({display_models[task['id']]} / {display_efforts[task['id']] or '模型默认'})")
+                         f"({last}{display_models[task['id']] or '未执行'} / "
+                         f"{display_efforts[task['id']] or '模型默认'}){note}")
         lines.append(f"{statuses['synthesis']} 最终合并模型链")
         lines.append(f"{statuses['audit']} 最终审计模型链")
         return "\n".join(lines)
@@ -2538,13 +2543,16 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
 
     def on_progress(kind: str, result: dict | None) -> None:
         if kind == "module" and result:
+            display_results[result["id"]] = result
             status = "✅" if result.get("status") == "ok" else "❌"
             statuses[result["id"]] = status
             display_models[result["id"]] = result.get(
                 "model", display_models[result["id"]])
             display_efforts[result["id"]] = result.get(
                 "effort", display_efforts[result["id"]])
-        elif kind == "synthesis":
+        elif kind == "synthesis_rescue":
+            statuses["synthesis"] = "🛟"
+        elif kind == "synthesis" and statuses["synthesis"] != "🛟":
             statuses["synthesis"] = "🔄"
         elif kind == "warning":
             log.warning("全模型精算预警：%s", result)
@@ -2574,6 +2582,8 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
         edit_text(chat_id, msg_id,
                   title + "\n\n" + "\n".join(
                        f"{statuses[t['id']]} {t['label']}"
+                        + (" — " + multi_analyzer.execution_note(display_results[t["id"]])
+                           if t["id"] in display_results else "")
                         for t in tasks)
                    + f"\n{statuses['synthesis']} 最终合并模型链"
                    + f"\n{statuses['audit']} 最终审计模型链", _NO_KB)

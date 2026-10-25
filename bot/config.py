@@ -828,12 +828,13 @@ LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
 # 同一模块的回退模型必须保持同等级；每个回退模型独立声明 effort。
 # max_tokens=0 表示不在模块层覆盖，让 llm_client 按 LLM_MODEL_MAX_TOKENS
 # （未单列时 LLM_MAX_TOKENS）读取服务器 .env 的逐模型预算。
+# Exact IDs only: GLM Flash remains available, as do ordinary tier settings.
+FULL_CONSULT_EXCLUDED_MODELS = frozenset({"glm-5.3"})
 FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gpt-6-astra": "flagship",
     "gpt-6-sol": "flagship",
     "gpt-6.1-sol": "flagship",
     "gpt-5.6-sol": "flagship",
-    "glm-5.3": "flagship",
     "grok-4.6": "flagship",
     "grok-4.7": "flagship",
     "deepseek-v4-pro": "flagship",
@@ -863,14 +864,14 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
     {"id": "fundamentals", "label": "基本面主分析", "model": "claude-sonnet-5-5-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "glm-5.3", "effort": "high"},
          {"model": "gpt-6.1-sol", "effort": "high"},
+          {"model": "gemini-4-argon-high", "effort": "high"},
      )},
-    {"id": "fundamentals_review", "label": "基本面复核", "model": "glm-5.3",
+    {"id": "fundamentals_review", "label": "基本面复核", "model": "gemini-4-argon-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gemini-4-argon-high", "effort": "high"},
          {"model": "deepseek-v4-pro", "effort": "high"},
+          {"model": "gpt-6.1-sol", "effort": "high"},
      )},
     {"id": "market_primary", "label": "盘口主分析", "model": "gpt-6.1-sol",
      "effort": "xhigh", "max_tokens": 0,
@@ -882,7 +883,7 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
          {"model": "claude-opus-5-5-high", "effort": "high"},
-         {"model": "glm-5.3", "effort": "high"},
+          {"model": "gpt-6.1-sol", "effort": "high"},
      )},
     {"id": "numeric_summary", "label": "数字整理", "model": "deepseek-v4.1-flash",
      "effort": "high", "max_tokens": 0,
@@ -894,7 +895,7 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
      "effort": "max", "max_tokens": 0,
      "fallbacks": (
          {"model": "claude-opus-5-5-high", "effort": "high"},
-         {"model": "glm-5.3", "effort": "max"},
+          {"model": "gemini-4-argon-high", "effort": "high"},
      )},
     {"id": "cross_market", "label": "跨市场检查", "model": "gemini-4-argon-high",
      "effort": "high", "max_tokens": 0,
@@ -902,11 +903,11 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
          {"model": "deepseek-v4-pro", "effort": "max"},
          {"model": "gpt-6.1-sol", "effort": "xhigh"},
      )},
-    {"id": "lesson_match", "label": "教训匹配", "model": "glm-5.3",
+    {"id": "lesson_match", "label": "教训匹配", "model": "claude-sonnet-5-5-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "claude-sonnet-5-5-high", "effort": "high"},
          {"model": "gpt-6.1-sol", "effort": "high"},
+          {"model": "gemini-4-argon-high", "effort": "high"},
      )},
 )
 
@@ -920,9 +921,15 @@ FULL_CONSULT_SYNTHESIS = {
 FULL_CONSULT_AUDIT = {
     "model": "claude-opus-5-5-high", "effort": "high", "max_tokens": 0,
     "fallbacks": (
-        {"model": "glm-5.3", "effort": "max"},
+        {"model": "gemini-4-argon-high", "effort": "high"},
         {"model": "deepseek-v4-pro", "effort": "max"},
     ),
+}
+# Only after a role's normal chain is exhausted; a group pin is mandatory.
+# These are initial values, independently overridable for analysis and review.
+FULL_CONSULT_RESCUE_DEFAULTS = {
+    "analyze": {"model": "gpt-6.1-sol", "effort": "high", "route_group": "cpa_gpt"},
+    "review": {"model": "gpt-6.1-sol", "effort": "high", "route_group": "cpa_gpt"},
 }
 FULL_CONSULT_MAX_WORKERS = 4
 FULL_CONSULT_TIMEOUT = 300

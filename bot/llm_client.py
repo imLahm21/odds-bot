@@ -1355,15 +1355,25 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
     yield ("error", last_err or "LLM 全部端点不可用（请用 /llm 测试/重置端点）")
 
 
+def _explicit_endpoints(model: str, route_group: str = ""):
+    """A forced group never leaks a rescue request to another provider."""
+    if route_group and route_group not in config.llm_route_groups_for_model(model):
+        return []
+    endpoints = _endpoints_by_priority(model)
+    return ([(index, ep) for index, ep in endpoints if ep.get("route_group") == route_group]
+            if route_group else endpoints)
+
+
 def chat_model(system: str, user: str, model: str, effort: str = "",
                timeout: int = 0, max_tokens: int = 0,
                fallback_models: tuple[str, ...] = (),
-               input_metrics: dict | None = None) -> str:
+               input_metrics: dict | None = None, route_group: str = "") -> str:
     """按明确模型调用，不读取 tier 运行时主模型。
 
     供全模型交叉精算/复盘使用：同一模型仍可在其授权组的多个 endpoint 间故障转移，
     但默认不会静默切换到另一模型。只有调用方显式提供 fallback_models 时，
     才会在首字节/正文前进入指定的模型回退链。
+    route_group 非空时严格限定授权组；该组不可用也不会换到其他组。
     """
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
@@ -1384,7 +1394,7 @@ def chat_model(system: str, user: str, model: str, effort: str = "",
         observation = _input_observation(
             system, user, current_model, tok, input_metrics)
         _log_input_observation(request_id, observation)
-        endpoints = _endpoints_by_priority(current_model)
+        endpoints = _explicit_endpoints(current_model, route_group)
         if not endpoints:
             labeled.append(f"{current_model}（没有可用授权端点）")
             continue
@@ -1422,7 +1432,7 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                       fallback_models: tuple[str, ...] = (),
                       fallback_efforts: tuple[str, ...] = (),
                       input_metrics: dict | None = None,
-                      on_model_used=None):
+                      on_model_used=None, route_group: str = ""):
     """按明确模型流式调用；只在首字节前进入调用方指定的模型回退链。
 
     fallback_efforts 与 fallback_models 按位置对应；未提供时沿用主模型
@@ -1462,7 +1472,7 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
         if observation["warn"] and not warning_sent:
             warning_sent = True
             yield ("warning", _input_warning_message(observation))
-        endpoints = _endpoints_by_priority(current_model)
+        endpoints = _explicit_endpoints(current_model, route_group)
         if not endpoints:
             last_err = f"{current_model}（没有可用授权端点）"
             continue

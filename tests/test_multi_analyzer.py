@@ -111,7 +111,7 @@ class TestMultiAnalyzer(unittest.TestCase):
         models = {task["model"] for task in config.FULL_CONSULT_TASKS}
         models.add(config.FULL_CONSULT_SYNTHESIS["model"])
         models.add(config.FULL_CONSULT_AUDIT["model"])
-        self.assertEqual(len(models), 10)
+        self.assertEqual(len(models), 9)
         self.assertIn("claude-sonnet-5-5-high", models)
         self.assertIn("claude-opus-5-5-high", models)
         self.assertIn("deepseek-v4.1-flash", models)
@@ -228,7 +228,7 @@ class TestMultiAnalyzer(unittest.TestCase):
 
         self.assertTrue(audit["ok"])
         self.assertEqual(calls[0][0], "claude-opus-5-5-high")
-        self.assertEqual(calls[1][0], "glm-5.3")
+        self.assertEqual(calls[1][0], "gemini-4-argon-high")
         self.assertEqual(calls[1][1]["max_tokens"], 0)
         self.assertTrue(audit["route"]["fallback_used"])
 

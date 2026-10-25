@@ -112,6 +112,32 @@ not proof of upstream acceptance; CPA `-high` IDs and independent effort support
 still require separate endpoint probes. Existing callback IDs and archive names
 remain compatible; historical reports are not rewritten.
 
+Each profile also has a configurable **shared rescue model**, initially
+`gpt-6.1-sol / high` pinned to `cpa_gpt`. Under `/llm`, open the profile and
+`🛟 公共兜底模型 / 授权组 / 强度`; choose a model, its allowed authorization group
+and effort together, or disable/reset rescue. Overrides persist independently in
+`full_model_rescue`; a whole-profile reset also restores rescue, while a role-only
+reset does not. No new API-key fields are required.
+Only when the normal primary/two-fallback chain is exhausted does a role, repair,
+synthesis or audit attempt one rescue round. Its pinned group cannot silently
+rotate to IK or another group; existing per-endpoint retries still apply.
+The explicit rescue may retry a previously tried model with its own group/effort,
+but never loops back to the normal chain. It keeps the original prompt and input.
+Writer/alias exclusion still applies to audit, and a partial streamed report is
+never regenerated with rescue. Jev remains separate and keeps its own fallback.
+Completed role statuses distinguish primary, fallback, rescue success and chain
+exhaustion; failures show the last attempted model instead of the initial model.
+Rescue improves availability but does not guarantee success against upstream limits.
+
+`glm-5.3` is excluded from full-model analysis/review defaults, role/rescue menus
+and runtime validation after content-rejection errors in this workload. This is
+an exact-ID restriction: `glm-5.3-flash` and ordinary tier settings are unchanged.
+Legacy saved roles drop excluded fallback slots, or promote an existing allowed
+fallback when the primary was excluded (new code primary if none remain).
+Any resulting same-group first fallback is cleared to retain routing safeguards.
+Other valid choices are retained; the original stored rows and historical reports
+are not rewritten. An excluded saved rescue resolves to the current safe default.
+
 The full-model report and the review's first-stage blind forecast use the same
 optional Jev decision finalization as ordinary SOP analysis, after report auditing
 and any repair, before display and archiving. It follows `TYPESAFE_DECISION_MODE`

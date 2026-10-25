@@ -20,16 +20,16 @@ from bot import config, db, full_model_settings as settings, full_model_ui, tgbo
 
 _APPROVED = {
     "data_audit": "gpt-6-luna/low glm-5.3-flash/low deepseek-v4.1-flash/low",
-    "fundamentals": "claude-sonnet-5-5-high/high glm-5.3/high gpt-6.1-sol/high",
-    "fundamentals_review": "glm-5.3/high gemini-4-argon-high/high deepseek-v4-pro/high",
+    "fundamentals": "claude-sonnet-5-5-high/high gpt-6.1-sol/high gemini-4-argon-high/high",
+    "fundamentals_review": "gemini-4-argon-high/high deepseek-v4-pro/high gpt-6.1-sol/high",
     "market_primary": "gpt-6.1-sol/xhigh deepseek-v4-pro/max gemini-4-argon-high/high",
-    "market_challenge": "grok-4.7/high claude-opus-5-5-high/high glm-5.3/high",
+    "market_challenge": "grok-4.7/high claude-opus-5-5-high/high gpt-6.1-sol/high",
     "numeric_summary": "deepseek-v4.1-flash/high glm-5.3-flash/high gpt-6-luna/medium",
-    "risk_review": "deepseek-v4-pro/max claude-opus-5-5-high/high glm-5.3/max",
+    "risk_review": "deepseek-v4-pro/max claude-opus-5-5-high/high gemini-4-argon-high/high",
     "cross_market": "gemini-4-argon-high/high deepseek-v4-pro/max gpt-6.1-sol/xhigh",
-    "lesson_match": "glm-5.3/high claude-sonnet-5-5-high/high gpt-6.1-sol/high",
+    "lesson_match": "claude-sonnet-5-5-high/high gpt-6.1-sol/high gemini-4-argon-high/high",
     "synthesis": "gpt-6-astra/xhigh claude-opus-5-5-high/high deepseek-v4-pro/max",
-    "audit": "claude-opus-5-5-high/high glm-5.3/max deepseek-v4-pro/max",
+    "audit": "claude-opus-5-5-high/high gemini-4-argon-high/high deepseek-v4-pro/max",
 }
 
 
@@ -46,7 +46,8 @@ class _ProfileFixture(unittest.TestCase):
 
 class TestFullModelSettings(_ProfileFixture):
     def test_approved_defaults_and_all_registered_model_grades(self):
-        self.assertEqual(set(config.LLM_MODELS), set(config.FULL_CONSULT_MODEL_GRADES))
+        self.assertEqual(set(config.LLM_MODELS) - config.FULL_CONSULT_EXCLUDED_MODELS,
+                         set(config.FULL_CONSULT_MODEL_GRADES))
         for profile in settings.PROFILES:
             roles = settings.defaults(profile)
             self.assertEqual(list(roles), list(_APPROVED))
@@ -80,12 +81,12 @@ class TestFullModelSettings(_ProfileFixture):
 
     def test_primary_and_both_fallback_pairs_persist_independently(self):
         self._set()
-        self._set(slot=1, model="glm-5.3", effort="low")
+        self._set(slot=1, model="gpt-6-astra", effort="low")
         self._set(slot=2, model="claude-sonnet-5-5-high", effort="medium")
         pairs = settings.slots(db.get_full_model_profile(self.conn, "analyze")["market_primary"])
         self.assertEqual(pairs, [
             {"model": "grok-4.7", "effort": "high"},
-            {"model": "glm-5.3", "effort": "low"},
+            {"model": "gpt-6-astra", "effort": "low"},
             {"model": "claude-sonnet-5-5-high", "effort": "medium"},
         ])
         self.assertEqual(db.get_full_model_profile(self.conn, "review"), settings.defaults("review"))

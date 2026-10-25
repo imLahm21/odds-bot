@@ -126,6 +126,14 @@ CREATE TABLE IF NOT EXISTS full_model_routes (
     PRIMARY KEY (profile, role)
 );
 
+CREATE TABLE IF NOT EXISTS full_model_rescue (
+    profile     TEXT PRIMARY KEY,
+    model       TEXT NOT NULL,
+    effort      TEXT NOT NULL,
+    route_group TEXT NOT NULL,
+    updated_at  TEXT
+);
+
 -- 走地(滚球)快照：结构与盘前 odds_history 不同(分钟数/比分/封盘)，独立建表，
 -- 避免污染赛前 SOP 的 CSV。只存 main:true 主盘口线(走地只看主盘)。
 CREATE TABLE IF NOT EXISTS live_odds_history (
@@ -692,7 +700,10 @@ def get_full_model_profile(conn: sqlite3.Connection, profile: str) -> dict[str, 
         if role not in roles:
             continue
         try:
-            roles[role] = full_model_settings.with_slots(roles[role], json.loads(raw))
+            pairs = json.loads(raw)
+            roles[role] = full_model_settings.stored_route(roles[role], pairs)
+            if pairs != full_model_settings.slots(roles[role]):
+                log.warning("全模型配置 %s/%s 已修正禁用模型或旧格式；原始存档不覆盖", profile, role)
         except (ValueError, TypeError, AttributeError) as exc:
             log.warning("全模型配置 %s/%s 无效，使用代码默认但保留存档：%s", profile, role, exc)
     return roles
@@ -729,8 +740,45 @@ def reset_full_model_profile(conn: sqlite3.Connection, profile: str,
         raise ValueError("职责不存在")
     if role is None:
         conn.execute("DELETE FROM full_model_routes WHERE profile=?", (profile,))
+        conn.execute("DELETE FROM full_model_rescue WHERE profile=?", (profile,))
     else:
         conn.execute("DELETE FROM full_model_routes WHERE profile=? AND role=?", (profile, role))
+    conn.commit()
+
+
+def get_full_model_rescue(conn: sqlite3.Connection, profile: str) -> dict:
+    default = full_model_settings.rescue_defaults(profile)
+    row = conn.execute(
+        "SELECT model,effort,route_group FROM full_model_rescue WHERE profile=?", (profile,)).fetchone()
+    if row is None:
+        return default
+    try:
+        return full_model_settings.rescue_pair(dict(zip(("model", "effort", "route_group"), row)))
+    except ValueError as exc:
+        log.warning("公共兜底配置 %s 无效，使用代码默认但保留存档：%s", profile, exc)
+        return default
+
+
+def set_full_model_rescue(conn: sqlite3.Connection, profile: str, model: str,
+                          effort: str, route_group: str) -> tuple[bool, str]:
+    try:
+        full_model_settings.rescue_defaults(profile)
+        pair = full_model_settings.rescue_pair(
+            {"model": model, "effort": effort, "route_group": route_group})
+    except ValueError as exc:
+        return False, str(exc)
+    conn.execute(
+        "INSERT INTO full_model_rescue (profile,model,effort,route_group,updated_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(profile) DO UPDATE SET model=excluded.model,effort=excluded.effort,"
+        "route_group=excluded.route_group,updated_at=excluded.updated_at",
+        (profile, pair["model"], pair["effort"], pair["route_group"], _now_utc_iso()))
+    conn.commit()
+    return True, ""
+
+
+def reset_full_model_rescue(conn: sqlite3.Connection, profile: str) -> None:
+    full_model_settings.rescue_defaults(profile)
+    conn.execute("DELETE FROM full_model_rescue WHERE profile=?", (profile,))
     conn.commit()
 
 

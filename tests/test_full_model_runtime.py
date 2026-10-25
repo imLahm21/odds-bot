@@ -71,10 +71,10 @@ class TestFullModelRuntime(unittest.TestCase):
             report, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League")
         self.assertTrue(report)
         self.assertEqual(summary["synthesis"], {"model": "claude-opus-5-5-high", "effort": "high"})
-        self.assertEqual(summary["audit"]["route"]["model"], "glm-5.3")
+        self.assertEqual(summary["audit"]["route"]["model"], "gemini-4-argon-high")
         self.assertTrue(summary["audit"]["route"]["fallback_used"])
-        self.assertEqual(chat.call_args.kwargs["model"], "glm-5.3")
-        self.assertEqual(chat.call_args.kwargs["effort"], "max")
+        self.assertEqual(chat.call_args.kwargs["model"], "gemini-4-argon-high")
+        self.assertEqual(chat.call_args.kwargs["effort"], "high")
         chat.assert_called_once()
 
     def test_stream_trace_reports_only_actual_content_model_without_extra_events(self):
@@ -108,7 +108,7 @@ class TestFullModelRuntime(unittest.TestCase):
         self.assertTrue(report)
         self.assertEqual(summary["profile"], "review")
         self.assertEqual(summary["synthesis"]["model"], "claude-opus-5-5-high")
-        self.assertEqual(summary["audit"]["route"]["model"], "glm-5.3")
+        self.assertEqual(summary["audit"]["route"]["model"], "gemini-4-argon-high")
         chat.assert_called_once()
 
     def test_repair_writers_are_excluded_in_addition_to_initial_writer(self):
@@ -127,7 +127,7 @@ class TestFullModelRuntime(unittest.TestCase):
         self.assertIn("修复标记", report)
         self.assertEqual(calls, [
             ("audit", "claude-opus-5-5-high"), ("repair", "gpt-6-astra"),
-            ("repair", "claude-opus-5-5-high"), ("audit", "glm-5.3"),
+            ("repair", "claude-opus-5-5-high"), ("audit", "gemini-4-argon-high"),
         ])
         self.assertEqual(set(summary["writers"]), {"gpt-6-astra", "claude-opus-5-5-high"})
 
@@ -137,8 +137,8 @@ class TestFullModelRuntime(unittest.TestCase):
                 "audit", "report", config.FULL_CONSULT_AUDIT, parse_json=True,
                 phase="audit", excluded_models={"claude-opus-5-5"})
         self.assertTrue(result["ok"])
-        self.assertEqual(route["model"], "glm-5.3")
-        self.assertEqual(chat.call_args.kwargs["model"], "glm-5.3")
+        self.assertEqual(route["model"], "gemini-4-argon-high")
+        self.assertEqual(chat.call_args.kwargs["model"], "gemini-4-argon-high")
 
     def test_no_independent_auditor_is_explicit_failure_without_self_request(self):
         spec = deepcopy(config.FULL_CONSULT_AUDIT)
