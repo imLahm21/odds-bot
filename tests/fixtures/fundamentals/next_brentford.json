@@ -1,0 +1,85 @@
+{
+ "response": [
+  {
+   "fixture": {
+    "id": 1462535,
+    "date": "2026-10-17T14:00:00+00:00",
+    "status": {
+     "short": "NS"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 40,
+     "name": "Liverpool"
+    }
+   },
+   "goals": {
+    "home": null,
+    "away": null
+   }
+  },
+  {
+   "fixture": {
+    "id": 9990323,
+    "date": "2026-10-25T14:00:00+00:00",
+    "status": {
+     "short": "NS"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 33,
+     "name": "Manchester United"
+    }
+   },
+   "goals": {
+    "home": null,
+    "away": null
+   }
+  },
+  {
+   "fixture": {
+    "id": 2064416,
+    "date": "2026-10-29T19:45:00+00:00",
+    "status": {
+     "short": "NS"
+    }
+   },
+   "league": {
+    "id": 48,
+    "name": "EFL Cup"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 63,
+     "name": "Leeds"
+    }
+   },
+   "goals": {
+    "home": null,
+    "away": null
+   }
+  }
+ ]
+}

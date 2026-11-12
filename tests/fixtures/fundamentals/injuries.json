@@ -1,0 +1,37 @@
+{
+ "response": [
+  {
+   "player": {
+    "name": "Player A",
+    "type": "Missing Fixture",
+    "reason": "Knee Injury"
+   },
+   "team": {
+    "id": 55,
+    "name": "Brentford"
+   }
+  },
+  {
+   "player": {
+    "name": "Player B",
+    "type": "Questionable",
+    "reason": "Illness"
+   },
+   "team": {
+    "id": 55,
+    "name": "Brentford"
+   }
+  },
+  {
+   "player": {
+    "name": "Player C",
+    "type": "Missing Fixture",
+    "reason": "Suspended"
+   },
+   "team": {
+    "id": 40,
+    "name": "Liverpool"
+   }
+  }
+ ]
+}

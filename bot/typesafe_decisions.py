@@ -956,15 +956,18 @@ _FALLBACK_LABELS = {
 class DecisionSelection:
     selected_id: str                        # C01.. 或 PASS
     candidate: DecisionCandidate | None
-    source: str                             # jev / jev_pass / edge_max / no_positive_edge / zero_kelly / zero_stake
+    source: str                             # jev / jev_pass / edge_max / explore / no_positive_edge / low_quality / zero_kelly / zero_stake
     fallback_reason: str                    # Jev 未参与或未被采纳的原因码；采纳时为空
-    evidence: str
-    confidence_score: int | None            # 第 7 节置信度 0~100
+    evidence: str                           # 旧报告的证据强度；新报告等于生效的信号强度
+    confidence_score: int | None            # 旧报告第 7 节置信度 0~100（新报告为 None）
     k: float
     stake: float
     candidates: tuple[DecisionCandidate, ...]
     positive_ids: tuple[str, ...]
     judgment: ChoiceJudgment | None = None
+    signal: str | None = None               # 第 7 节信号强度（已按登记表封顶）；旧报告 None
+    quality: int | None = None              # 第 7 节数据质量 0~100；旧报告 None
+    tier: str = "pass"                      # value / explore / pass
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candidates", tuple(self.candidates))
@@ -987,10 +990,84 @@ def parse_report_confidence(report: str) -> int | None:
     return value if 0 <= value <= 100 else None
 
 
-def kelly_fraction(evidence: str, confidence_score: int | None) -> float:
-    """SOP 7.5：证据强度定 k（未写明按默认中档 1/4）；置信度 <60 压至不高于 1/8。"""
+_SIGNAL_WORDS = (("strong", "强"), ("medium", "中"), ("weak", "弱"), ("none", "无"))
+_SIGNAL_RANK = {"none": 0, "weak": 1, "medium": 2, "strong": 3}
+
+
+def parse_signal_strength(report: str) -> str | None:
+    """第 7 节「信号强度：无/弱/中/强」→ none/weak/medium/strong；未写（旧报告）返回 None。"""
+    section = extract_conclusion_section(report)
+    if not section:
+        return None
+    match = re.search(r"(?m)^\s*[-*]?\s*信号强度\s*[：:]\s*(.*)$", _plain(section))
+    if not match:
+        return None
+    value = match.group(1).strip().strip("[]【】「」()（）").strip().casefold()
+    for key, word in _SIGNAL_WORDS:
+        if value.startswith(word) or re.match(rf"{key}\b", value):
+            return key
+    return None
+
+
+def parse_data_quality(report: str) -> int | None:
+    """第 7 节「数据质量：85 / 100」→ 85；未写（旧报告）返回 None。"""
+    section = extract_conclusion_section(report)
+    if not section:
+        return None
+    match = re.search(r"(?m)^\s*[-*]?\s*数据质量\s*[：:]\s*\D{0,4}?(\d{1,3})", _plain(section))
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 0 <= value <= 100 else None
+
+
+def verified_hypothesis_count(path: str | Path | None = None) -> int:
+    """假设登记表「三、登记表」里状态为「已验证」的行数。读不到文件时按 0 处理（最保守）。"""
+    target = Path(path) if path else Path(__file__).resolve().parents[1] / config.HYPOTHESIS_REGISTRY
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    start = text.find("## 三、登记表")
+    body = text[start:] if start >= 0 else ""
+    count = 0
+    for line in body.splitlines():
+        cells = _split_pipe_row(line)
+        if cells and cells[0].startswith("H-") and cells[-1].startswith("已验证"):
+            count += 1
+    return count
+
+
+def effective_signal(signal: str | None) -> str | None:
+    """登记表没有「已验证」假设时，信号强度最高只能是 weak（中/强需要已验证假设）。"""
+    if signal is None:
+        return None
+    if _SIGNAL_RANK.get(signal, 0) > _SIGNAL_RANK["weak"] and verified_hypothesis_count() == 0:
+        return "weak"
+    return signal
+
+
+def quality_factor(quality: int | None) -> float:
+    value = config.QUALITY_DEFAULT if quality is None else quality
+    for floor, factor in config.QUALITY_K_FACTORS:
+        if value >= floor:
+            return factor
+    return 0.0
+
+
+def kelly_fraction(signal: str | None, quality: int | None = None, *,
+                   evidence: str = "unknown",
+                   confidence_score: int | None = None) -> float:
+    """SOP 7.5 第 4 条：k = 信号强度基础 k × 数据质量系数。
+
+    旧格式报告（第 7 节无「信号强度」）回退：证据强度定 k，但过渡期上限压到 weak（1/8），
+    证据强度「无」仍为 0；置信度 <60 分支保留（同样 ≤1/8）。"""
+    if signal is not None:
+        base = config.SIGNAL_BASE_K.get(signal, config.SIGNAL_BASE_K["none"])
+        return base * quality_factor(quality)
     k_table = config.PARLAY_EVIDENCE_K
     k = k_table.get(evidence, k_table["medium"])
+    k = min(k, k_table["weak"])
     if confidence_score is not None and confidence_score < 60:
         k = min(k, k_table["weak"])
     return k
@@ -1039,6 +1116,8 @@ def _request_selection(
     away: str,
     league: str,
     confidence_score: int | None,
+    signal: str | None = None,
+    quality: int | None = None,
 ) -> tuple[ChoiceJudgment | None, str | None]:
     conclusion = extract_conclusion_section(report)
     if not conclusion:
@@ -1055,24 +1134,32 @@ def _request_selection(
     criteria["PASS"] = {
         "when": "Every candidate contradicts the section 7 direction, or the "
                 "section 7 risk notes explicitly argue against each of them.",
-        "boundary": "A thin but positive edge alone is not a reason to pass.",
+        "boundary": "A thin but positive edge alone is not a reason to pass. "
+                    "A market whose section 7 judgment is 无倾向 (no lean) has no "
+                    "direction, so its candidates do not contradict section 7.",
     }
     state = {
         "match": {"home": home, "away": away, "league": league},
         "section_7_conclusion": conclusion[:_SECTION_7_MAX_CHARS],
-        "report_confidence": confidence_score,
         "candidates": criteria,
     }
+    if signal is not None:
+        state["signal_strength"] = signal
+        state["data_quality"] = quality
+    else:
+        state["report_confidence"] = confidence_score
     return _request_choice_result(
         state,
         criteria,
         "Every listed candidate is a section 8 wager whose positive edge was "
         "computed and checked by code. Using the section 7 final conclusion "
-        "(direction per market, confidence, key evidence, risks), which single "
+        "(direction per market, signal strength, key evidence, risks), which single "
         "candidate should be the wager? Prefer the candidate whose side and market "
-        "agree with the section 7 judgments and key evidence; among equally "
-        "consistent candidates prefer the higher edge. Choose PASS only when no "
-        "candidate is consistent with section 7.",
+        "agree with the section 7 judgments and key evidence; a market judged "
+        "无倾向 (no lean) neither supports nor contradicts its candidates, so judge "
+        "those on edge alone; among equally consistent candidates prefer the higher "
+        "edge. Choose PASS only when every candidate contradicts a section 7 "
+        "direction.",
         question_id="decision_select",
     )
 
@@ -1085,23 +1172,43 @@ def select_decision(
     *,
     min_confidence: float | None,
     use_jev: bool = True,
+    explore_allowed: bool = True,
 ) -> DecisionSelection | None:
-    """代码筛出 eligible 且 edge>0 的候选；无则直接 PASS（不调 Jev）。
-    否则 Jev 在正 edge 候选 + PASS 中选；Jev 失败/低置信度 → edge 最高的正值项。
+    """三档决策（SOP 7.5 第 6 条）：
+      价值注 —— 有 eligible 且 edge>0 的候选：Jev 在正 edge 候选 + PASS 中选；
+                Jev 失败/低置信度 → edge 最高的正值项；k = 信号强度 × 数据质量；
+      探索注 —— 无正 edge 但有 eligible 候选 edge ≥ EXPLORE_MIN_EDGE：取 edge 最高的一项，
+                固定平注 EXPLORE_STAKE，不调 Jev（explore_allowed=False 时跳过，如已达日上限）；
+      空仓   —— 以上都不满足，或数据质量 < QUALITY_MIN_TO_BET。
     候选表无法解析时返回 None（报告保持原样，串关抽取走既有 fallback）。"""
     pool = _selection_pool(report)
     if pool is None:
         return None
     candidates, evidence = pool
-    confidence_score = parse_report_confidence(report)
+    raw_signal = parse_signal_strength(report)
+    signal = effective_signal(raw_signal)
+    quality = parse_data_quality(report) if raw_signal is not None else None
+    confidence_score = None if raw_signal is not None else parse_report_confidence(report)
     positives = _positive_candidates(candidates)
     common = {
-        "evidence": evidence,
+        "evidence": signal if signal is not None else evidence,
         "confidence_score": confidence_score,
         "candidates": candidates,
         "positive_ids": tuple(c.candidate_id for c in positives),
+        "signal": signal,
+        "quality": quality,
     }
+    if quality is not None and quality < config.QUALITY_MIN_TO_BET:
+        return DecisionSelection(
+            selected_id="PASS", candidate=None, source="low_quality",
+            fallback_reason="", k=0.0, stake=0.0, **common)
     if not positives:
+        explore = _explore_candidate(candidates) if explore_allowed else None
+        if explore is not None:
+            return DecisionSelection(
+                selected_id=explore.candidate_id, candidate=explore, source="explore",
+                fallback_reason="", k=0.0, stake=round(config.EXPLORE_STAKE, 1),
+                tier="explore", **common)
         return DecisionSelection(
             selected_id="PASS", candidate=None, source="no_positive_edge",
             fallback_reason="", k=0.0, stake=0.0, **common)
@@ -1110,7 +1217,8 @@ def select_decision(
     reason: str | None = "jev_disabled"
     if use_jev:
         judgment, reason = _request_selection(
-            report, positives, home, away, league, confidence_score)
+            report, positives, home, away, league, confidence_score,
+            signal=signal, quality=quality)
 
     chosen: DecisionCandidate | None = None
     source = "edge_max"
@@ -1140,7 +1248,8 @@ def select_decision(
                 **common)
         chosen = max(positives, key=lambda c: c.edge)   # 并列取表中靠前者
 
-    k = kelly_fraction(evidence, confidence_score)
+    k = kelly_fraction(signal, quality, evidence=evidence,
+                       confidence_score=confidence_score)
     if k <= 0:
         return DecisionSelection(
             selected_id="PASS", candidate=None, source="zero_kelly",
@@ -1155,7 +1264,23 @@ def select_decision(
     return DecisionSelection(
         selected_id=chosen.candidate_id, candidate=chosen, source=source,
         fallback_reason=fallback, k=k, stake=stake,
-        judgment=judgment, **common)
+        judgment=judgment, tier="value", **common)
+
+
+def _explore_candidate(
+    candidates: tuple[DecisionCandidate, ...],
+) -> DecisionCandidate | None:
+    """探索注候选：eligible、数字完整、edge ≥ EXPLORE_MIN_EDGE 中 edge 最高者（并列取靠前）。"""
+    if config.EXPLORE_MODE != "on" or config.EXPLORE_STAKE <= 0:
+        return None
+    pool = [
+        candidate for candidate in candidates
+        if candidate.eligibility == "eligible"
+        and candidate.odds is not None and candidate.odds > 1.0
+        and candidate.p_final is not None
+        and candidate.edge is not None and candidate.edge >= config.EXPLORE_MIN_EDGE
+    ]
+    return max(pool, key=lambda c: c.edge) if pool else None
 
 
 def _k_label(k: float) -> str:
@@ -1185,6 +1310,12 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
         source_line = f"Jev（{jev_note}）判定 PASS：正 edge 候选均与第 7 节结论不一致"
     elif selection.source == "no_positive_edge":
         source_line = "代码判定：无符合条件且 edge>0 的候选，直接 pass（未调用 Jev）"
+    elif selection.source == "explore":
+        source_line = (f"探索注：无正 edge，取 edge ≥ {config.EXPLORE_MIN_EDGE:+.0%} 的最高项，"
+                       f"固定平注，用于收集样本（未调用 Jev）")
+    elif selection.source == "low_quality":
+        source_line = (f"代码判定：数据质量 {selection.quality} < {config.QUALITY_MIN_TO_BET}，"
+                       f"本场空仓（未调用 Jev）")
     elif selection.source == "zero_stake":
         source_line = (f"选定项 edge 过薄，按 k={_k_label(selection.k)} 算出的注额舍入为 0，"
                        f"不下注")
@@ -1212,20 +1343,34 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
     lines.append(f"- **决策来源**：{source_line}")
     if candidate is None:
         lines.append("- **注额**：pass，空仓")
+    elif selection.tier == "explore":
+        lines.append(
+            f"- **注额**：${selection.stake:.1f}"
+            f"（探索注，固定平注；期望收益为负，不可串关，记账时与价值注分开）")
+    elif selection.signal is not None:
+        quality = selection.quality if selection.quality is not None else config.QUALITY_DEFAULT
+        base = config.SIGNAL_BASE_K.get(selection.signal, config.SIGNAL_BASE_K["none"])
+        lines.append(
+            f"- **注额**：${selection.stake:.1f}"
+            f"（价值注；k={_k_label(base)}（信号强度"
+            f"{_EVIDENCE_LABELS.get(selection.signal, selection.signal)}）"
+            f"×{quality_factor(selection.quality):g}（数据质量 {quality}）={selection.k:g}"
+            f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，已截单注上限）")
     else:
-        low = (selection.confidence_score is not None
-               and selection.confidence_score < 60)
-        # 括注里不再出现 $ 金额：parse_decision_section 取该行最后一个 $ 数作注额
+        # 旧格式报告：证据强度定 k，过渡期上限 1/8
         lines.append(
             f"- **注额**：${selection.stake:.1f}"
             f"（k={_k_label(selection.k)}，证据强度"
-            f"{_EVIDENCE_LABELS.get(selection.evidence, selection.evidence)}"
-            + (f"，置信度 {selection.confidence_score}<60 压至 ≤1/8" if low else "")
+            f"{_EVIDENCE_LABELS.get(selection.evidence, selection.evidence)}，过渡期上限 1/8"
+            + (f"，置信度 {selection.confidence_score}" if selection.confidence_score is not None else "")
             + f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，"
               f"已截单注上限）")
     payload = {
         "schema": "decision_final/1",
         "selected_id": selection.selected_id,
+        "tier": selection.tier if candidate is not None else "pass",
+        "signal": selection.signal,
+        "quality": selection.quality,
         "pass": candidate is None,
         "play": candidate.play if candidate else "",
         "odds": round(candidate.odds, 6) if candidate else 0.0,
@@ -1390,6 +1535,15 @@ def read_final_decision(report: str) -> dict[str, Any] | None:
         return value if math.isfinite(value) else None
 
     stake = number("stake")
+    if data.get("tier") == "explore":
+        # 探索注不可串关：对串关抽取一律视同 pass（保留玩法与注额供展示）
+        return {
+            "pass": True, "play": str(data.get("play") or ""),
+            "odds": number("odds") or 0.0, "edge": number("edge") or 0.0,
+            "p_final": number("p_final") or 0.0, "evidence": evidence,
+            "stake": stake or 0.0, "tier": "explore",
+            "warnings": ["explore_tier_not_parlayable"],
+        }
     if data.get("pass") is True:
         return {
             "pass": True, "play": "", "odds": 0.0, "edge": 0.0,
@@ -1574,6 +1728,9 @@ def selection_record(
         "typesafe_choice": judgment.choice if judgment else "",
         "final_choice": final_choice,
         "source": selection.source if selection else "",
+        "tier": selection.tier if selection else "",
+        "signal": selection.signal if selection else None,
+        "quality": selection.quality if selection else None,
         "positive_ids": list(selection.positive_ids) if selection else [],
         "top3": [key for key, _ in sorted(
             probabilities.items(), key=lambda item: item[1], reverse=True)[:3]],

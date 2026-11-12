@@ -1,0 +1,220 @@
+{
+ "response": [
+  {
+   "fixture": {
+    "id": 9990323,
+    "date": "2026-10-25T14:00:00+00:00",
+    "status": {
+     "short": "NS"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 33,
+     "name": "Manchester United"
+    }
+   },
+   "goals": {
+    "home": null,
+    "away": null
+   }
+  },
+  {
+   "fixture": {
+    "id": 1462535,
+    "date": "2026-10-17T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 40,
+     "name": "Liverpool"
+    }
+   },
+   "goals": {
+    "home": 1,
+    "away": 2
+   }
+  },
+  {
+   "fixture": {
+    "id": 7537342,
+    "date": "2026-10-10T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 66,
+     "name": "Aston Villa"
+    },
+    "away": {
+     "id": 55,
+     "name": "Brentford"
+    }
+   },
+   "goals": {
+    "home": 2,
+    "away": 2
+   }
+  },
+  {
+   "fixture": {
+    "id": 2774098,
+    "date": "2026-10-05T14:00:00+00:00",
+    "status": {
+     "short": "PST"
+    }
+   },
+   "league": {
+    "id": 48,
+    "name": "EFL Cup"
+   },
+   "teams": {
+    "home": {
+     "id": 999,
+     "name": "Postponed FC"
+    },
+    "away": {
+     "id": 55,
+     "name": "Brentford"
+    }
+   },
+   "goals": {
+    "home": null,
+    "away": null
+   }
+  },
+  {
+   "fixture": {
+    "id": 780900,
+    "date": "2026-10-03T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 36,
+     "name": "Fulham"
+    }
+   },
+   "goals": {
+    "home": 2,
+    "away": 1
+   }
+  },
+  {
+   "fixture": {
+    "id": 2297037,
+    "date": "2026-09-27T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 49,
+     "name": "Chelsea"
+    }
+   },
+   "goals": {
+    "home": 0,
+    "away": 1
+   }
+  },
+  {
+   "fixture": {
+    "id": 8424223,
+    "date": "2026-09-20T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 45,
+     "name": "Everton"
+    },
+    "away": {
+     "id": 55,
+     "name": "Brentford"
+    }
+   },
+   "goals": {
+    "home": 0,
+    "away": 3
+   }
+  },
+  {
+   "fixture": {
+    "id": 4656407,
+    "date": "2026-09-13T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 39,
+     "name": "Wolves"
+    }
+   },
+   "goals": {
+    "home": 1,
+    "away": 0
+   }
+  }
+ ]
+}

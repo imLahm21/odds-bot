@@ -1,0 +1,112 @@
+{
+ "response": [
+  {
+   "fixture": {
+    "id": 1462535,
+    "date": "2026-10-17T14:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 40,
+     "name": "Liverpool"
+    }
+   },
+   "goals": {
+    "home": 1,
+    "away": 2
+   }
+  },
+  {
+   "fixture": {
+    "id": 368272,
+    "date": "2026-03-01T15:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 40,
+     "name": "Liverpool"
+    },
+    "away": {
+     "id": 55,
+     "name": "Brentford"
+    }
+   },
+   "goals": {
+    "home": 2,
+    "away": 1
+   }
+  },
+  {
+   "fixture": {
+    "id": 1249409,
+    "date": "2025-09-01T15:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 55,
+     "name": "Brentford"
+    },
+    "away": {
+     "id": 40,
+     "name": "Liverpool"
+    }
+   },
+   "goals": {
+    "home": 1,
+    "away": 1
+   }
+  },
+  {
+   "fixture": {
+    "id": 796158,
+    "date": "2025-02-01T15:00:00+00:00",
+    "status": {
+     "short": "FT"
+    }
+   },
+   "league": {
+    "id": 39,
+    "name": "Premier League"
+   },
+   "teams": {
+    "home": {
+     "id": 40,
+     "name": "Liverpool"
+    },
+    "away": {
+     "id": 55,
+     "name": "Brentford"
+    }
+   },
+   "goals": {
+    "home": 3,
+    "away": 1
+   }
+  }
+ ]
+}

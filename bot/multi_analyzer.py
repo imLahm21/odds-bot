@@ -96,12 +96,10 @@ def _review_module_input(task: dict, bundle: dict) -> str:
 def _review_module_system(task: dict, bundle: dict) -> str:
     module_id = task["id"]
     if module_id in ("fundamentals", "fundamentals_review"):
+        has_h2h, has_form = analyzer.fund_has(bundle.get("fundamentals", ""))
         rules = analyzer.load_fund_rules(
             league_name=bundle.get("league", ""),
-            has_h2h=any(k in bundle.get("fundamentals", "")
-                        for k in ("交锋", "H2H", "h2h")),
-            has_form=any(k in bundle.get("fundamentals", "")
-                         for k in ("近10场", "近 10 场", "近况", "战绩")),
+            has_h2h=has_h2h, has_form=has_form,
         )
     elif module_id in ("market_primary", "market_challenge"):
         rules = _read_rules("market")
@@ -157,12 +155,10 @@ def _module_system(task: dict, bundle: dict) -> str:
     module_id = task["id"]
     role = task["label"]
     if module_id in ("fundamentals", "fundamentals_review"):
+        has_h2h, has_form = analyzer.fund_has(bundle.get("fundamentals", ""))
         rules = analyzer.load_fund_rules(
             league_name=bundle.get("league", ""),
-            has_h2h=any(k in bundle.get("fundamentals", "")
-                        for k in ("交锋", "H2H", "h2h")),
-            has_form=any(k in bundle.get("fundamentals", "")
-                         for k in ("近10场", "近 10 场", "近况", "战绩")),
+            has_h2h=has_h2h, has_form=has_form,
         )
     elif module_id in ("market_primary", "market_challenge"):
         rules = _read_rules("market")

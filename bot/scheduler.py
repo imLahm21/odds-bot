@@ -50,10 +50,18 @@ def task_a_update_fixtures() -> int:
             if n:
                 log.info("  %s: %d 场", name, n)
             time.sleep(config.REQUEST_THROTTLE_SEC)
-        # 清理结束很久的旧比赛，防表膨胀
-        fix_n, odds_n = db.cleanup_old(conn, config.CLEANUP_DAYS)
-        if fix_n or odds_n:
-            log.info("  清理旧数据：删 %d 场 / %d 行快照", fix_n, odds_n)
+        # 清理结束很久的旧比赛，防表膨胀。先按精简口径归档（假设回测要用这些历史），
+        # 归档失败则本轮不清理——宁可库多涨一天，也不丢数据。
+        try:
+            arc_fix, arc_rows = db.archive_old(conn, config.CLEANUP_DAYS)
+            if arc_fix or arc_rows:
+                log.info("  归档旧盘口：%d 场 / %d 行 → odds_archive", arc_fix, arc_rows)
+        except Exception as exc:
+            log.warning("  归档旧盘口失败（%s），本轮跳过清理", exc)
+        else:
+            fix_n, odds_n = db.cleanup_old(conn, config.CLEANUP_DAYS)
+            if fix_n or odds_n:
+                log.info("  清理旧数据：删 %d 场 / %d 行快照", fix_n, odds_n)
         db.checkpoint_wal(conn)
     finally:
         conn.close()

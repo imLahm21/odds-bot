@@ -1,0 +1,53 @@
+{
+ "response": {
+  "form": "WDLWWDLWWD",
+  "fixtures": {
+   "played": {
+    "home": 4,
+    "away": 5,
+    "total": 9
+   },
+   "wins": {
+    "home": 3,
+    "away": 1,
+    "total": 4
+   },
+   "draws": {
+    "home": 1,
+    "away": 2,
+    "total": 3
+   },
+   "loses": {
+    "home": 0,
+    "away": 2,
+    "total": 2
+   }
+  },
+  "goals": {
+   "for": {
+    "total": {
+     "home": 9,
+     "away": 5,
+     "total": 14
+    }
+   },
+   "against": {
+    "total": {
+     "home": 3,
+     "away": 7,
+     "total": 10
+    }
+   }
+  },
+  "clean_sheet": {
+   "home": 2,
+   "away": 1,
+   "total": 3
+  },
+  "failed_to_score": {
+   "home": 0,
+   "away": 2,
+   "total": 2
+  }
+ }
+}

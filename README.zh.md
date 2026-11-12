@@ -44,7 +44,7 @@ bot/
 ├── db.py            # SQLite：建表 / 批量插入 / WAL / 去重 / 动态配置
 ├── parser.py        # JSON→行解析 + 凯利计算（亚盘文本解析含完整 1/4 盘）
 ├── scheduler.py     # apscheduler 五档定时任务 A/B/C/D/E
-├── fundamentals.py  # 基本面采集：近况/交锋/未来赛程/积分榜 → 文本喂 /analyze
+├── fundamentals.py  # 基本面采集：事实表 + 近况/交锋/赛程/积分榜（主客场分项）/赛季统计/伤停/首发，全部截至开球前 → 文本喂 /analyze
 ├── analyzer.py      # 读全量 SOP 规则 + 调 LLM 跑精算/复盘/基本面预分析
 ├── multi_analyzer.py # 全模型交叉精算/复盘、独立审计与 Jev 定稿
 ├── full_model_settings.py # 模型分工默认值及回退/强度校验
@@ -313,7 +313,7 @@ Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-
 
    选完再按当前模型选择一档**推理强度**（中文 / API 原值），点了 AI 就开始推理，约 **1~3 分钟**，
    期间会原地显示步骤进度条。跑完发来一份完整精算报告（盘口定性、资金流向、操盘手法、
-   风控验证、最终结论与置信度、投注决策）。
+   假设匹配、市场层读数、最终结论（信号强度 + 数据质量）、投注决策）。
 
 > ⚠️ **每日次数限制**：访客每天最多跑 **10 次** `/analyze`（管理员不限）。次数用完次日自动恢复。
 > 只看数据、点开按钮但没真正跑，不算次数。
@@ -440,8 +440,8 @@ Telegram、Ghost 和微信发布流程会自动隐藏该列；被排除的候选
 `TYPESAFE_DECISION_MODE` 作用于报告生成后的第 8 节选中项：
 - `off`：报告保持模型自己的选择。
 - `shadow`：报告不变，后台让 Jev 选一次，只记 `TYPESAFE_SHADOW` 日志（哈希 + 候选 ID，不含报告正文）。
-- `active`：代码筛出 eligible 且 edge>0 的候选（无则直接 pass、不调 Jev），Jev 在其中 + PASS 里选；
-  Jev 失败或置信度低于阈值时，若原报告已明确判 PASS 则保留 PASS，否则退回 edge 最高项，报告注明「Jev 未参与」。注额由代码按 SOP 7.5 重算，
+- `active`：代码筛出 eligible 且 edge>0 的候选（价值注），Jev 在其中 + PASS 里选；无正 edge 时，若有 eligible 候选 edge ≥ `EXPLORE_MIN_EDGE`（默认 −3%）则下**探索注**（固定平注 `EXPLORE_STAKE`，默认 $1，每日 ≤ `EXPLORE_DAILY_MAX` 注，不可串关），否则 pass；数据质量 < 40 一律 pass。
+  Jev 失败或置信度低于阈值时，若原报告已明确判 PASS 则保留 PASS，否则退回 edge 最高项，报告注明「Jev 未参与」。注额由代码按 SOP 7.5 重算（k = 信号强度基础 k × 数据质量系数；假设登记表没有「已验证」假设时信号强度上限为「弱」），
   模型原选择改名为「模型初选」保留，第 8 节写入 `decision_final` 注释供 `/parlay` 读取（TG/发布出口会剥掉）。
 
 > 不需要 Telegram bot 就只填 `APIFOOTBALL_KEY`，守护进程会自动退化为纯调度器模式。

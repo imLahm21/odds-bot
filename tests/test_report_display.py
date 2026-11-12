@@ -180,7 +180,8 @@ class TestReportDisplayOutlets(unittest.TestCase):
 
     def test_generated_no_positive_edge_reason_is_human_readable(self):
         report = REPORT.replace("+8.0%", "−1.0%")
-        selection = self.decisions.select_decision(report, min_confidence=None, use_jev=False)
+        selection = self.decisions.select_decision(
+            report, min_confidence=None, use_jev=False, explore_allowed=False)
         self.assertEqual(selection.selected_id, "PASS")
         visible = self.tgbot._md_to_tg(self.decisions.apply_selection(report, selection))
         self.assertNotIn("eligible", visible)

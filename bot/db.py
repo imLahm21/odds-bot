@@ -57,6 +57,38 @@ CREATE INDEX IF NOT EXISTS idx_odds_fix_time ON odds_history(fixture_id, snapsho
 CREATE UNIQUE INDEX IF NOT EXISTS idx_odds_dedup
     ON odds_history(fixture_id, snapshot_utc, bookmaker_id, market, handicap);
 
+-- 盘口归档（假设回测用）：cleanup_old 删除原始快照前，按导出精简口径保留
+--   kind='node_last'：每节点 × 庄 × 市场 × 盘口线的最后一行
+--   kind='first'    ：每庄 × 市场 × 盘口线的最早一行
+-- 每场约 2000 行，是原始快照的几十分之一；比分不在此表，回测时按日期调 API 补。
+CREATE TABLE IF NOT EXISTS odds_archive (
+    fixture_id    INTEGER NOT NULL,
+    kind          TEXT NOT NULL,            -- node_last | first
+    snapshot_utc  TEXT NOT NULL,
+    source_updated_utc TEXT,
+    node_label    TEXT,
+    bookmaker_id  INTEGER NOT NULL,
+    bookmaker     TEXT,
+    market        TEXT NOT NULL,
+    home_odds     REAL, draw_odds REAL, away_odds REAL,
+    kelly_home    REAL, kelly_draw REAL, kelly_away REAL,
+    handicap      REAL,
+    home_water    REAL, away_water REAL,
+    kelly_h_water REAL, kelly_a_water REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_odds_archive_key ON odds_archive(
+    fixture_id, kind, COALESCE(node_label, ''), bookmaker_id, market,
+    COALESCE(handicap, -999));
+-- 被清理比赛的元信息（fixtures 行会被 cleanup_old 删除）
+CREATE TABLE IF NOT EXISTS fixtures_archive (
+    fixture_id    INTEGER PRIMARY KEY,
+    league_id     INTEGER, league_name TEXT, season INTEGER,
+    home_team     TEXT, away_team TEXT,
+    home_team_id  INTEGER, away_team_id INTEGER,
+    commence_utc  TEXT,
+    archived_utc  TEXT
+);
+
 -- 动态配置表：由 TG bot 实时增删/开关，调度器每次抓取时读取
 CREATE TABLE IF NOT EXISTS watched_leagues (
     league_id   INTEGER PRIMARY KEY,
@@ -86,6 +118,13 @@ CREATE TABLE IF NOT EXISTS parlay_usage (
     day      TEXT NOT NULL,            -- 北京时间 YYYY-MM-DD
     used     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, day)
+);
+
+-- 每日探索注计数（全局，按报告生成的北京日期）：见 config.EXPLORE_DAILY_MAX。
+-- 探索注 = 无正 edge 时的固定平注，用于收集 BCG 执行样本（reference_staking_kelly 3.4）。
+CREATE TABLE IF NOT EXISTS explore_usage (
+    day      TEXT PRIMARY KEY,         -- 北京时间 YYYY-MM-DD
+    used     INTEGER NOT NULL DEFAULT 0
 );
 
 -- LLM 故障转移/熔断可调参数：由 TG /llm 面板实时改，llm_client 读取（免重启）。
@@ -183,6 +222,16 @@ LIVE_ODDS_COLS = [
     "bookmaker_id", "bookmaker", "market",
     "handicap", "home_water", "away_water", "draw_odds", "suspended",
 ]
+
+
+def ah_handicap_sql(alias: str = "") -> str:
+    """读库用的「已校正让球」SQL 表达式：修复前（config.AH_SIGN_FIX_UTC 之前）的亚盘行取反。
+    凡按 handicap 分组 / 输出的查询都应用它代替裸 handicap 列（含 PARTITION BY），
+    否则修复前后两批同一盘口线会被当成两条线。alias 为表别名前缀（如 "h."）。"""
+    a = alias
+    return (f"(CASE WHEN {a}market = 'ah' AND {a}handicap IS NOT NULL "
+            f"AND {a}snapshot_utc < '{config.AH_SIGN_FIX_UTC}' "
+            f"THEN -{a}handicap ELSE {a}handicap END)")
 
 
 def get_conn(db_path: str | None = None) -> sqlite3.Connection:
@@ -510,6 +559,44 @@ def get_fixture_meta(conn: sqlite3.Connection, fixture_id: int):
         (fixture_id,)).fetchone()
 
 
+_ARCHIVE_COLS = (
+    "snapshot_utc, source_updated_utc, node_label, bookmaker_id, bookmaker, market, "
+    "home_odds, draw_odds, away_odds, kelly_home, kelly_draw, kelly_away, handicap, "
+    "home_water, away_water, kelly_h_water, kelly_a_water")
+
+
+def archive_old(conn: sqlite3.Connection, days: int = 30) -> tuple[int, int]:
+    """把将被 cleanup_old 删除的比赛按精简口径写入 odds_archive / fixtures_archive。
+    返回 (归档场数, 归档行数)。须在 cleanup_old 之前调用；失败时调用方不应继续清理。"""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    target = "SELECT fixture_id FROM fixtures WHERE commence_utc < ?"
+    fx = conn.execute(
+        "INSERT OR IGNORE INTO fixtures_archive (fixture_id, league_id, league_name, "
+        "season, home_team, away_team, home_team_id, away_team_id, commence_utc, "
+        "archived_utc) SELECT fixture_id, league_id, league_name, season, home_team, "
+        "away_team, home_team_id, away_team_id, commence_utc, ? FROM fixtures "
+        "WHERE commence_utc < ?", (stamp, cutoff))
+    rows = 0
+    for kind, partition, order in (
+        ("node_last", "fixture_id, node_label, bookmaker_id, market, handicap",
+         "snapshot_utc DESC, id DESC"),
+        ("first", "fixture_id, bookmaker_id, market, handicap",
+         "snapshot_utc ASC, id ASC"),
+    ):
+        cur = conn.execute(
+            f"INSERT OR IGNORE INTO odds_archive (fixture_id, kind, {_ARCHIVE_COLS}) "
+            f"SELECT fixture_id, ?, {_ARCHIVE_COLS} FROM ("
+            f"  SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order}) AS rn"
+            f"  FROM odds_history WHERE fixture_id IN ({target})"
+            f") WHERE rn = 1", (kind, cutoff))
+        rows += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conn.commit()
+    return (fx.rowcount if fx.rowcount and fx.rowcount > 0 else 0), rows
+
+
 def cleanup_old(conn: sqlite3.Connection, days: int = 30) -> tuple[int, int]:
     """删除开球时间早于 days 天前的比赛及其盘口快照。返回 (删赛程数, 删快照数)。"""
     from datetime import timedelta
@@ -551,6 +638,23 @@ def incr_analyze_used(conn: sqlite3.Connection, chat_id: int, day: str,
         (chat_id, day, n, n))
     conn.commit()
     return get_analyze_used(conn, chat_id, day)
+
+
+def get_explore_used(conn: sqlite3.Connection, day: str) -> int:
+    """取某北京日期已写出的探索注数（无记录返回 0）。"""
+    row = conn.execute(
+        "SELECT used FROM explore_usage WHERE day=?", (day,)).fetchone()
+    return row[0] if row else 0
+
+
+def incr_explore_used(conn: sqlite3.Connection, day: str, n: int = 1) -> int:
+    """当日探索注计数 +n，返回自增后的值。"""
+    conn.execute(
+        "INSERT INTO explore_usage (day, used) VALUES (?,?) "
+        "ON CONFLICT(day) DO UPDATE SET used = used + ?",
+        (day, n, n))
+    conn.commit()
+    return get_explore_used(conn, day)
 
 
 def get_parlay_used(conn: sqlite3.Connection, chat_id: int, day: str) -> int:

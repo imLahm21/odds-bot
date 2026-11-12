@@ -713,7 +713,7 @@ class TestGenerationSelection(unittest.TestCase):
         return selection, request
 
     def test_no_positive_edge_passes_without_calling_jev(self):
-        report = SELECT_REPORT.replace("+8.0%", "−1.0%").replace("+8.3%", "−0.5%")
+        report = SELECT_REPORT.replace("+8.0%", "−10.0%").replace("+8.3%", "−5.0%")
         selection, request = self._select(report)
         request.assert_not_called()
         self.assertEqual(selection.selected_id, "PASS")
@@ -733,15 +733,16 @@ class TestGenerationSelection(unittest.TestCase):
         self.assertEqual(selection.source, "jev")
         self.assertEqual(selection.selected_id, "C01")
         self.assertEqual(selection.fallback_reason, "")
-        self.assertEqual(selection.k, 0.25)
-        self.assertEqual(selection.stake, 2.0)      # 100×0.25×0.08/1.0
+        self.assertEqual(selection.k, 0.125)        # 旧格式报告：过渡期上限 1/8
+        self.assertEqual(selection.stake, 1.0)      # 100×0.125×0.08/1.0
+        self.assertEqual(selection.tier, "value")
 
     def test_low_confidence_falls_back_to_max_edge(self):
         selection, _ = self._select(answer=_judgment("C01", 0.5))
         self.assertEqual(selection.source, "edge_max")
         self.assertEqual(selection.selected_id, "C02")
         self.assertEqual(selection.fallback_reason, "low_confidence")
-        self.assertEqual(selection.stake, 2.3)      # 100×0.25×0.083/0.9
+        self.assertEqual(selection.stake, 1.2)      # 100×0.125×0.083/0.9
 
     def test_missing_threshold_never_trusts_jev(self):
         selection, _ = self._select(answer=_judgment("C01", 0.99),
@@ -810,7 +811,9 @@ class TestGenerationSelection(unittest.TestCase):
         self.assertTrue(decisions.read_final_decision(output)["pass"])
 
     def test_stake_is_capped(self):
-        report = SELECT_REPORT.replace("52% | 54% | +8.0%", "52% | 80% | +60.0%").replace(
+        report = SELECT_REPORT.replace(
+            "| C01 | 主胜 | 2.00 | 50% | 52% | 54% | +8.0% |",
+            "| C01 | 主胜 | 1.50 | 66.7% | 70% | 99% | +48.5% |").replace(
             "中，k=1/4", "强，k=1/2")
         selection, _ = self._select(report, answer=_judgment("C01", 0.9))
         self.assertEqual(selection.stake, config.PARLAY_STAKE_CAP)
@@ -883,7 +886,7 @@ class TestFinalDecisionContract(unittest.TestCase):
         final = decisions.read_final_decision(self._final_report(_judgment("C01", 0.9)))
         self.assertEqual(final, {
             "pass": False, "play": "主胜", "odds": 2.0, "edge": 0.08,
-            "p_final": 0.54, "evidence": "medium", "stake": 2.0, "warnings": [],
+            "p_final": 0.54, "evidence": "medium", "stake": 1.0, "warnings": [],
         })
 
     def test_pass_final_decision(self):
@@ -898,7 +901,7 @@ class TestFinalDecisionContract(unittest.TestCase):
                          ('"p_final":0.54', '"p_final":1.54'),
                          ('"schema":"decision_final/1"', '"schema":"x"'),
                          ('"evidence":"medium"', '"evidence":"huge"'),
-                         ('"stake":2.0', '"stake":"2"')):
+                         ('"stake":1.0', '"stake":"1"')):
             with self.subTest(old=old):
                 self.assertIn(old, report)
                 self.assertIsNone(
@@ -913,7 +916,7 @@ class TestFinalDecisionContract(unittest.TestCase):
             result = analyzer.extract_decision(report)
         llm.assert_not_called()
         self.assertEqual(result["play"], "主胜")
-        self.assertEqual(result["stake"], 2.0)
+        self.assertEqual(result["stake"], 1.0)
 
     def test_manifest_strip_removes_final_block_comment(self):
         report = self._final_report(_judgment("C01", 0.9))
@@ -976,3 +979,94 @@ class TestFinalizeDecision(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NEW_FORMAT_REPORT = SELECT_REPORT.replace(
+    "- **置信度**：72 / 100",
+    "- **信号强度**：无\n- **数据质量**：85 / 100（扣分构成：时效 5、不同步 5、临场附加 5）",
+).replace("- **证据强度与凯利分数**：中，k=1/4",
+          "- **信号强度与凯利分数**：基础 k 1/8 × 质量系数 1.0 = 1/8")
+
+
+class TestSignalQualityTiers(unittest.TestCase):
+    def _select(self, report, answer=None, **kwargs):
+        with patch.object(decisions, "_request_choice_result",
+                          return_value=(answer, None)) as request:
+            return decisions.select_decision(
+                report, "Home", "Away", "League", min_confidence=0.8, **kwargs), request
+
+    def test_parse_signal_and_quality(self):
+        self.assertEqual(decisions.parse_signal_strength(NEW_FORMAT_REPORT), "none")
+        self.assertEqual(decisions.parse_data_quality(NEW_FORMAT_REPORT), 85)
+        self.assertIsNone(decisions.parse_signal_strength(SELECT_REPORT))
+        strong = NEW_FORMAT_REPORT.replace("信号强度**：无", "信号强度**：强")
+        self.assertEqual(decisions.parse_signal_strength(strong), "strong")
+
+    def test_kelly_is_base_times_quality_factor(self):
+        self.assertEqual(decisions.kelly_fraction("none", 85), 0.125)
+        self.assertEqual(decisions.kelly_fraction("medium", 70), 0.25 * 0.75)
+        self.assertEqual(decisions.kelly_fraction("strong", 45), 0.5 * 0.5)
+        self.assertEqual(decisions.kelly_fraction("strong", 30), 0.0)
+        self.assertEqual(decisions.kelly_fraction(None, None, evidence="strong"), 0.125)
+        self.assertEqual(decisions.kelly_fraction(None, None, evidence="none"), 0.0)
+
+    def test_signal_capped_at_weak_without_verified_hypotheses(self):
+        strong = NEW_FORMAT_REPORT.replace("信号强度**：无", "信号强度**：强")
+        with patch.object(decisions, "verified_hypothesis_count", return_value=0):
+            selection, _ = self._select(strong, _judgment("C01", 0.9))
+        self.assertEqual(selection.signal, "weak")
+        self.assertEqual(selection.k, 0.125)
+        with patch.object(decisions, "verified_hypothesis_count", return_value=1):
+            selection, _ = self._select(strong, _judgment("C01", 0.9))
+        self.assertEqual(selection.signal, "strong")
+        self.assertEqual(selection.k, 0.5)
+
+    def test_registry_currently_has_no_verified_hypotheses(self):
+        self.assertEqual(decisions.verified_hypothesis_count(), 0)
+
+    def test_value_bet_uses_quality_factor_and_writes_tier(self):
+        report = NEW_FORMAT_REPORT.replace("85 / 100", "65 / 100")
+        selection, _ = self._select(report, _judgment("C01", 0.9))
+        self.assertEqual(selection.tier, "value")
+        self.assertEqual(selection.k, 0.125 * 0.75)
+        self.assertEqual(selection.stake, 0.8)          # 100×0.09375×0.08/1.0 = 0.75 → 0.8
+        output = decisions.apply_selection(report, selection)
+        self.assertIn('"tier":"value"', output)
+        self.assertIn("数据质量 65", output)
+
+    def test_explore_tier_when_no_positive_edge(self):
+        report = NEW_FORMAT_REPORT.replace("+8.0%", "−1.0%").replace("+8.3%", "−2.5%")
+        selection, request = self._select(report)
+        request.assert_not_called()
+        self.assertEqual(selection.tier, "explore")
+        self.assertEqual(selection.source, "explore")
+        self.assertEqual(selection.selected_id, "C01")   # −1.0% 是最高
+        self.assertEqual(selection.stake, 1.0)
+        output = decisions.apply_selection(report, selection)
+        self.assertIn("探索注", output)
+        final = decisions.read_final_decision(output)
+        self.assertTrue(final["pass"])                   # 串关抽取视同 pass
+        self.assertEqual(final["tier"], "explore")
+
+    def test_no_explore_when_all_edges_below_floor_or_budget_used(self):
+        report = NEW_FORMAT_REPORT.replace("+8.0%", "−4.0%").replace("+8.3%", "−5.0%")
+        selection, _ = self._select(report)
+        self.assertEqual(selection.selected_id, "PASS")
+        self.assertEqual(selection.source, "no_positive_edge")
+        report = NEW_FORMAT_REPORT.replace("+8.0%", "−1.0%").replace("+8.3%", "−2.5%")
+        selection, _ = self._select(report, explore_allowed=False)
+        self.assertEqual(selection.selected_id, "PASS")
+
+    def test_low_quality_passes_everything(self):
+        report = NEW_FORMAT_REPORT.replace("85 / 100", "35 / 100")
+        selection, request = self._select(report, _judgment("C01", 0.9))
+        request.assert_not_called()
+        self.assertEqual(selection.source, "low_quality")
+        self.assertEqual(selection.selected_id, "PASS")
+        self.assertIn("数据质量 35", decisions.apply_selection(report, selection))
+
+    def test_parlay_rejects_explore_leg(self):
+        from bot import parlay
+        ok, reason = parlay._leg_ok({"tier": "explore", "edge": 0.0, "evidence": "medium"})
+        self.assertFalse(ok)
+        self.assertIn("探索注", reason)

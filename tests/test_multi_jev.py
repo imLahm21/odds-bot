@@ -90,7 +90,7 @@ class TestMultiJev(unittest.TestCase):
         self.assertEqual(final["odds"], 2.0)
         self.assertAlmostEqual(final["edge"], 0.08)
         self.assertAlmostEqual(final["p_final"], 0.54)
-        self.assertEqual(final["stake"], 2.0)
+        self.assertEqual(final["stake"], 1.0)   # 旧格式报告：过渡期 k 上限 1/8
         self.assertTrue(report.startswith(_REPORT.split("### 8.", 1)[0]))
         self.assertIn("模型初选", report)
         self.assertLess(report.index("decision_final"), report.index("### 全模型执行记录"))
@@ -192,7 +192,7 @@ class TestMultiJev(unittest.TestCase):
         final = decisions.read_final_decision(report)
         self.assertAlmostEqual(final["p_final"], 0.60)
         self.assertAlmostEqual(final["edge"], 0.20)
-        self.assertEqual(final["stake"], 5.0)
+        self.assertEqual(final["stake"], 2.5)   # 100×0.125×0.20/1.0
 
     def test_cancellation_during_audit_skips_jev(self):
         cancel = Event()

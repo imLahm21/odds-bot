@@ -5,6 +5,7 @@
 - 采番：案例号 #（索引表末行）与数据卡号 case_NN（文件名）是两套独立序列，各自 +1
 - 字母节：扫主题文件已有 `## A.`/`## B.` 取下一字母
 - 三写一改：① 写数据卡 ② 主题文件加规则节+检查项(+触发/相关) ③④ 改总览索引(+路由表)
+- 登记：⑤ 方案里的 hypotheses 逐条追加到 rules/假设登记表.md 3.7 节（状态「假设」）
 - 原子性：先在内存构建所有目标文件新内容，全部成功才逐个 os.replace；任一步抛异常整批不落盘
 - 自检：落盘后跑协议第四节清单
 
@@ -19,6 +20,15 @@ log = logging.getLogger("odds_bot.lesson_archive")
 
 LESSONS_DIR = os.path.join("rules", "实战教训")
 OVERVIEW = "reference_case_lessons.md"           # 相对 LESSONS_DIR
+REGISTRY = os.path.join("..", "假设登记表.md")      # 相对 LESSONS_DIR
+_REGISTRY_SECTION = "### 3.7 归档新增"
+# 新规则节不得出现的旧分层措辞（ARCHIVING_PROTOCOL：新教训一律先登记为假设）
+_FORBIDDEN_RULE_PATTERNS = (
+    r"置信度\s*(?:扣|降|上调|下调|上限|封顶|提)",
+    r"封顶\s*\d",
+    r"权重\s*\d+\s*%",
+    r"必须改判",
+)
 
 # ─── 采番 ────────────────────────────────────────────────────────────────────
 
@@ -171,6 +181,9 @@ metadata:
   type: feedback
 ---
 
+> **证据层级**：**假设层**——本文件的「盘路 → 赛果」条文均为假设，编号与状态见 [假设登记表](../假设登记表.md)；
+> 只有「已验证」可以定方向。分层总则见 [reference_case_lessons.md](reference_case_lessons.md)「证据四层」。
+
 # {title}
 
 > **触发条件**：{trigger}
@@ -201,6 +214,67 @@ def build_new_topic_file(slug: str, plan: dict, trigger: str,
         checklist=checklist,
         related=plan.get("related_case_append", "") or "（本文件首案）",
     )
+
+
+def _clean_cell(text) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).replace("|", "／").strip()
+
+
+def append_registry_rows(registry_text: str, hypotheses: list[dict],
+                         source: str, date: str = "") -> tuple[str, list[str]]:
+    """在登记表「3.7 归档新增」表末尾追加新假设（编号已存在或不合法的跳过）。
+    返回 (新文本, 实际追加的编号)。找不到该节时原样返回。"""
+    if not hypotheses or _REGISTRY_SECTION not in registry_text:
+        return registry_text, []
+    existing = set(re.findall(r"^\|\s*(H-[A-Za-z0-9-]+)", registry_text, re.M))
+    rows: list[str] = []
+    added: list[str] = []
+    for item in hypotheses:
+        if not isinstance(item, dict):
+            continue
+        code = _clean_cell(item.get("code"))
+        if not re.fullmatch(r"H-[A-Za-z0-9-]+", code) or code in existing:
+            continue
+        trigger = _clean_cell(item.get("trigger"))
+        if date:
+            trigger += f"（{date} 登记）"
+        mech = "✓" if item.get("mechanical") else "✗"
+        rows.append(f"| {code} | {trigger} | {_clean_cell(item.get('prediction'))} "
+                    f"| {source} | {mech} | 1 场（本案） | 0 | 假设 |")
+        existing.add(code)
+        added.append(code)
+    if not rows:
+        return registry_text, []
+    start = registry_text.index(_REGISTRY_SECTION)
+    body_start = start + len(_REGISTRY_SECTION)
+    nxt = re.search(r"\n#{1,3} ", registry_text[body_start:])
+    end = body_start + nxt.start() if nxt else len(registry_text)
+    block = registry_text[start:end].rstrip("\n")
+    tail = registry_text[end:]
+    new_block = block + "\n" + "\n".join(rows) + "\n"
+    return registry_text[:start] + new_block + (("\n" + tail.lstrip("\n")) if tail else ""), added
+
+
+_HYPOTHESIS_PREFIX = {
+    "sync_pricing": "H-P", "lure_variants": "H-V", "late_stage_shift": "H-L",
+    "strong_team_deep": "H-X", "kelly_signals": "H-K", "heat_direction": "H-H",
+    "fundamentals_weight": "H-F", "csl_fundamentals": "H-F",
+    "h2h_weight": "H-F", "home_away_quality": "H-F",
+}
+
+
+def hypothesis_prefix(slug: str) -> str:
+    """主题 slug → 假设编号前缀（新主题取各段首字母，如 cup_rotation → H-CR）。"""
+    if slug in _HYPOTHESIS_PREFIX:
+        return _HYPOTHESIS_PREFIX[slug]
+    initials = "".join(part[:1] for part in re.split(r"[_\-]+", slug or "") if part)
+    return "H-" + (initials.upper() or "N")
+
+
+def forbidden_rule_phrases(text: str) -> list[str]:
+    """新规则节里残留的旧分层措辞（置信度加减分/封顶/权重百分比/必须改判）。"""
+    return [m.group(0) for pat in _FORBIDDEN_RULE_PATTERNS
+            for m in re.finditer(pat, text or "")]
 
 
 def _new_route_table_row(slug: str, trigger: str, key_point: str) -> str:
@@ -297,10 +371,25 @@ def build_changeset(plan: dict, meta: dict, topic_slug: str, *,
             summary.append("③④ 总览：案例索引 +1 行")
     files[overview_path] = ov2
 
+    # ⑤ 假设登记表
+    registered: list[str] = []
+    hypotheses = plan.get("hypotheses") or []
+    registry_path = os.path.normpath(os.path.join(lessons_dir, REGISTRY))
+    if hypotheses and os.path.exists(registry_path):
+        with open(registry_path, encoding="utf-8") as f:
+            reg = f.read()
+        source = f"{topic_fn.removesuffix('.md')} {section_letter}"
+        reg2, registered = append_registry_rows(reg, hypotheses, source, date_raw[:10])
+        if registered:
+            files[registry_path] = reg2
+            summary.append(f"⑤ 假设登记表：+{len(registered)} 条"
+                           f"（{'、'.join(registered)}，状态「假设」）")
+
     return {
         "case_no": case_no, "card_no": card_no,
         "section_letter": section_letter,
         "files": files, "card_path": card_path, "summary": summary,
+        "registered": registered,
     }
 
 
@@ -447,7 +536,29 @@ def run_self_check(changeset: dict, topic_slug: str,
             if not os.path.exists(os.path.join(lessons_dir, target)):
                 problems.append(f"主题文件链接指向不存在的文件：{target}")
 
-    # ⑩ [全库] 无残留裸章节号
+        # ⑩ 新增节不得含旧分层措辞（新教训一律先登记为假设）
+        if letter:
+            sect = re.search(rf"^## {letter}\..*?(?=\n## |\Z)", tt, re.S | re.M)
+            bad = forbidden_rule_phrases(sect.group(0) if sect else "")
+            if bad:
+                problems.append(
+                    f"新增节含旧分层措辞（应改为假设记录）：{sorted(set(bad))}")
+
+    # ⑪ 本次登记的假设须已写入登记表
+    expected = changeset.get("registered") or []
+    if expected:
+        registry_path = os.path.normpath(os.path.join(lessons_dir, REGISTRY))
+        try:
+            with open(registry_path, encoding="utf-8") as f:
+                reg = f.read()
+            missing = [c for c in expected
+                       if not re.search(rf"^\|\s*{re.escape(c)}\s*\|", reg, re.M)]
+            if missing:
+                problems.append(f"假设登记表缺本次登记的编号：{missing}")
+        except OSError:
+            problems.append("假设登记表读取失败")
+
+    # ⑫ [全库] 无残留裸章节号
     try:
         for name in os.listdir(lessons_dir):
             if re.match(r"2026\d+_case_.*\.md", name):

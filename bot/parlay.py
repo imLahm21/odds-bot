@@ -3,7 +3,8 @@
 
 对齐 rules/风控验证/reference_staking_kelly.md 第五章 §5.2：
   - 只做 3串1（2串1 无 ×1.15 增益，默认拆单关）。
-  - 准入门槛（全满足才可串）：三腿【每腿】edge>0 且证据达「中」以上。
+  - 准入门槛（全满足才可串）：三腿【每腿】为价值注（edge>0，探索注不可串）且信号强度达「中」以上。
+    过渡期假设登记表没有「已验证」假设，信号强度最高为「弱」→ 一律拆单关（等同停用）。
   - 「每腿 edge>0」是【保守准入政策】，非数学必然 —— 乘法增益可救回轻度负 EV 腿
     （反例 0.99×1.02×1.02×1.15−1=+18.45%）。保留门槛的理由是估计误差连乘、
     相关性不可控、方差放大，不是「负 EV 不可救」。
@@ -46,6 +47,8 @@ def norm_evidence(ev) -> str:
 
 def _leg_ok(leg: dict) -> tuple[bool, str]:
     """单腿是否满足准入（edge>0 且证据≥PARLAY_MIN_EVIDENCE）。返回 (通过, 原因)。"""
+    if leg.get("tier") == "explore":
+        return False, "该腿为探索注（无正 edge，固定平注），不可串关"
     edge = leg.get("edge")
     if edge is None:
         return False, "缺 edge（抽取失败）"

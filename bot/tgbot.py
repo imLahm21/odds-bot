@@ -1006,15 +1006,15 @@ def _build_csv(fid: int):
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker, market, "
             "home_odds, draw_odds, away_odds, kelly_home, kelly_draw, kelly_away, "
-            "handicap, home_water, away_water, kelly_h_water, kelly_a_water, "
+            "hc, home_water, away_water, kelly_h_water, kelly_a_water, "
             "source_updated_utc "
             "FROM ("
-            "  SELECT *, ROW_NUMBER() OVER ("
-            "    PARTITION BY node_label, bookmaker_id, market, handicap "
+            f"  SELECT *, {db.ah_handicap_sql()} AS hc, ROW_NUMBER() OVER ("
+            f"    PARTITION BY node_label, bookmaker_id, market, {db.ah_handicap_sql()} "
             "    ORDER BY snapshot_utc DESC) AS rn "
             "  FROM odds_history WHERE fixture_id=?"
             ") WHERE rn=1 "
-            "ORDER BY snapshot_utc, bookmaker, market, handicap", (fid,)).fetchall()
+            "ORDER BY snapshot_utc, bookmaker, market, hc", (fid,)).fetchall()
     finally:
         conn.close()
     if not rows:
@@ -1280,7 +1280,7 @@ def _odds_digest(fid: int) -> tuple[str, dict] | tuple[None, None]:
             "WHERE fixture_id=?", (fid,)).fetchone()
         rows = conn.execute(
             "SELECT snapshot_utc, node_label, bookmaker_id, market, "
-            "home_odds, draw_odds, away_odds, handicap, home_water, away_water "
+            f"home_odds, draw_odds, away_odds, {db.ah_handicap_sql()}, home_water, away_water "
             "FROM odds_history WHERE fixture_id=? AND bookmaker_id IN (4,8) "
             "ORDER BY snapshot_utc", (fid,)).fetchall()
     finally:
@@ -2280,7 +2280,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     ]}
     if _is_admin(chat_id):
         kb["inline_keyboard"].append(
-            [{"text": "🧪 全模型交叉精算", "callback_data": f"am:{fid}"}])
+            [{"text": "🧪 全模型交叉精算（待适配新分层）", "callback_data": f"am:{fid}"}])
     send(chat_id, "请选择下一步：\n"
                   "🧠 基本面预分析 = 先用轻量模型把两队近况/交锋/赛程/积分榜"
                   "分析成一份可读概述（可选、较慢，可随时停止；跑基本面时仍可发其它命令）；\n"
@@ -2288,7 +2288,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
                   "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求"
                   "（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
                   "🧪 全模型交叉精算 = 按职责调用所选模型分别分析，"
-                  "按保存的职责链合并、独立审计（管理员功能）。\n"
+                  "按保存的职责链合并、独立审计（管理员功能；职责提示词仍是旧分层措辞，过渡期结论勿用于下注）。\n"
                   "🎯/✍️ 选完后再按当前重档模型选择可用的中英双语推理强度。\n"
                   "（预分析不影响精算质量——主 SOP 本就会自行研判原始基本面）", kb)
 

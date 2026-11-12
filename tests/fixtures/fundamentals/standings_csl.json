@@ -1,0 +1,117 @@
+{
+ "response": [
+  {
+   "league": {
+    "id": 169,
+    "name": "Super League",
+    "season": 2026,
+    "standings": [
+     [
+      {
+       "rank": 1,
+       "team": {
+        "id": 836,
+        "name": "Shanghai Port"
+       },
+       "points": 40,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 12,
+        "draw": 4,
+        "lose": 2
+       }
+      },
+      {
+       "rank": 2,
+       "team": {
+        "id": 837,
+        "name": "Tianjin Jinmen Tiger"
+       },
+       "points": 36,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 10,
+        "draw": 6,
+        "lose": 2
+       }
+      },
+      {
+       "rank": 3,
+       "team": {
+        "id": 999,
+        "name": "Chengdu"
+       },
+       "points": 35,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 10,
+        "draw": 5,
+        "lose": 3
+       }
+      },
+      {
+       "rank": 4,
+       "team": {
+        "id": 998,
+        "name": "Shandong"
+       },
+       "points": 33,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 9,
+        "draw": 6,
+        "lose": 3
+       }
+      },
+      {
+       "rank": 6,
+       "team": {
+        "id": 830,
+        "name": "Beijing Guoan"
+       },
+       "points": 30,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 8,
+        "draw": 6,
+        "lose": 4
+       }
+      },
+      {
+       "rank": 7,
+       "team": {
+        "id": 833,
+        "name": "Shanghai Shenhua"
+       },
+       "points": 28,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 18,
+        "win": 8,
+        "draw": 4,
+        "lose": 6
+       }
+      }
+     ]
+    ]
+   }
+  }
+ ]
+}

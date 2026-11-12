@@ -48,15 +48,53 @@ def finalize_decision(report: str, home: str = "", away: str = "",
     try:
         selection = typesafe_decisions.select_decision(
             report, home, away, league,
-            min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE)
+            min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE,
+            explore_allowed=_explore_budget_left())
         typesafe_decisions.log_selection(report, selection)
         if selection is None:
             log.warning("第 8 节候选表无法解析，保留报告模型的选择")
             return report
+        if selection.tier == "explore":
+            _count_explore()
         return typesafe_decisions.apply_selection(report, selection)
     except Exception as exc:
         log.warning("生成时选定失败（%s），保留原报告", type(exc).__name__)
         return report
+
+
+def _cst_day() -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def _explore_budget_left() -> bool:
+    """当日探索注是否还有额度（EXPLORE_DAILY_MAX ≤0 视为不限）。读库失败按无额度处理。"""
+    if config.EXPLORE_MODE != "on":
+        return False
+    if config.EXPLORE_DAILY_MAX <= 0:
+        return True
+    try:
+        from . import db
+        conn = db.get_conn()
+        try:
+            return db.get_explore_used(conn, _cst_day()) < config.EXPLORE_DAILY_MAX
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("探索注额度读取失败（%s），本场不下探索注", type(exc).__name__)
+        return False
+
+
+def _count_explore() -> None:
+    try:
+        from . import db
+        conn = db.get_conn()
+        try:
+            db.incr_explore_used(conn, _cst_day())
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("探索注计数写入失败（%s）", type(exc).__name__)
 
 # 请求头清洗迁至 llm_client.clean_header_value；此处保留别名兼容旧引用。
 _clean_header_value = llm_client.clean_header_value
@@ -251,13 +289,50 @@ def load_live_rules() -> str:
     return text
 
 
+def market_hypotheses_block(csv_text: str, league: str) -> str:
+    """【市场事实】+【已触发假设】（代码计算，WP-3.2）。任何异常都返回空串，不阻断精算。"""
+    try:
+        from . import hypotheses, market_facts
+        facts = market_facts.build_facts(market_facts.rows_from_csv(csv_text), league)
+        if not facts.lines:
+            return ""
+        return (market_facts.format_facts(facts) + "\n\n"
+                + hypotheses.format_triggers(hypotheses.evaluate(facts)) + "\n\n")
+    except Exception as exc:
+        log.warning("市场事实/假设计算失败（%s），本场不注入", type(exc).__name__)
+        return ""
+
+
+def candidates_block(csv_text: str, league: str, home: str, away: str) -> str:
+    """【代码候选表】（WP-3.3）。异常或数据不足时返回空串，LLM 按 SOP 自行算。"""
+    from . import candidates
+    return candidates.candidates_block(csv_text, league, home, away)
+
+
+def fund_has(fundamentals: str | None) -> tuple[bool, bool]:
+    """(has_h2h, has_form)：决定是否加载 H2H / 近况主题文件。
+
+    优先读 fundamentals.build_fundamentals 写入的结构化标志行（【基本面数据块】…）；
+    旧文本或手动粘贴没有标志行时，退回关键词判据——但先剔除固定提示语，
+    否则「交锋」「近 10 场」等词恒出现在提示语里，判据永远为真（F5）。"""
+    from . import fundamentals as fundamentals_mod
+    text = fundamentals or ""
+    flags = fundamentals_mod.parse_flags(text)
+    if flags is not None:
+        return flags.get("has_h2h", True), flags.get("has_form", True)
+    body = fundamentals_mod.strip_fixed_hints(text)
+    has_h2h = any(k in body for k in ("交锋", "H2H", "h2h"))
+    has_form = any(k in body for k in ("近10场", "近 10 场", "近况", "战绩"))
+    return has_h2h, has_form
+
+
 def load_fund_rules(league_name: str = "", has_h2h: bool = True,
                     has_form: bool = True) -> str:
-    """读取基本面分析专用规则（国家队/赛事情境/大小球 + 命中的 B 层主题）。
+    """读取基本面分析专用规则（国家队/赛事情境/大小球 + 命中的基本面层主题）。
 
-    基本面预处理属**证据分层的 B 层**，故除方法论外还须加载 B 层主题规则
-    （权重分配、碾压级要件、近况质量分级、H2H 权重）——否则它在做 B 层判断时
-    手上没有 B 层的判据。不含全套 SOP 精算规则。缓存按文件列表 + mtime 双重校验。
+    基本面预处理属**证据四层的基本面层**，故除方法论外还须加载基本面层主题规则
+    （碾压级五要素、极端动力差异、近况质量分级、H2H 读法）——否则它手上没有
+    方向覆盖条件的判据。不含全套 SOP 精算规则。缓存按文件列表 + mtime 双重校验。
     """
     rels = list(config.FUND_ANALYZE_RULE_FILES) + config.fund_topic_files(
         league_name, has_h2h, has_form)
@@ -320,8 +395,7 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
     # 主题防错规则按本场条件加载：联赛决定是否要中超专项，基本面文本里
     # 有无 H2H/近况决定是否要那两个主题（判据保守——拿不准就加载）。
     fund = fundamentals or ""
-    has_h2h = any(k in fund for k in ("交锋", "H2H", "h2h"))
-    has_form = any(k in fund for k in ("近10场", "近 10 场", "近况", "战绩"))
+    has_h2h, has_form = fund_has(fund)
     rules = load_rules(
         league_name=league, has_h2h=has_h2h, has_form=has_form)
     system = (
@@ -330,18 +404,22 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         "你是拥有20年经验的庄家操盘手和数据精算师。严格按上述 SOP 文档的"
         "步骤 1~8 执行分析（含步骤 7.5 投注决策），按文档「输出格式」章节的结构"
         "输出完整精算报告——**必须包含 `### 8. 投注决策` 段**，串关裁判依赖该段。"
-        "\n\n【证据分层铁律】方向只由 A 层（盘口定性 + 操盘手法匹配，权重 40%）决定。"
-        "B 层基本面（30%）仅在明文触发的条件覆盖场景（碾压级五要素、极端动力差异 ≥3 项）"
-        "可改方向；**C 层凯利/返还率（20%）与 D 层案例教训（10%）永不改方向**，"
-        "只能「扣置信度 + 把反向结果列为次选」。"
-        "不可按权重加总投票决定方向（否则 B+C+D=60% 会架空 A=40%）——权重只用于算置信度。"
-        "报告第 7 节须先写「分层判断」行，标明 A/B/C/D 各层结论与依据。"
-        "盘口数据为 CSV，基本面为【原始数据】文本（含两队近10场、历史交锋、"
-        "未来5场赛程、积分榜，来自 API-Football）。你需先按 SOP 步骤1的读法"
-        "自行分析这份原始基本面——判赛事情境（阶段/赛制/赛程密度）、近况分层加权、"
-        "实力锚（无终指用排名/洲际强弱）、H2H 权重、攻防与大小球倾向——"
-        "再将研判并入后续盘口精算。不要编造数据，缺失部分明确标注「无数据」，"
-        "按战绩/比分/排名/交锋综合加权。"
+        "\n\n【证据四层】默认无倾向，市场价格就是基准。方向只来自两处："
+        "① 假设登记表中状态为「已验证」的假设；② 基本面明文覆盖条件"
+        "（碾压级五要素 ≥3 项 / 极端动力差异 ≥3 项）。凯利、返还率是报价的变换，"
+        "属市场层事实，不改方向；「假设」「观察中」只在第 4 节记录命中。"
+        "**没有已验证假设、也没有基本面明文覆盖时，第 7 节各判定写『无倾向』**，"
+        "不得为了给出结论而选边。过渡期第 8 节 p_最终 = p_市场，不做校准平移。"
+        "报告第 7 节须先写「四层判断」行，并写出「信号强度」「数据质量」两行。"
+        "盘口数据为 CSV，基本面为【原始数据】文本（含代码算好的【事实表】、两队近10场、"
+        "历史交锋、未来赛程、积分榜、赛季统计、伤停，来自 API-Football，均截至开球前）。"
+        "**统计数字（胜平负、进失球、主客场分拆、休息天数、积分差）直接引用【事实表】，"
+        "不要自己数逐场列表**。你需先按 SOP 步骤1的读法分析这份基本面——判赛事情境"
+        "（阶段/赛制/赛程密度）、近况按对手质量分级、实力锚（无终指用排名/洲际强弱）、"
+        "H2H 读法、攻防——并逐项核对基本面方向覆盖条件。"
+        "若提供了【市场事实】与【已触发假设】段落（代码计算），步骤 2~5 的事实与第 4 节"
+        "假设表以其为准，你只负责解释与写报告，不自行增删触发的假设。"
+        "不要编造数据，缺失部分明确标注「无数据」（计入数据质量的基本面缺块扣分）。"
     )
     if extra_instruction.strip():
         system += (
@@ -353,6 +431,8 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 盘口快照（CSV）\n{csv_text}\n\n"
         f"{goals_model.format_states_block(goals_model.states_from_csv(csv_text))}\n"
+        f"{market_hypotheses_block(csv_text, league)}"
+        f"{candidates_block(csv_text, league, home, away)}"
         f"### 基本面\n{fundamentals}\n"
     )
     if input_metrics is not None:
@@ -379,11 +459,9 @@ def analyze(csv_text: str, fundamentals: str,
                        input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
         report = finalize_decision(report, home, away, league)
-        fund = fundamentals or ""
+        has_h2h, has_form = fund_has(fundamentals)
         mf = rules_manifest(
-            league_name=league,
-            has_h2h=any(k in fund for k in ("交锋", "H2H", "h2h")),
-            has_form=any(k in fund for k in ("近10场", "近 10 场", "近况", "战绩")))
+            league_name=league, has_h2h=has_h2h, has_form=has_form)
         report += "\n\n" + format_rules_manifest(mf)
     return report
 
@@ -426,15 +504,14 @@ _LLM_ERR_PREFIXES = (
 def _fund_prompts(raw_funds: str, home: str, away: str,
                   league: str) -> tuple[str, str]:
     """构造基本面预处理的 (system, user) prompt，供阻塞版与流式版共用。"""
+    has_h2h, has_form = fund_has(raw_funds)
     system = (
         load_fund_rules(
-            league_name=league,
-            has_h2h=any(k in (raw_funds or "") for k in ("交锋", "H2H", "h2h")),
-            has_form=any(k in (raw_funds or "")
-                         for k in ("近10场", "近 10 场", "近况", "战绩")))
+            league_name=league, has_h2h=has_h2h, has_form=has_form)
         + "\n\n===== 任务（基本面分析） =====\n"
         "你是足球赛事基本面分析师。下面是某场比赛的原始基本面数据"
-        "（两队近 10 场、历史交锋、未来 5 场赛程、积分榜，来自 API-Football）。"
+        "（事实表、两队近 10 场、历史交锋、未来赛程、积分榜、赛季统计、伤停，来自 API-Football，"
+        "均截至开球前）。**统计数字直接引用【事实表】，不要自己数逐场列表**。"
         "请严格依据上述方法论规则，把原始数据分析成一份结构化【基本面研判】，"
         "供操盘手后续盘口精算参考：\n"
         "1. 先判赛事情境：赛事阶段（小组赛/淘汰赛/联赛轮次）、赛制（单/双循环）、"
@@ -444,14 +521,13 @@ def _fund_prompts(raw_funds: str, home: str, away: str,
         "H2H 权重、出线形势与战意、两队攻防与大小球倾向。\n"
         "3. 产出研判结论（不是复述数据），指出对盘口的参考意义与风险点。\n"
         "数据缺失的部分明确标注「无数据」，不要编造。控制在合理篇幅内。\n"
-        "\n【本步骤的定位：证据分层的 B 层，权重 30%】\n"
-        "你的产出是**基本面侧证据**，供后续盘口精算（A 层：盘口定性 + 操盘手法，权重 40%）参考。\n"
-        "· **不要下最终方向结论**（不写「所以本场推荐客胜/上盘」）——方向由 A 层盘口决定，\n"
-        "  你的任务是提供基本面事实与倾向，让操盘手去比对盘口是否合理。\n"
-        "· 允许并鼓励明确指出**基本面倾向哪一方、强度多少**，以及\n"
-        "  **是否达到「条件覆盖」级别**（碾压级五要素、极端动力差异 ≥3 项等明文要件）——\n"
-        "  只有达到这些明文要件时，基本面才可覆盖盘口方向；否则只作权重与置信度参考。\n"
-        "· 基本面与盘口矛盾时的处理留给后续步骤，你只需如实标注矛盾点与强度。\n"
+        "\n【本步骤的定位：证据四层的基本面层】\n"
+        "你的产出是**基本面事实与相对市场的偏离（偏主 / 偏客 / 无）**，供后续精算参考。\n"
+        "· **不要下最终方向结论**（不写「所以本场推荐客胜/上盘」）。\n"
+        "· 逐项核对**方向覆盖条件**：碾压级五要素（≥3 项）、极端动力差异（≥3 项），"
+        "写明每项满足/不满足/无数据（无数据不算满足）——只有达到明文要件时，"
+        "基本面层才可提出方向；否则只记录事实与偏离。\n"
+        "· 不使用权重百分比，不给置信度加减分。基本面与盘口矛盾时如实标注，不互相改写。\n"
         "输出用纯文字，不要使用 Markdown 符号（不要出现 #、*、**、>、--- 等），"
         "分点可用「1. 2. 3.」或「·」，标题直接用文字，方便在纯文本聊天窗展示。"
     )
@@ -530,14 +606,16 @@ def distill_lesson(review_report: str, home: str, away: str,
         "严格按以下结构输出，不要多余前后缀、不要代码块围栏：\n\n"
         "# 案例（数据存档）：[主队] [比分] [客队]（[日期] [联赛][轮次如有]）\n\n"
         "## 结果\n"
-        "- **预测**：[盲推的亚盘/胜平负/比分/置信度，命中或偏差]\n"
+        "- **预测**：[盲推的亚盘/胜平负/比分/信号强度与数据质量（旧报告为置信度），命中或偏差；"
+        "「无倾向」如实记为无倾向]\n"
         "- **实际**：[真实比分与结算]\n"
         "- **正确结论**：[事后看应得的判断]\n\n"
         "## 关键信号\n"
         "[3~6 条最能解释对/错的盘口/凯利/水位/欧赔/基本面信号，用短句或小表格]\n\n"
         "## 教训与规则\n"
-        "[本场印证或修正了哪条军规/既有教训（引用编号如有）；根因是什么；"
-        "可沉淀的防错提醒。若复盘判断正确，则记录被验证有效的信号组合]\n\n"
+        "[本场命中了哪些假设（引用 H- 编号）、结果是否符合其预测；根因是什么；"
+        "可沉淀的新假设（触发条件 + 预测，不写成定方向规则、不写置信度加减分）。"
+        "若复盘判断正确，记录命中的假设及其结果]\n\n"
         "硬规则：① 只依据给定复盘报告，不编造数据、不新增未提及的结论；"
         "② 中文；③ 简洁——整张卡控制在 400 字内，突出可复用规律而非复述全文；"
         "④ 若报告显示预测正确，如实写成「正确案例」，不要硬凑错误。"
@@ -735,11 +813,16 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
     date = (meta.get("kick_cst") or "")[:10]
     existing = ("（新建主题，无现有内容）" if is_new_topic
                 else topic_file_text)
+    from . import lesson_archive
+    prefix = lesson_archive.hypothesis_prefix(topic_slug)
     system = (
         "你是足球赔率教训库的归档编辑。把一份【赛后复盘报告】写成可直接并入教训库的"
-        "结构化材料。参考给定【目标主题文件现有内容】的写法（节标题、规则编号、"
+        "结构化材料。参考给定【目标主题文件现有内容】的写法（节标题、假设编号、"
         "来源引用、检查项句式），保持风格一致。\n"
         f"本次在该主题文件新增 **{section_letter} 节**（字母已定，直接用）。\n"
+        "【证据四层】新教训一律先登记为**假设**：写「触发条件（尽量可机械判定）→ 预测」，"
+        "不得写成定方向的规则；禁止出现置信度加减分、封顶、权重百分比、「必须改判」"
+        "「优先级高于」等措辞。单个案例只是 1 场样本，不构成验证。\n"
         "只输出一个 JSON 对象，不要 markdown 代码块、不要多余文字。字段：\n"
         '  "card_md": 数据卡全文（Markdown）。四段结构：# 案例（数据存档）：'
         "[主队] [比分] [客队]（[日期] [赛事]）\\n\\n## 结果 / ## 关键信号 / "
@@ -747,10 +830,15 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
         "占位符 {CASE_NO}）；\n"
         f'  "rule_section_md": 主题文件新增的「## {section_letter}. <标题>」整节，'
         "首行为『> 来源：<对阵>（<日期> <赛事>）。<原判错误一句话>。存档："
-        "{CARD_LINK}。』，随后 2~4 条『**规则 "
-        f"{section_letter}1：…**』；若与既有节是姊妹场景可加一段『与 X 的区别』；\n"
-        '  "checklist_items": 字符串数组，每条形如 "- [ ] 触发条件？→ 应做动作"，'
-        f"对应新增规则；\n"
+        "{CARD_LINK}。』，随后 1~4 条『**"
+        f"{prefix}-{section_letter}1：<触发条件> → 预测 <方向>**』；"
+        "若与既有节是姊妹场景可加一段『与 X 的区别』，触发条件尽量写成互斥；\n"
+        '  "checklist_items": 字符串数组，每条形如 "- [ ] 触发条件？→ 记 '
+        f'{prefix}-{section_letter}1 命中"，对应新增假设；\n'
+        '  "hypotheses": 数组，每个新增假设一项 {"code":"'
+        f'{prefix}-{section_letter}1","trigger":"触发摘要（≤40字）",'
+        '"prediction":"预测（≤12字）","mechanical":true/false}'
+        "（mechanical=触发条件能否只用盘口/积分榜数据机械判定）；编号与 rule_section_md 一致；\n"
         '  "index_row": {"teams":"主 比分 客","date":"YYYY-MM-DD","league":"赛事",'
         '"result":"赛果一句话","topic_ref":"<主题缩写> ' + section_letter + '"}；\n'
         '  "trigger_extension": 若本案扩展了主题触发边界，给一句话（会追加到主题文件'
@@ -801,6 +889,7 @@ def compose_archive_plan(review_report: str, meta: dict, topic_slug: str,
         "trigger_extension": (str(d.get("trigger_extension")).strip()
                               if d.get("trigger_extension") else None),
         "related_case_append": str(d.get("related_case_append", "")).strip(),
+        "hypotheses": [h for h in (d.get("hypotheses") or []) if isinstance(h, dict)],
     }, None
 
 
@@ -1136,8 +1225,8 @@ _STAGE_NAMES = {
     1: "数据提取",
     2: "盘口定性",
     3: "资金流向与热度",
-    4: "操盘手法匹配",
-    5: "风控验证",
+    4: "假设匹配",
+    5: "市场层读数",
     6: "缺失节点预测",
     7: "最终精算结论",
     8: "投注决策",
@@ -1184,12 +1273,9 @@ def analyze_stream(csv_text: str, fundamentals: str,
         elif kind == "done":
             # 报告末尾附规则版本指纹（审查第 35 项）：让两份同场报告的差异
             # 能归因到「规则变了 / 输入变了 / 模型变了」三者之一。
-            fund = fundamentals or ""
+            has_h2h, has_form = fund_has(fundamentals)
             mf = rules_manifest(
-                league_name=league,
-                has_h2h=any(k in fund for k in ("交锋", "H2H", "h2h")),
-                has_form=any(k in fund for k in
-                             ("近10场", "近 10 场", "近况", "战绩")))
+                league_name=league, has_h2h=has_h2h, has_form=has_form)
             report = finalize_decision(payload, home, away, league)
             yield ("done", report + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
@@ -1253,7 +1339,7 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         "- 主流亚盘主盘口（如 -0.75）最终结算：上盘[赢/输/走水]，并说明赢半/输半\n"
         "- 关键节点其它盘口的结算结果\n\n"
         "### 3. 盲推预判 vs 实际对照\n"
-        "- 第一遍盲推的亚盘/胜平负/比分/置信度逐项列出\n"
+        "- 第一遍盲推的亚盘/胜平负/比分/信号强度/数据质量逐项列出（旧格式报告为置信度）\n"
         "- 与实际结果逐项比对：命中 / 偏差 / 完全错\n\n"
         "### 4. 信号有效性复盘\n"
         "- 正确信号：盲推中哪些变盘/凯利/水位/欧赔信号正确预示了结果\n"
@@ -1263,7 +1349,7 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
            if has_fund else "")
         + "- 凯利/返还率事后检验（报警是否兑现）\n\n"
         "### 5. 经验教训\n"
-        "- 本场印证/修正了哪条军规或既有教训（引用规则库编号）\n"
+        "- 本场命中了哪些假设（引用 H- 编号），结果是否符合其预测（逐条：符合 / 不符合 / 无方向）\n"
         "- 盲推若判错，根因是什么"
         + ("（区分是纯盘口不可知，还是基本面本可补正的盲区）" if has_fund else "")
         + "；可沉淀的防错提醒\n\n"
@@ -1381,11 +1467,11 @@ def _extract_decision_llm(report: str, home: str = "", away: str = "",
         '  "odds": 该玩法的十进制赔率（数字，如 1.95）；pass 时给 0；\n'
         '  "edge": 该玩法的 edge，写成【小数】（如 +8.3% → 0.083，−1.9% → -0.019）；pass 时给 0；\n'
         '  "p_final": 该玩法的 p_最终，写成【小数】（如 57% → 0.57）；pass 时给 0；\n'
-        '  "evidence": 证据强度，取 "strong"/"medium"/"weak"/"none"/"unknown" 之一。'
-        "**只从报告显式写出的证据强度/凯利分数抽取**"
-        "（强1/2→strong、中1/4→medium、弱1/8→weak、无→none）；"
-        "**报告未写证据强度时一律给 \"unknown\"，严禁根据置信度反推**"
-        "（置信度衡量的是研判确定性，证据强度衡量的是信息差质量，两者不可互推）；\n"
+        '  "evidence": 信号强度，取 "strong"/"medium"/"weak"/"none"/"unknown" 之一。'
+        "**只从报告显式写出的「信号强度」（新格式第 7 节）或「证据强度」（旧格式第 8 节）抽取**"
+        "（强→strong、中→medium、弱→weak、无→none）；"
+        "**报告两者都没写时一律给 \"unknown\"，严禁根据置信度或数据质量反推**；\n"
+        '  若选中项是探索注（第 8 节写明「探索注」），"pass" 给 true——探索注不可串关；\n'
         '  "stake": 报告建议注额数字（美元，无则 null）。\n'
         "硬规则：① 只依据报告已有内容，不自行重算、不编造；② 数字用阿拉伯数字、"
         "百分数一律转小数；③ 只输出一个 JSON 对象。"

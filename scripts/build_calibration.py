@@ -141,7 +141,8 @@ def parse_decimal_odds(v):
 
 
 def collect_rows(xlsx_path, sheets, months):
-    """收集带置信度的决策行；末项 fair_odds 可为 None。"""
+    """收集决策行：带数值置信度（旧记账）或填了「档」列（2026-11 起：value/explore）的行。
+    元组末两项为 fair_odds（可为 None）与 tier（value/explore/""）。"""
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     cutoff = None
     if months:
@@ -161,12 +162,18 @@ def collect_rows(xlsx_path, sheets, months):
         pi = h.get("投注玩法")
         di = h.get("日期")
         fi = next((h.get(name) for name in FAIR_ODDS_HEADERS if h.get(name)), None)
-        if not (ci and oi and ni):
+        ti = h.get("档")
+        if not ((ci or ti) and oi and ni):
             continue
         for r in range(2, ws.max_row + 1):
-            conf = ws.cell(r, ci).value
-            if not isinstance(conf, (int, float)):
-                continue  # 只统计带数值置信度的「决策」行
+            conf = ws.cell(r, ci).value if ci else None
+            tier = str(ws.cell(r, ti).value or "").strip().lower() if ti else ""
+            if tier in ("价值注", "价值"):
+                tier = "value"
+            elif tier in ("探索注", "探索"):
+                tier = "explore"
+            if not isinstance(conf, (int, float)) and tier not in ("value", "explore"):
+                continue  # 只统计「决策」行：带数值置信度，或填了档
             net = ws.cell(r, ni).value
             odds = ws.cell(r, oi).value
             if net is None or odds is None:
@@ -178,9 +185,10 @@ def collect_rows(xlsx_path, sheets, months):
             result = ws.cell(r, ri).value if ri else ""
             play = ws.cell(r, pi).value if pi else ""
             fair_odds = parse_decimal_odds(ws.cell(r, fi).value) if fi else None
-            rows.append((float(conf), float(odds), float(stake or 0), float(net),
+            rows.append((float(conf) if isinstance(conf, (int, float)) else None,
+                         float(odds), float(stake or 0), float(net),
                          str(result or "").strip(), str(play or ""), ws.title, date,
-                         fair_odds))
+                         fair_odds, tier or "value"))
     missing = [s for s in sheets if s not in seen_sheets]
     return rows, seen_sheets, missing
 
@@ -286,8 +294,20 @@ def build_fair_odds_markdown(rows):
 
 
 def build_markdown(rows):
-    """产出可直接更新到 Kelly 文档观测层的 Markdown。"""
+    """产出可直接更新到 Kelly 文档观测层的 Markdown。
+
+    探索注（档=explore）期望收益为负、目的只是收集执行样本，**不混入**置信度表与玩法表；
+    单独列在「按档」表里。"""
     out = []
+    out.append("### 按档（价值注 / 探索注 分开统计）\n")
+    out.append("| 档 | 笔数 | 方向命中率 | ROI | 净盈亏 |")
+    out.append("|----|------|-----------|-----|--------|")
+    for tier, label in (("value", "价值注"), ("explore", "探索注")):
+        n, wr, roi, net, _f, _p, _pr = stat([x for x in rows if x[9] == tier])
+        out.append(f"| {label} | {n} | {fmt_pct(wr)} | {fmt_roi(roi)} | {net:+.2f} |")
+    out.append("")
+    all_rows = rows
+    rows = [x for x in all_rows if x[9] != "explore"]
     out.append("### 置信度校准表（本人实测，Kelly 的 p_校准 从「方向命中率」列取）\n")
     out.append("> 口径：**方向命中率** =（全赢+半赢）/（总数−走盘），"
                "走盘不计入分母（方向没错、只是没赚到）。"
@@ -297,7 +317,7 @@ def build_markdown(rows):
     out.append("| 自评置信度 | 笔数 | 方向命中率 | 全赢率 | 走盘率 | 盈利笔数 | ROI | 净盈亏 | 判定 |")
     out.append("|-----------|------|-----------|--------|--------|---------|-----|--------|------|")
     for (lo, hi), label in zip(CONF_BUCKETS, CONF_LABELS):
-        sel = [x for x in rows if lo <= x[0] < hi]
+        sel = [x for x in rows if x[0] is not None and lo <= x[0] < hi]
         n, wr, roi, net, fullw, pushr, profit = stat(sel)
         verdict = "样本不足" if n < 15 else (
             "✅ 盈利" if (roi is not None and roi > 0) else "❌ 亏")
@@ -362,7 +382,7 @@ def main():
         print(f"- ⚠️ 未找到 sheet：{', '.join(missing)}")
     if args.months:
         print(f"- 滚动窗口：最近 {args.months} 个月")
-    print(f"- 有效决策样本（带数值置信度）：{len(rows)} 笔")
+    print(f"- 有效决策样本（带数值置信度或「档」列）：{len(rows)} 笔")
 
     fair_odds_count = sum(1 for x in rows if x[8] is not None)
     fair_note = "" if fair_odds_count else "（未找到公允赔率列或有效值，本期不生成事前 edge 表）"

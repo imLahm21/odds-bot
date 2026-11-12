@@ -97,9 +97,11 @@ class TestTaskAFixtureSync(unittest.TestCase):
         fetch_fixtures.return_value = response
         parse_fixtures.return_value = parsed
 
-        result = scheduler.task_a_update_fixtures()
+        with patch.object(scheduler.db, "archive_old", return_value=(0, 0)) as archive_old:
+            result = scheduler.task_a_update_fixtures()
 
         self.assertEqual(result, 1)
+        archive_old.assert_called_once_with(conn, scheduler.config.CLEANUP_DAYS)
         fetch_fixtures.assert_called_once_with(2, 2026)
         parse_fixtures.assert_called_once_with(
             response, 2, "欧冠 Champions Lg", 2026)

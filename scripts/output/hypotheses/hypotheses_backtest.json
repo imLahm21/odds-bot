@@ -1,0 +1,344 @@
+{
+ "H-D02": {
+  "triggered": 376,
+  "settled": 371,
+  "hit_rate": 0.48830409356725146,
+  "ci95": [
+   0.4357510802781878,
+   0.5411169425391945
+  ],
+  "roi": -0.004043126684636129,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-D13": {
+  "triggered": 50,
+  "settled": 48,
+  "hit_rate": 0.4878048780487805,
+  "ci95": [
+   0.3425418723993569,
+   0.6351574068413481
+  ],
+  "roi": -0.10031249999999999,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-K02": {
+  "triggered": 735,
+  "settled": 693,
+  "hit_rate": 0.7561327561327561,
+  "ci95": [
+   0.7228060639334917,
+   0.786635393063335
+  ],
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-K03": {
+  "triggered": 132,
+  "settled": 111,
+  "hit_rate": 0.15315315315315314,
+  "ci95": [
+   0.09787395226245062,
+   0.23163730498231083
+  ],
+  "roi": -0.15081081081081082,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-K20": {
+  "triggered": 739,
+  "settled": 727,
+  "hit_rate": 0.5694635488308115,
+  "ci95": [
+   0.5331975618572118,
+   0.6049992786072609
+  ],
+  "roi": -0.023920220082530978,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M01": {
+  "triggered": 2,
+  "settled": 2,
+  "hit_rate": 0.0,
+  "ci95": [
+   0.0,
+   0.6576280471103807
+  ],
+  "roi": -1.0,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M02": {
+  "triggered": 5,
+  "settled": 4,
+  "hit_rate": 0.75,
+  "ci95": [
+   0.3006360524426366,
+   0.9544139373553637
+  ],
+  "roi": 0.4075,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-M03": {
+  "triggered": 45,
+  "settled": 0,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-M04": {
+  "triggered": 12,
+  "settled": 12,
+  "hit_rate": 0.18181818181818182,
+  "ci95": [
+   0.05136660067100063,
+   0.4769861375782448
+  ],
+  "roi": -0.5783333333333334,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M05": {
+  "triggered": 28,
+  "settled": 28,
+  "hit_rate": 0.4230769230769231,
+  "ci95": [
+   0.255441899027294,
+   0.6105170307888017
+  ],
+  "roi": -0.2003571428571429,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M06": {
+  "triggered": 54,
+  "settled": 54,
+  "hit_rate": 0.5098039215686274,
+  "ci95": [
+   0.37680695448409596,
+   0.641427378576938
+  ],
+  "roi": -0.05240740740740741,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M07": {
+  "triggered": 2,
+  "settled": 2,
+  "hit_rate": 0.5,
+  "ci95": [
+   0.09452865480086614,
+   0.9054713451991339
+  ],
+  "roi": 0.0,
+  "halves_same_sign": false,
+  "robust_sign": false
+ },
+ "H-M08": {
+  "triggered": 12,
+  "settled": 0,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-M09": {
+  "triggered": 897,
+  "settled": 0,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-M10": {
+  "triggered": 62,
+  "settled": 62,
+  "hit_rate": 0.509090909090909,
+  "ci95": [
+   0.38076038407484447,
+   0.636234395128984
+  ],
+  "roi": -0.017499999999999977,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M11": {
+  "triggered": 249,
+  "settled": 245,
+  "hit_rate": 0.5427350427350427,
+  "ci95": [
+   0.4787284406529295,
+   0.6053611382937307
+  ],
+  "roi": 0.04083673469387753,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-M12": {
+  "triggered": 133,
+  "settled": 0,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-M13": {
+  "triggered": 172,
+  "settled": 0,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": null,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-P-A1": {
+  "triggered": 205,
+  "settled": 203,
+  "hit_rate": 0.5051546391752577,
+  "ci95": [
+   0.4353847370841401,
+   0.5747243602947733
+  ],
+  "roi": 0.009433497536945792,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-P-C3": {
+  "triggered": 164,
+  "settled": 159,
+  "hit_rate": 0.527027027027027,
+  "ci95": [
+   0.446926623590694,
+   0.6057598602187494
+  ],
+  "roi": -0.01059748427672957,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-R1a": {
+  "triggered": 2,
+  "settled": 2,
+  "hit_rate": 1.0,
+  "ci95": [
+   0.20654329147389294,
+   1.0
+  ],
+  "roi": 0.4,
+  "halves_same_sign": false,
+  "robust_sign": false
+ },
+ "H-R1b": {
+  "triggered": 1,
+  "settled": 1,
+  "hit_rate": null,
+  "ci95": null,
+  "roi": 0.0,
+  "halves_same_sign": null,
+  "robust_sign": null
+ },
+ "H-R3a": {
+  "triggered": 65,
+  "settled": 64,
+  "hit_rate": 0.43548387096774194,
+  "ci95": [
+   0.3194239439101423,
+   0.5590723259253417
+  ],
+  "roi": -0.17335937500000007,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-R3b": {
+  "triggered": 502,
+  "settled": 498,
+  "hit_rate": 0.49469214437367304,
+  "ci95": [
+   0.4497646169244246,
+   0.539705555865828
+  ],
+  "roi": -0.06336345381526101,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-R4": {
+  "triggered": 29,
+  "settled": 27,
+  "hit_rate": 0.5769230769230769,
+  "ci95": [
+   0.3894829692111983,
+   0.744558100972706
+  ],
+  "roi": 0.09574074074074074,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-S1": {
+  "triggered": 73,
+  "settled": 73,
+  "hit_rate": 0.5303030303030303,
+  "ci95": [
+   0.41157476624932443,
+   0.645697690280881
+  ],
+  "roi": 0.014657534246575335,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-S2": {
+  "triggered": 163,
+  "settled": 158,
+  "hit_rate": 0.5517241379310345,
+  "ci95": [
+   0.4704815188517763,
+   0.6302967581890508
+  ],
+  "roi": 0.042373417721519,
+  "halves_same_sign": false,
+  "robust_sign": true
+ },
+ "H-S3": {
+  "triggered": 122,
+  "settled": 122,
+  "hit_rate": 0.5575221238938053,
+  "ci95": [
+   0.46555055620499053,
+   0.6457111861881296
+  ],
+  "roi": 0.03831967213114757,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-S4": {
+  "triggered": 411,
+  "settled": 408,
+  "hit_rate": 0.5051282051282051,
+  "ci95": [
+   0.4556991415756827,
+   0.5544572258573156
+  ],
+  "roi": -0.045919117647058805,
+  "halves_same_sign": true,
+  "robust_sign": true
+ },
+ "H-T3": {
+  "triggered": 5,
+  "settled": 5,
+  "hit_rate": 0.4,
+  "ci95": [
+   0.1176182311592533,
+   0.769280067791163
+  ],
+  "roi": -0.11200000000000006,
+  "halves_same_sign": true,
+  "robust_sign": true
+ }
+}

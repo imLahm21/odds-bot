@@ -1,0 +1,174 @@
+{
+ "response": [
+  {
+   "league": {
+    "id": 39,
+    "name": "Premier League",
+    "season": 2026,
+    "standings": [
+     [
+      {
+       "rank": 1,
+       "team": {
+        "id": 42,
+        "name": "Arsenal"
+       },
+       "points": 25,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 8,
+        "draw": 1,
+        "lose": 0
+       }
+      },
+      {
+       "rank": 2,
+       "team": {
+        "id": 40,
+        "name": "Liverpool"
+       },
+       "points": 22,
+       "goalsDiff": 11,
+       "form": "WWDWL",
+       "description": "Promotion - Champions League",
+       "all": {
+        "played": 9,
+        "win": 7,
+        "draw": 1,
+        "lose": 1
+       },
+       "home": {
+        "played": 4,
+        "win": 4,
+        "draw": 0,
+        "lose": 0,
+        "goals": {
+         "for": 10,
+         "against": 2
+        }
+       },
+       "away": {
+        "played": 5,
+        "win": 3,
+        "draw": 1,
+        "lose": 1,
+        "goals": {
+         "for": 8,
+         "against": 5
+        }
+       }
+      },
+      {
+       "rank": 3,
+       "team": {
+        "id": 50,
+        "name": "Manchester City"
+       },
+       "points": 20,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 6,
+        "draw": 2,
+        "lose": 1
+       }
+      },
+      {
+       "rank": 4,
+       "team": {
+        "id": 49,
+        "name": "Chelsea"
+       },
+       "points": 18,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 5,
+        "draw": 3,
+        "lose": 1
+       }
+      },
+      {
+       "rank": 5,
+       "team": {
+        "id": 47,
+        "name": "Tottenham"
+       },
+       "points": 17,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 5,
+        "draw": 2,
+        "lose": 2
+       }
+      },
+      {
+       "rank": 8,
+       "team": {
+        "id": 55,
+        "name": "Brentford"
+       },
+       "points": 15,
+       "goalsDiff": 4,
+       "form": "WDLWW",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 4,
+        "draw": 3,
+        "lose": 2
+       },
+       "home": {
+        "played": 4,
+        "win": 3,
+        "draw": 1,
+        "lose": 0,
+        "goals": {
+         "for": 9,
+         "against": 3
+        }
+       },
+       "away": {
+        "played": 5,
+        "win": 1,
+        "draw": 2,
+        "lose": 2,
+        "goals": {
+         "for": 5,
+         "against": 7
+        }
+       }
+      },
+      {
+       "rank": 12,
+       "team": {
+        "id": 36,
+        "name": "Fulham"
+       },
+       "points": 11,
+       "goalsDiff": 0,
+       "form": "",
+       "description": null,
+       "all": {
+        "played": 9,
+        "win": 3,
+        "draw": 2,
+        "lose": 4
+       }
+      }
+     ]
+    ]
+   }
+  }
+ ]
+}

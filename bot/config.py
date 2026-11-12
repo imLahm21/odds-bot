@@ -316,6 +316,11 @@ NODE_THRESHOLDS: list[tuple[float, str]] = [
 # ─── 数据库 ──────────────────────────────────────────────────────────────────
 DB_PATH = "odds.db"
 
+# 亚盘让球符号修复时点（UTC）。此前 parser 写成 handicap = -raw（见 parser.parse_ah_value），
+# 早于此时点的 market='ah' 行让球符号整体相反；读库处一律经 db.ah_handicap_sql() 翻回，
+# 不改库内原始数据。时点由导出库逐小时实测：2026-09-06 16:40Z 及以前全反、16:57Z 起全正。
+AH_SIGN_FIX_UTC = "2026-09-06T16:50:00Z"
+
 # ─── Telegram bot ────────────────────────────────────────────────────────────
 # token 与白名单从 .env 读取，不写死在代码里：
 #   TELEGRAM_BOT_TOKEN=123456:ABC...
@@ -346,7 +351,22 @@ PARLAY_STAKE_CAP = 12.0          # 单注上限（$）
 # 证据强度 → 凯利分数 k（同 reference_staking_kelly：强 1/2、中 1/4、弱 1/8、无 0）。
 # 串关取三腿最弱腿的档位定 k（木桶效应）。
 PARLAY_EVIDENCE_K = {"strong": 0.5, "medium": 0.25, "weak": 0.125, "none": 0.0}
-PARLAY_MIN_EVIDENCE = "medium"   # 准入门槛：每腿证据须 ≥ 此档（§5.2 准入①）
+PARLAY_MIN_EVIDENCE = "medium"   # 准入门槛：每腿信号强度须 ≥ 此档（§5.2 准入①）
+# 证据四层（CLAUDE.md 步骤 7）：凯利分数 k = 信号强度基础 k × 数据质量系数。
+# 信号强度只来自「已验证」假设与基本面覆盖；登记表没有「已验证」假设时，
+# 代码把信号强度上限压在 weak（过渡期串关因此一律拆单关）。
+SIGNAL_BASE_K = {"none": 0.125, "weak": 0.125, "medium": 0.25, "strong": 0.5}
+# 数据质量 → 质量系数：(下限, 系数)，从高到低取第一个满足的档。<40 → 0（空仓）。
+QUALITY_K_FACTORS = [(80, 1.0), (60, 0.75), (40, 0.5), (0, 0.0)]
+QUALITY_MIN_TO_BET = 40          # 数据质量低于此值本场全部空仓（含探索注）
+QUALITY_DEFAULT = 70             # 报告未写数据质量时的保守默认（取 0.75 档）
+HYPOTHESIS_REGISTRY = "rules/假设登记表.md"
+
+# 探索注（无正 edge 时收集 BCG 执行样本，见 reference_staking_kelly 3.4）
+EXPLORE_MODE = os.getenv("EXPLORE_MODE", "on").strip().lower()   # on / off
+EXPLORE_MIN_EDGE = float(os.getenv("EXPLORE_MIN_EDGE", "-0.03"))  # 只在价格接近公平时探索
+EXPLORE_STAKE = float(os.getenv("EXPLORE_STAKE", "1.0"))          # 每注固定美元数
+EXPLORE_DAILY_MAX = int(os.getenv("EXPLORE_DAILY_MAX", "5"))      # 每日探索注上限（按报告生成日）
 # Beta 提示：/parlay 仍在打磨，各处引用此常量，日后一键去 Beta。
 PARLAY_BETA_NOTICE = ("⚠️ /parlay 为 Beta 实验功能，串关判定仍在打磨，"
                       "结果仅供参考，请自行复核。")
@@ -1007,23 +1027,24 @@ FUND_ANALYZE_RULE_FILES = [
     "rules/方法论/reference_over_under.md",
 ]
 
-# 基本面预处理是【证据分层的 B 层】，故须加载 B 层主题规则——否则它在做
-# B 层判断时手上没有 B 层的权重、条件覆盖要件与近况质量分级标准。
-# 按本场条件挑选（同 lesson_topic_files 的判据，仅取 B 层那几个）。
-FUND_B_LAYER_SLUGS = {
-    "fundamentals_weight": ("always", None),      # 权重分配/碾压级/战意，每场必读
+# 基本面预处理属【证据四层的基本面层】，故须加载基本面层主题规则——否则它
+# 手上没有方向覆盖要件（碾压级五要素 / 极端动力差异）与近况质量分级标准。
+# 按本场条件挑选（同 lesson_topic_files 的判据，仅取基本面层那几个）。
+FUND_LAYER_SLUGS = {
+    "fundamentals_weight": ("always", None),      # 碾压级五要素/杯赛/战意，每场必读
     "home_away_quality":   ("has_form", None),    # 近况按对手质量分级
-    "h2h_weight":          ("has_h2h", None),     # H2H 权重双向调整
+    "h2h_weight":          ("has_h2h", None),     # H2H 事实读法
     "csl_fundamentals":    ("league", ("中超", "足协杯", "csl", "chinese super")),
 }
+FUND_B_LAYER_SLUGS = FUND_LAYER_SLUGS             # 旧名兼容
 
 
 def fund_topic_files(league_name: str = "", has_h2h: bool = True,
                      has_form: bool = True) -> list[str]:
-    """基本面预处理要加载的 B 层主题文件（相对路径）。判据同 lesson_topic_files。"""
+    """基本面预处理要加载的基本面层主题文件（相对路径）。判据同 lesson_topic_files。"""
     lg = (league_name or "").lower()
     out = []
-    for slug, (kind, param) in FUND_B_LAYER_SLUGS.items():
+    for slug, (kind, param) in FUND_LAYER_SLUGS.items():
         keep = (kind == "always"
                 or (kind == "has_h2h" and bool(has_h2h))
                 or (kind == "has_form" and bool(has_form))
@@ -1050,6 +1071,7 @@ ANALYZE_RULE_FILES = [
     "rules/风控验证/reference_kelly_index.md",
     "rules/风控验证/reference_staking_kelly.md",
     "rules/实战教训/reference_case_lessons.md",
+    "rules/假设登记表.md",
 ]
 
 # 主题防错文件（rules/实战教训/feedback_*.md）的条件加载规则。
