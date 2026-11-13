@@ -85,7 +85,9 @@ def _review_module_input(task: dict, bundle: dict) -> str:
         f"## 比赛：{bundle.get('home','')} vs {bundle.get('away','')}\n"
         f"## 联赛：{bundle.get('league','')}\n\n"
         f"### 全程盘口CSV\n{bundle.get('csv_text','')}\n\n"
-        f"### 第一阶段盲推预判\n{bundle.get('forecast','')}\n\n"
+        + analyzer.market_hypotheses_block(
+            bundle.get('csv_text', ''), bundle.get('league', ''))
+        + f"### 第一阶段盲推预判\n{bundle.get('forecast','')}\n\n"
         f"### 基本面（盲推时不可见，仅供事后归因）\n"
         f"{bundle.get('fundamentals','')}\n\n"
         f"### 进球状态\n{bundle.get('goals_block','')}\n\n"
@@ -115,8 +117,11 @@ def _review_module_system(task: dict, bundle: dict) -> str:
         "\n\n===== 全模型对照复盘模块 =====\n"
         "这是已结束比赛的第二阶段复盘。第一阶段盲推当时不知道比分和基本面；"
         "现在才揭晓结果。必须以盲推原文为基准判断哪里对、哪里错，禁止利用结果"
-        "倒推并改写盲推。A层模块分析盘口信号有效性；B层只分析盲推未见的基本面"
-        "是否能解释偏差；C层复核结算、概率与风险；D层只提炼教训。\n"
+        "倒推并改写盲推。按证据四层分工：市场层模块核对 p_市场、热门方与变盘事实；"
+        "假设层模块逐条检验已触发假设（符合 / 不符合 / 无方向），只记样本、"
+        "不因单场结果改变假设状态；基本面层模块只分析盲推未见的基本面是否能解释偏差；"
+        "风险与数字模块复核结算、概率与注额；教训模块只把新发现登记为待验证假设。"
+        "盲推写「无倾向」不算判错。\n"
     )
     return rules + task_rule + _json_instruction(
         module_id, task["label"], bundle.get("extra_instruction", ""))
@@ -401,9 +406,11 @@ def _audit_report(bundle: dict, report: str, cards: list[dict], *,
     deterministic = _basic_report_issues(report)
     system = (
         "你是最终报告审计员。只输出合法JSON，不要Markdown。\n"
-        "检查报告是否遵守项目SOP：A层定方向，B层只有条件覆盖才能改方向，"
-        "C/D层只能影响置信度；检查第1到第8节、数据缺失、edge、Kelly、"
-        "比分和用户自定义侧重。不要重写报告。\n"
+        "检查报告是否遵守项目SOP的证据四层：市场层只给 p_市场 基准、不定方向；"
+        "方向只来自「已验证」假设或基本面明文覆盖条件，两者都没有时各判定必须写「无倾向」；"
+        "「假设」「观察中」只记录命中；数据质量只影响注额。"
+        "检查第1到第8节、第7节的信号强度与数据质量两行、数据缺失、edge、Kelly、"
+        "档位（价值注/探索注/空仓）、比分和用户自定义侧重。不要重写报告。\n"
         '{"ok":true,"issues":[{"section":"7","problem":"...",'
         '"required_fix":"..."}]}'
     )
@@ -435,8 +442,9 @@ def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
         + card_text
         + "\n\n===== 精算合并要求 =====\n"
         "请基于同一份原始数据完成最终报告。专家卡片是证据辅助，不是投票结果。\n"
-        "A层盘口定性和操盘手法决定方向；B层仅在SOP明文条件覆盖时改方向；"
-        "C/D层不得改方向，只能扣置信度、列次选和风险。\n"
+        "按证据四层定结论：市场层只给 p_市场 基准；方向只来自「已验证」假设或"
+        "基本面明文覆盖条件，都没有就写「无倾向」；专家卡片里未验证的盘路判断"
+        "只作为假设命中记录，不得改方向；数据质量只调注额。\n"
         "必须保留现有输出格式的 ### 1 到 ### 8，必须包含 ### 8. 投注决策。\n"
     )
     return system, user, metrics

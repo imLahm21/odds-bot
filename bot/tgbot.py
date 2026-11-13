@@ -112,32 +112,49 @@ def _submit_bg(fn, *args) -> None:
 # 容量依据（服务器 2核12G）：分析线程 99% 时间阻塞在等 LLM 网络响应（期间释放 GIL），
 # 本地只做流式解析，几乎不吃 CPU；规则库 system prompt 进程内缓存共享一份（_rules_cache），
 # 每线程仅额外持累积报告与请求缓冲，约 0.5~1MB → 10 路并行也仅约 10MB，内存非瓶颈。
-# 真正的天花板是【LLM 网关并发限流】，故不宜再往上堆（过高只会 429/排队甚至触发熔断）。
+# 真正的天花板是【LLM 网关并发限流】——由 llm_client 按授权组的重档并发上限把关
+# （config.LLM_GROUP_MAX_CONCURRENT），超出的请求在那里排队，这里只限任务总数。
 _ANALYSIS_MAX_CONCURRENT = 10     # 全局同时在跑的分析上限（超出则排队）
-_ANALYSIS_MAX_PER_CHAT = 5        # 单个 chat 同时在跑的分析上限（防单人开到失控）
-# 批内错峰：同一 chat 连点多场时，第 N 场延迟 (N-1)×本值秒才发起，把各场下行 token
-# （单次 15~28 万）错开到不同 TPM 计费窗口，避免同时打满单个 key 的限流（实测 429）。
-# 配合 llm_client 的端点轮转（每场落到不同 key）双管齐下。设 0 关闭错峰。
+_ANALYSIS_MAX_PER_CHAT = 6        # 单个 chat 同时在跑的精算上限（常见用法：27 分钟内 4~6 场）
+# 错峰分两种，按该 chat 重档主模型所在的授权组决定：
+#   CPA 组（单 key、无按分钟限流）：缓存预热——第一场立即发，其余各场只等到
+#     「第一场发出后 config.LLM_CACHE_WARMUP_SECONDS 秒」一起发，吃第一场的前缀缓存。
+#   其它组（IK，多 key 按分钟限流）：递增错峰——第 N 场延迟 (N-1)×间隔，把下行 token
+#     错开到不同 TPM 计费窗口，配合 llm_client 的端点轮转。
 # 封顶存在的意义：用户在开赛前 27 分钟才开始推算、开赛前必须下注，延迟不能无限累加。
-_ANALYSIS_STAGGER_SECONDS = 30    # 每场递增的错峰间隔（秒）
-_ANALYSIS_STAGGER_MAX = 120       # 单场错峰延迟上限（秒），保护下注时间窗
+_ANALYSIS_STAGGER_SECONDS = 30    # 递增错峰的每场间隔（秒）
+_ANALYSIS_STAGGER_MAX = 120       # 递增错峰的单场延迟上限（秒），保护下注时间窗
+_ANALYSIS_WARMUP_WINDOW = 240     # 一批的领头场发出后多久内算同一批（秒，约等于缓存存活期）
 _analysis_pool = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_CONCURRENT,
                                     thread_name_prefix="analysis")
 
+# 复盘不赶时效：全部进单线程队列一场一场跑，不占精算的并行名额；
+# 有精算在跑或在排队时，下一场复盘先让路（已经开跑的那场不打断）。
+_REVIEW_KINDS = frozenset({"复盘", "全模型复盘"})
+_STAGGER_KINDS = frozenset({"精算", "全模型精算"})
+_REVIEW_MAX_QUEUED_PER_CHAT = 20
+_REVIEW_YIELD_POLL_SECONDS = 5
+_review_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review")
+
 # 进行中的分析任务：task_id -> {"chat_id", "cancel": Event, "kind": "精算"/"复盘"}。
-# 按 task_id（非 chat_id）做键，故【同一 chat 可并行多个】分析/复盘；每个任务的
+# 按 task_id（非 chat_id）做键，故【同一 chat 可并行多个】分析；每个任务的
 # 停止按钮带自己的 task_id（stopan:<task_id>），点哪个停哪个、互不影响。
 # 停止键置位对应 Event，分析循环每收到一块流式数据就检查、置位则收尾退出。
 _analysis_tasks: dict[str, dict] = {}
 _analysis_lock = threading.Lock()
+# 缓存预热：授权组 -> 本批领头场发出的 monotonic 时刻
+_warmup_leader_at: dict[str, float] = {}
 
 # 清空内联键盘的常量（收尾时移除「停止」按钮）
 _NO_KB = {"inline_keyboard": []}
 
 
-def _analysis_count_for_chat(chat_id: int) -> int:
-    """该 chat 当前进行中的分析任务数（调用方须持 _analysis_lock）。"""
-    return sum(1 for t in _analysis_tasks.values() if t["chat_id"] == chat_id)
+def _analysis_count_for_chat(chat_id: int, review: bool = False) -> int:
+    """该 chat 当前进行中/排队中的任务数（调用方须持 _analysis_lock）。
+    review=True 只数复盘，否则只数非复盘——两类名额互不占用。"""
+    return sum(1 for t in _analysis_tasks.values()
+               if t["chat_id"] == chat_id
+               and (t["kind"] in _REVIEW_KINDS) == review)
 
 
 def _analysis_cancel(task_id: str) -> str | None:
@@ -151,26 +168,64 @@ def _analysis_cancel(task_id: str) -> str | None:
         return t["kind"]
 
 
-def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
-    """把一个分析任务提交到独立分析池，并登记到中断注册表。
-    fn 的末两个参数会追加为 (task_id, cancel 事件)。
-    返回新任务的 task_id；该 chat 并行数已达上限则返回 None（调用方据此提示）。
+def _heavy_route_group(chat_id: int) -> str:
+    """该 chat 重档主模型所在的首个授权组（决定错峰方式）；取不到返回空串。"""
+    try:
+        model = llm_client.get_tier_model("heavy", visitor=not _is_admin(chat_id))
+        groups = config.llm_route_groups_for_model(model)
+        return groups[0] if groups else ""
+    except Exception:
+        log.exception("取重档授权组失败，按递增错峰处理")
+        return ""
 
-    批内错峰：同一 chat 几秒内连点多场时，第 N 场延迟 (N-1)×_ANALYSIS_STAGGER_SECONDS
-    才真正发起，把各场的下行 token 错开到不同的 TPM 计费窗口（中转商按令牌分组限流，
-    单次精算下行 15~28 万 token，同时发起必撞 429）。延迟用 cancel.wait 实现，
-    等待期间点「停止」立刻生效且不会发出 LLM 请求。
-    """
+
+def _stagger_delay(chat_id: int, kind: str, running: int) -> float:
+    """本场发起前要等的秒数（调用方须持 _analysis_lock）。只对精算类任务错峰。"""
+    if kind not in _STAGGER_KINDS:
+        return 0
+    group = _heavy_route_group(chat_id)
+    if group.startswith("cpa_"):
+        warmup = config.LLM_CACHE_WARMUP_SECONDS
+        if warmup <= 0:
+            return 0
+        now = time.monotonic()
+        leader_at = _warmup_leader_at.get(group)
+        if leader_at is None or now - leader_at > _ANALYSIS_WARMUP_WINDOW:
+            _warmup_leader_at[group] = now      # 本场是这一批的领头场，立即发
+            return 0
+        return max(0.0, leader_at + warmup - now)
+    return min(running * _ANALYSIS_STAGGER_SECONDS, _ANALYSIS_STAGGER_MAX)
+
+
+def _other_analysis_active(exclude: str = "") -> bool:
+    """是否有非复盘的分析任务在跑或在排队（复盘据此让路）。"""
     with _analysis_lock:
-        running = _analysis_count_for_chat(chat_id)
-        if running >= _ANALYSIS_MAX_PER_CHAT:
+        return any(t["kind"] not in _REVIEW_KINDS
+                   for tid, t in _analysis_tasks.items() if tid != exclude)
+
+
+def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
+    """把一个分析任务提交到后台池，并登记到中断注册表。
+    fn 的末两个参数会追加为 (task_id, cancel 事件)。
+    返回新任务的 task_id；该 chat 同类任务数已达上限则返回 None（调用方据此提示）。
+
+    精算类：进并行分析池，按 _stagger_delay 错峰（延迟用 cancel.wait 实现，
+    等待期间点「停止」立刻生效且不会发出 LLM 请求）。
+    复盘类：进单线程复盘队列，一场一场跑；轮到时若有精算在跑/排队则先让路。
+    """
+    is_review = kind in _REVIEW_KINDS
+    with _analysis_lock:
+        running = _analysis_count_for_chat(chat_id, review=is_review)
+        limit = _REVIEW_MAX_QUEUED_PER_CHAT if is_review else _ANALYSIS_MAX_PER_CHAT
+        if running >= limit:
             return None
         task_id = uuid.uuid4().hex[:10]
         cancel = threading.Event()
+        reviews_ahead = sum(1 for t in _analysis_tasks.values()
+                            if t["kind"] in _REVIEW_KINDS)
         _analysis_tasks[task_id] = {"chat_id": chat_id, "cancel": cancel,
                                     "kind": kind}
-    # 已有 N 个在跑 → 本场排第 N+1，延迟 N×间隔；封顶防把最后一场推太晚（下注窗口只有约 27 分钟）
-    delay = min(running * _ANALYSIS_STAGGER_SECONDS, _ANALYSIS_STAGGER_MAX)
+        delay = _stagger_delay(chat_id, kind, running)
 
     def _run() -> None:
         try:
@@ -179,6 +234,13 @@ def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
                 if cancel.wait(delay):
                     log.info("分析任务在错峰等待期被停止 chat=%s kind=%s", chat_id, kind)
                     return
+            if is_review:
+                while _other_analysis_active():
+                    if cancel.wait(_REVIEW_YIELD_POLL_SECONDS):
+                        break
+            if cancel.is_set():
+                log.info("分析任务在排队期被停止 chat=%s kind=%s", chat_id, kind)
+                return
             fn(*args, task_id, cancel)
         except Exception:
             log.exception("分析任务出错 chat=%s kind=%s", chat_id, kind)
@@ -186,10 +248,22 @@ def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
             with _analysis_lock:
                 _analysis_tasks.pop(task_id, None)
 
-    _analysis_pool.submit(_run)
-    if delay > 0:
-        send(chat_id, f"⏳ 已排队：本场约 {delay}s 后开始"
-                      f"（错峰发起，避免多场同时打满单个 key 的限流）")
+    (_review_pool if is_review else _analysis_pool).submit(_run)
+    if is_review:
+        busy = _other_analysis_active()
+        if reviews_ahead or busy:
+            ahead = (f"前面还有 {reviews_ahead} 场复盘" if reviews_ahead
+                     else "有精算在跑")
+            send(chat_id,
+                 f"⏳ 复盘已排队：{ahead}。复盘一场一场做，精算优先。",
+                 {"inline_keyboard": [[
+                     {"text": "🛑 取消排队",
+                      "callback_data": f"stopan:{task_id}"}]]})
+    elif delay >= 1:
+        why = ("等第一场写入缓存后一起发，省输入额度"
+               if _heavy_route_group(chat_id).startswith("cpa_")
+               else "错峰发起，避免多场同时打满单个 key 的限流")
+        send(chat_id, f"⏳ 已排队：本场约 {delay:.0f}s 后开始（{why}）")
     return task_id
 
 
@@ -2417,7 +2491,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     if eff_label:
         tag += f"·{eff_label}"
     title = (f"⏳ 正在精算 {meta['home']} vs {meta['away']}"
-             f"（{tag}，{_tier_model_label(chat_id)}，约 1~3 分钟）")
+             f"（{tag}，{_tier_model_label(chat_id)}，重档约 2~8 分钟）")
     if extra_instruction.strip():
         title += f"\n侧重：{extra_instruction.strip()[:80]}"
     total = analyzer._TOTAL_STAGES
@@ -2439,6 +2513,7 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
 
     msg_id = send(chat_id, progress_text(1, "数据提取"), stop_kb)
     report = None
+    queued_shown = False
     _visitor = not _is_admin(chat_id)
     _llm_audit(chat_id, "analyze", "heavy", fid=fid, effort=effort)
     for ev in analyzer.analyze_stream(csv_str, funds, meta["home"],
@@ -2458,6 +2533,13 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
             done_stages = [analyzer._STAGE_NAMES[i] for i in range(1, n)]
             if msg_id:
                 edit_text(chat_id, msg_id, progress_text(n, name), stop_kb)
+        elif ev[0] == "queued":
+            # 重档并发已满：首次进入排队时提示一次（之后每 2s 的事件只用于检查停止键）
+            if msg_id and not queued_shown:
+                queued_shown = True
+                edit_text(chat_id, msg_id,
+                          title + "\n\n⏳ 排队中：该供应商的重档并发已满，"
+                                  "前面的场次出完就开始。", stop_kb)
         elif ev[0] == "done":
             report = ev[1]
         elif ev[0] == "warning":

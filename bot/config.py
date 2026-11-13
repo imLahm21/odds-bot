@@ -990,6 +990,34 @@ FULL_CONSULT_RESCUE_DEFAULTS = {
 FULL_CONSULT_MAX_WORKERS = 4
 FULL_CONSULT_TIMEOUT = 300
 
+# ─── 重档并发上限（按供应商授权组）───────────────────────────────────────────
+# 同一授权组同时在跑的【重档/全模型】请求数上限；超出的在 llm_client 里排队，
+# 不直接发出去撞上游限流。轻档（走地 1min 循环）与平衡档（基本面预览）不占名额、
+# 也不排队——它们要的是秒级响应，不能被 7~8 分钟一场的重档精算堵住。
+# 依据（2026-11 实测）：CPA 的 GPT 组背后只有 1 个 Plus + 1 个 Free Codex 账号，
+# Astra 单场 420~495s；27 分钟窗口内要出 4~6 场，至少需要 3 路并行（两波 ≈ 17 分钟）。
+# 未列出的组按「每条已配置 key × LLM_GROUP_CONCURRENT_PER_KEY」计。
+# 服务器 .env 可覆盖：LLM_GROUP_MAX_CONCURRENT=cpa_gpt:3,cpa_gemini:4
+LLM_GROUP_MAX_CONCURRENT: dict[str, int] = {
+    "cpa_gpt": 3,
+    "cpa_gemini": 3,
+    "cpa_claude": 2,
+    **_parse_model_token_limits(os.getenv("LLM_GROUP_MAX_CONCURRENT", "")),
+}
+LLM_GROUP_CONCURRENT_PER_KEY = 2
+
+
+def llm_model_is_light(model: str) -> bool:
+    """模型是否登记在轻档池（走地用的快模型）；这类请求不受重档并发上限约束。"""
+    return "light" in ((LLM_MODELS.get(model) or {}).get("tiers") or ())
+
+
+# 缓存预热错峰：同一 CPA 组连点多场时，第一场立即发，其余各场只等到
+# 「第一场发出后 N 秒」再一起发，让它们吃到第一场写入的输入前缀缓存
+# （规则库 system prompt 约占输入一半；实测 Gemini 间隔 43s 的第二场命中 9.3 万缓存 token）。
+# 设 0 关闭。IK 组仍按 tgbot 的递增错峰（多 key 按分钟限流）。
+LLM_CACHE_WARMUP_SECONDS = _typesafe_nonnegative_int("LLM_CACHE_WARMUP_SECONDS", 25)
+
 # ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
 # 这里是这 10 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、
 # llm_client 无 DB 值时兜底也读它。修改默认/范围只改这一处。

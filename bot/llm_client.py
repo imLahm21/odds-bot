@@ -881,6 +881,74 @@ def _headers(ep: dict) -> dict:
 _CONNECT_TIMEOUT = 10   # 连接超时（秒），与读超时分开
 
 
+# ─── 重档并发上限（按授权组的信号量）────────────────────────────────────────
+# 只约束重档/全模型的长请求；轻档与平衡档直接放行（见 config.LLM_GROUP_MAX_CONCURRENT）。
+_QUEUED_EVENT = "queued"
+_QUEUE_POLL_SECONDS = 2.0
+_group_slots: dict[str, threading.BoundedSemaphore] = {}
+_group_slots_lock = threading.Lock()
+
+
+def group_concurrency_limit(route_group: str) -> int:
+    """某授权组的重档并发上限：显式登记 > 每条已配置 key × 每 key 并发。"""
+    explicit = config.LLM_GROUP_MAX_CONCURRENT.get(route_group)
+    if explicit:
+        return max(1, int(explicit))
+    keys = sum(1 for ep in _ENDPOINTS if ep["route_group"] == route_group)
+    return max(1, keys * int(config.LLM_GROUP_CONCURRENT_PER_KEY))
+
+
+def _group_slot(route_group: str) -> threading.BoundedSemaphore:
+    with _group_slots_lock:
+        slot = _group_slots.get(route_group)
+        if slot is None:
+            slot = threading.BoundedSemaphore(group_concurrency_limit(route_group))
+            _group_slots[route_group] = slot
+        return slot
+
+
+def _limited_chat(limited: bool, ep: dict, payload: dict, read_to: int,
+                  max_retries: int, request_id: str = ""):
+    """_do_chat 外包一层组内并发上限；排队时间不计入读超时。"""
+    if not limited:
+        return _do_chat(ep, payload, read_to, max_retries, request_id)
+    slot = _group_slot(ep["route_group"])
+    started = monotonic()
+    slot.acquire()
+    try:
+        waited = monotonic() - started
+        if waited >= 1:
+            log.info("LLM排队结束 request=%s group=%s waited=%.0fs",
+                     request_id or "-", ep["route_group"], waited)
+        return _do_chat(ep, payload, read_to, max_retries, request_id)
+    finally:
+        slot.release()
+
+
+def _limited_stream(limited: bool, ep: dict, payload: dict, first_byte_to: int,
+                    idle_to: int, max_retries: int = 0):
+    """_stream_one 外包一层组内并发上限。
+
+    排队期间每 _QUEUE_POLL_SECONDS 秒 yield 一次 ('queued', 已等秒数)，
+    让上层（tgbot 的停止按钮）在排队时也能中断；消费方提前退出时由 finally 归还名额。
+    """
+    if not limited:
+        yield from _stream_one(ep, payload, first_byte_to, idle_to, max_retries)
+        return
+    slot = _group_slot(ep["route_group"])
+    started = monotonic()
+    while not slot.acquire(timeout=_QUEUE_POLL_SECONDS):
+        yield (_QUEUED_EVENT, int(monotonic() - started))
+    try:
+        waited = monotonic() - started
+        if waited >= 1:
+            log.info("LLM排队结束 group=%s endpoint=%s waited=%.0fs",
+                     ep["route_group"], ep["label"], waited)
+        yield from _stream_one(ep, payload, first_byte_to, idle_to, max_retries)
+    finally:
+        slot.release()
+
+
 # ─── 阻塞调用（带端点内重试 + 跨端点故障转移）────────────────────────────────
 def _do_chat(ep: dict, payload: dict, read_to: int,
              max_retries: int, request_id: str = "") \
@@ -1055,8 +1123,8 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                      ep["route_group"], ep["label"])
             payload = _payload(model, system, user, tok, effort, False,
                                ep["route_group"])
-            content, ok, err, was_to, rate_limited, token_exhausted = _do_chat(
-                ep, payload, read_to, max_retries, request_id)
+            content, ok, err, was_to, rate_limited, token_exhausted = _limited_chat(
+                tier == "heavy", ep, payload, read_to, max_retries, request_id)
             if token_exhausted:
                 # 换同一模型的另一条 key 不会改变 prompt/effort/token 预算，只会重复
                 # 消耗；直接结束该模型并进入已配置的回退模型。不要污染端点熔断状态。
@@ -1301,9 +1369,12 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                                ep["route_group"])
             produced = False        # 是否已向用户吐过正文 delta
             usage_logged = False
-            for ev in _stream_one(ep, payload, first_byte_to, idle_to,
-                                  int(st["max_retries"])):
-                if ev[0] == "delta":
+            for ev in _limited_stream(tier == "heavy", ep, payload,
+                                      first_byte_to, idle_to,
+                                      int(st["max_retries"])):
+                if ev[0] == _QUEUED_EVENT:
+                    yield ev        # 排队中：透传给上层显示并检查停止键
+                elif ev[0] == "delta":
                     produced = True
                     yield ev
                 elif ev[0] == _USAGE_EVENT:
@@ -1408,8 +1479,8 @@ def chat_model(system: str, user: str, model: str, effort: str = "",
                      current_model, ep["route_group"], ep["label"])
             payload = _payload(current_model, system, user, tok, effort,
                                False, ep["route_group"])
-            content, ok, err, was_to, rate_limited, token_exhausted = _do_chat(
-                ep, payload, read_to, max_retries, request_id)
+            content, ok, err, was_to, rate_limited, token_exhausted = _limited_chat(
+                not config.llm_model_is_light(current_model), ep, payload, read_to, max_retries, request_id)
             if token_exhausted:
                 raw_errs.append(err)
                 labeled.append(f"{ep['label']}({current_model})：{err}")
@@ -1489,9 +1560,12 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                                True, ep["route_group"])
             endpoint_produced = False
             usage_logged = False
-            for ev in _stream_one(ep, payload, first_byte_to, idle_to,
-                                  int(st["max_retries"])):
-                if ev[0] == "delta":
+            for ev in _limited_stream(
+                    not config.llm_model_is_light(current_model), ep, payload,
+                    first_byte_to, idle_to, int(st["max_retries"])):
+                if ev[0] == _QUEUED_EVENT:
+                    yield ev
+                elif ev[0] == "delta":
                     if not endpoint_produced and on_model_used is not None:
                         on_model_used(current_model, current_effort)
                     endpoint_produced = True
