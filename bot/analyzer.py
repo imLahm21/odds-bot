@@ -14,7 +14,7 @@ import threading
 
 from dotenv import load_dotenv
 
-from . import config, llm_client, goals_model, typesafe_decisions, report_display
+from . import config, focus, llm_client, goals_model, typesafe_decisions, report_display
 
 load_dotenv()
 log = logging.getLogger("odds_bot.analyzer")
@@ -30,12 +30,14 @@ def _start_typesafe_shadow(target, *args, name: str) -> None:
 
 
 def finalize_decision(report: str, home: str = "", away: str = "",
-                      league: str = "") -> str:
+                      league: str = "", *, modes: tuple[str, ...] = ()) -> str:
     """生成时定第 8 节选中项（TYPESAFE_DECISION_MODE）：
       off    —— 原样返回，沿用报告模型自己的选择；
       shadow —— 原样返回，后台跑一遍 Jev 选定并记 TYPESAFE_SHADOW 日志；
       active —— 代码筛 eligible 且 edge>0 的候选 → Jev 在其中 + PASS 选定
                 → Jev 失败/低置信度退回 edge 最高 → 改写第 8 节并嵌入 decision_final。
+    modes：自定义侧重模式（focus.MODES 的 key），active 时透传给 select_decision；
+    conservative 不下探索注。off/shadow 行为不变。
     任何异常都退回原报告，不影响精算主流程。"""
     mode = config.TYPESAFE_DECISION_MODE
     if mode == "off" or not (report or "").strip():
@@ -49,7 +51,8 @@ def finalize_decision(report: str, home: str = "", away: str = "",
         selection = typesafe_decisions.select_decision(
             report, home, away, league,
             min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE,
-            explore_allowed=_explore_budget_left())
+            explore_allowed=("conservative" not in modes) and _explore_budget_left(),
+            modes=modes)
         typesafe_decisions.log_selection(report, selection)
         if selection is None:
             log.warning("第 8 节候选表无法解析，保留报告模型的选择")
@@ -60,6 +63,24 @@ def finalize_decision(report: str, home: str = "", away: str = "",
     except Exception as exc:
         log.warning("生成时选定失败（%s），保留原报告", type(exc).__name__)
         return report
+
+
+FOCUS_MISSING_SECTION_9_NOTE = "\n\n> ⚠️ 模型未输出「### 9. 侧重专题」，本次侧重可能未被回应。"
+
+
+def _finalize_with_focus(report: str, home: str, away: str, league: str,
+                         extra_instruction: str = "") -> str:
+    """finalize_decision + 侧重标记：按侧重模式定稿，在「## 赛事：」行后标注本场侧重；
+    有侧重但模型漏写第 9 节时在末尾提示。无侧重时与 finalize_decision 完全一致。"""
+    focus_obj = focus.parse(extra_instruction)
+    if focus_obj.modes:
+        report = finalize_decision(report, home, away, league, modes=focus_obj.modes)
+    else:
+        report = finalize_decision(report, home, away, league)
+    report = focus.stamp(report, focus_obj)
+    if not focus_obj.empty and not focus.has_section_9(report):
+        report += FOCUS_MISSING_SECTION_9_NOTE
+    return report
 
 
 def _cst_day() -> str:
@@ -389,9 +410,11 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
                      input_metrics: dict | None = None) -> tuple[str, str]:
     """构造精算的 (system, user) prompt，供阻塞版与流式版共用。
 
-    extra_instruction: 用户自定义侧重，非空时追加到标准任务说明之后；
-    明确要求不违背 SOP 与输出格式，以保护进度条依赖的 ### 1~8 段落结构。
+    extra_instruction: 用户自定义侧重（focus.encode 编码的模式 + 自由文字）。
+    为空时 system/user 与不带侧重的预设精算逐字相同；非空时只在 user 最末尾
+    追加代码计算段（大小球/波胆）与「本场侧重任务」段，要求在第 9 节回应。
     """
+    focus_obj = focus.parse(extra_instruction)
     # 主题防错规则按本场条件加载：联赛决定是否要中超专项，基本面文本里
     # 有无 H2H/近况决定是否要那两个主题（判据保守——拿不准就加载）。
     fund = fundamentals or ""
@@ -421,20 +444,24 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         "假设表以其为准，你只负责解释与写报告，不自行增删触发的假设。"
         "不要编造数据，缺失部分明确标注「无数据」（计入数据质量的基本面缺块扣分）。"
     )
-    if extra_instruction.strip():
-        system += (
-            "\n\n===== 用户额外侧重 =====\n"
-            "在不违背上述 SOP 步骤与「输出格式」章节结构（必须保留 ### 1~8 各段标题）"
-            "的前提下，优先满足以下用户要求：\n" + extra_instruction.strip()
-        )
+    # 侧重不进 system：带/不带侧重的 system 完全相同，可命中同一份输入缓存；
+    # 侧重任务段放在 user 最末尾（见 focus_task_block），避免被十几万字规则和数据淹没。
+    st = goals_model.states_from_csv(csv_text)
     user = (
         f"## 比赛：{home} vs {away}\n## 联赛：{league}\n\n"
         f"### 盘口快照（CSV）\n{csv_text}\n\n"
-        f"{goals_model.format_states_block(goals_model.states_from_csv(csv_text))}\n"
+        f"{goals_model.format_states_block(st)}\n"
         f"{market_hypotheses_block(csv_text, league)}"
         f"{candidates_block(csv_text, league, home, away)}"
         f"### 基本面\n{fundamentals}\n"
     )
+    if not focus_obj.empty:
+        if "ou" in focus_obj.modes:
+            user += "\n" + goals_model.format_total_goals_block(st)
+        if "score" in focus_obj.modes:
+            user += "\n" + goals_model.format_score_block(
+                st, config.FOCUS_SCORE_TOP_N, config.FOCUS_SCORE_VALUE_MARGIN)
+        user += "\n" + focus_task_block(focus_obj)
     if input_metrics is not None:
         input_metrics.update({
             "rule_chars": len(rules),
@@ -442,6 +469,68 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
             "fundamentals_chars": len(fund),
         })
     return system, user
+
+
+# 第 9 节各模式的专题模板行（docs/自定义侧重优化计划.md 3.3）
+_FOCUS_SECTION_LINES = {
+    "ou": (
+        "- **大小球专题**：主线与相邻线的去抽水概率与初→终变化；照抄「总进球分布」的数字；\n"
+        "  两队近况的进失球（引用事实表）；第 8 节各大小球候选的 edge 排序；"
+        "结论 [大 / 小 / 无倾向] 及理由"
+    ),
+    "score": (
+        "- **波胆专题**：照抄「比分概率表」；给出 2~3 个首选比分及理由"
+        "（须与大小球、胜平负判定不矛盾）；\n"
+        "  固定写「波胆无市场报价，以下为模型公平赔率；BCG 报价 ≥ 表中下限才有价值」"
+    ),
+    "aggressive": "- **口径**：激进——凯利分数 ×2（上限 1/2），方向与候选不变",
+    "conservative": "- **口径**：保守——凯利分数减半，不下探索注",
+}
+
+
+def focus_task_block(focus_obj: "focus.Focus") -> str:
+    """「本场侧重任务」段：放在输入最末尾，要求在第 8 节之后新增第 9 节回应侧重。
+    空侧重返回 ""。multi_analyzer 的合并提示词也复用本段。"""
+    if focus_obj.empty:
+        return ""
+    lines = [
+        "===== 本场侧重任务（最后阅读，必须执行）=====",
+        f"本场用户选择的侧重：{focus.label(focus_obj)}",
+        "",
+        "【权限】侧重不改变证据四层：方向仍只来自「已验证」假设或基本面明文覆盖；",
+        "p_最终、候选表数字、选中项与注额由规则和代码决定，"
+        "不要为了迎合侧重而改动第 1~8 节的数字。",
+    ]
+    if "score" in focus_obj.modes:
+        lines.append("波胆无市场报价，不进第 8 节候选表、不算 edge。")
+    if focus_obj.text:
+        lines += [
+            "",
+            "【用户补充文字的处理】",
+            f"用户原文：{focus_obj.text}",
+            "· 其中的事实陈述（伤停、首发、天气、战意、消息）记为「用户提供·未核实」，归入基本面层，",
+            "  可以参与基本面覆盖条件的判断；凡结论用到它，第 7 节四层判断行、关键依据和第 9 节"
+            "都要写明「用户提供·未核实」。",
+            "  若方向依赖该信息成立，第 7 节风险提示写「方向依赖未核实信息」。",
+            "· 其中的关注点要求（深挖某节点、某玩法）在第 9 节展开。",
+            "· 其中的情景假设（如果…怎么办）在第 9 节分情景作答，不改当前结论。",
+        ]
+    lines += [
+        "",
+        "【输出】在 `### 8. 投注决策` 之后、归档路径行之前，新增一节：",
+        "### 9. 侧重专题",
+        "- **侧重复述**：{一句话}",
+    ]
+    for key in focus_obj.modes:
+        if key in _FOCUS_SECTION_LINES:
+            lines.append(_FOCUS_SECTION_LINES[key])
+    if focus_obj.conflict:
+        lines.append("- **口径**：激进与保守同时出现，按常规口径")
+    if focus_obj.text:
+        lines.append("- **补充信息与关注点**：[逐条回应；用户提供的事实标「用户提供·未核实」"
+                     "并说明是否触发基本面覆盖]")
+    lines.append("- **对第 7、8 节的影响**：[逐条写改了什么；按四层规则不能改的写明原因]")
+    return "\n".join(lines) + "\n"
 
 
 def analyze(csv_text: str, fundamentals: str,
@@ -458,7 +547,8 @@ def analyze(csv_text: str, fundamentals: str,
     report = _call_llm(system, user, effort, tier="heavy", visitor=visitor,
                        input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
-        report = finalize_decision(report, home, away, league)
+        report = _finalize_with_focus(report, home, away, league,
+                                      extra_instruction)
         has_h2h, has_form = fund_has(fundamentals)
         mf = rules_manifest(
             league_name=league, has_h2h=has_h2h, has_form=has_form)
@@ -1276,7 +1366,8 @@ def analyze_stream(csv_text: str, fundamentals: str,
             has_h2h, has_form = fund_has(fundamentals)
             mf = rules_manifest(
                 league_name=league, has_h2h=has_h2h, has_form=has_form)
-            report = finalize_decision(payload, home, away, league)
+            report = _finalize_with_focus(payload, home, away, league,
+                                          extra_instruction)
             yield ("done", report + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)

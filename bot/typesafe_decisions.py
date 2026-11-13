@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from . import config
+from . import config, focus
 
 log = logging.getLogger("odds_bot.typesafe_decisions")
 _LESSONS_DIR = Path(__file__).resolve().parents[1] / "rules" / "实战教训"
@@ -968,10 +968,13 @@ class DecisionSelection:
     signal: str | None = None               # 第 7 节信号强度（已按登记表封顶）；旧报告 None
     quality: int | None = None              # 第 7 节数据质量 0~100；旧报告 None
     tier: str = "pass"                      # value / explore / pass
+    focus_modes: tuple[str, ...] = ()       # 自定义侧重模式（focus.MODES 的 key）
+    focus_note: str = ""                    # 侧重对定稿做了什么调整（多条用「；」连接）
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candidates", tuple(self.candidates))
         object.__setattr__(self, "positive_ids", tuple(self.positive_ids))
+        object.__setattr__(self, "focus_modes", tuple(self.focus_modes))
 
 
 def extract_conclusion_section(report: str) -> str | None:
@@ -1173,6 +1176,7 @@ def select_decision(
     min_confidence: float | None,
     use_jev: bool = True,
     explore_allowed: bool = True,
+    modes: tuple[str, ...] = (),
 ) -> DecisionSelection | None:
     """三档决策（SOP 7.5 第 6 条）：
       价值注 —— 有 eligible 且 edge>0 的候选：Jev 在正 edge 候选 + PASS 中选；
@@ -1180,10 +1184,16 @@ def select_decision(
       探索注 —— 无正 edge 但有 eligible 候选 edge ≥ EXPLORE_MIN_EDGE：取 edge 最高的一项，
                 固定平注 EXPLORE_STAKE，不调 Jev（explore_allowed=False 时跳过，如已达日上限）；
       空仓   —— 以上都不满足，或数据质量 < QUALITY_MIN_TO_BET。
+    modes（自定义侧重，见 bot/focus.py）：
+      ou           —— 价值档/探索档有大小球候选时只在其中选，没有则按常规；
+      aggressive   —— 价值注 k ×FOCUS_AGGRESSIVE_K_MULT，上限 FOCUS_K_MAX；
+      conservative —— 价值注 k ×FOCUS_CONSERVATIVE_K_MULT，且不下探索注。
+    任何模式都不绕过数据质量门槛。modes=() 时与未加侧重前完全一致。
     候选表无法解析时返回 None（报告保持原样，串关抽取走既有 fallback）。"""
     pool = _selection_pool(report)
     if pool is None:
         return None
+    modes = tuple(modes or ())
     candidates, evidence = pool
     raw_signal = parse_signal_strength(report)
     signal = effective_signal(raw_signal)
@@ -1197,21 +1207,44 @@ def select_decision(
         "positive_ids": tuple(c.candidate_id for c in positives),
         "signal": signal,
         "quality": quality,
+        "focus_modes": modes,
     }
+    notes: list[str] = []
+
+    def make(**kwargs: Any) -> DecisionSelection:
+        return DecisionSelection(focus_note="；".join(notes), **kwargs, **common)
+
     if quality is not None and quality < config.QUALITY_MIN_TO_BET:
-        return DecisionSelection(
-            selected_id="PASS", candidate=None, source="low_quality",
-            fallback_reason="", k=0.0, stake=0.0, **common)
+        return make(selected_id="PASS", candidate=None, source="low_quality",
+                    fallback_reason="", k=0.0, stake=0.0)
+    if "conservative" in modes:
+        explore_allowed = False
     if not positives:
-        explore = _explore_candidate(candidates) if explore_allowed else None
+        explore = None
+        if explore_allowed:
+            if "ou" in modes:
+                explore = _explore_candidate(
+                    tuple(c for c in candidates if focus.is_ou_play(c.play)))
+                notes.append("大小球重点：仅在大小球候选中选定" if explore is not None
+                             else "大小球重点：大小球无合格候选，按常规选定")
+            if explore is None:
+                explore = _explore_candidate(candidates)
+        elif "conservative" in modes:
+            notes.append("保守口径：不下探索注")
         if explore is not None:
-            return DecisionSelection(
-                selected_id=explore.candidate_id, candidate=explore, source="explore",
-                fallback_reason="", k=0.0, stake=round(config.EXPLORE_STAKE, 1),
-                tier="explore", **common)
-        return DecisionSelection(
-            selected_id="PASS", candidate=None, source="no_positive_edge",
-            fallback_reason="", k=0.0, stake=0.0, **common)
+            return make(selected_id=explore.candidate_id, candidate=explore,
+                        source="explore", fallback_reason="", k=0.0,
+                        stake=round(config.EXPLORE_STAKE, 1), tier="explore")
+        return make(selected_id="PASS", candidate=None, source="no_positive_edge",
+                    fallback_reason="", k=0.0, stake=0.0)
+
+    if "ou" in modes:
+        ou_positives = [c for c in positives if focus.is_ou_play(c.play)]
+        if ou_positives:
+            positives = ou_positives          # Jev 与 edge 最高规则都只在大小球候选里选
+            notes.append("大小球重点：仅在大小球候选中选定")
+        else:
+            notes.append("大小球重点：大小球无合格候选，按常规选定")
 
     judgment: ChoiceJudgment | None = None
     reason: str | None = "jev_disabled"
@@ -1229,10 +1262,9 @@ def select_decision(
         elif judgment.confidence < min_confidence:
             fallback = "low_confidence"
         elif judgment.choice == "PASS":
-            return DecisionSelection(
+            return make(
                 selected_id="PASS", candidate=None, source="jev_pass",
-                fallback_reason="", k=0.0, stake=0.0, judgment=judgment,
-                **common)
+                fallback_reason="", k=0.0, stake=0.0, judgment=judgment)
         else:
             chosen = next(
                 (c for c in positives if c.candidate_id == judgment.choice), None)
@@ -1242,29 +1274,34 @@ def select_decision(
                 source, fallback = "jev", ""
     if chosen is None:
         if _model_pick_is_pass(report):
-            return DecisionSelection(
+            return make(
                 selected_id="PASS", candidate=None, source="model_pass",
-                fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment,
-                **common)
+                fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment)
         chosen = max(positives, key=lambda c: c.edge)   # 并列取表中靠前者
 
     k = kelly_fraction(signal, quality, evidence=evidence,
                        confidence_score=confidence_score)
+    if "aggressive" in modes:
+        # 上限只封顶加倍后的值，不会把原本已更高的 k 压低
+        k = min(k * config.FOCUS_AGGRESSIVE_K_MULT, max(config.FOCUS_K_MAX, k))
+        notes.append(f"激进口径：凯利分数 ×{config.FOCUS_AGGRESSIVE_K_MULT:g}"
+                     f"（上限 {_k_label(config.FOCUS_K_MAX)}）")
+    if "conservative" in modes:
+        k = k * config.FOCUS_CONSERVATIVE_K_MULT
+        notes.append(f"保守口径：凯利分数 ×{config.FOCUS_CONSERVATIVE_K_MULT:g}，不下探索注")
     if k <= 0:
-        return DecisionSelection(
+        return make(
             selected_id="PASS", candidate=None, source="zero_kelly",
-            fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment,
-            **common)
+            fallback_reason=fallback, k=0.0, stake=0.0, judgment=judgment)
     stake = stake_for(chosen, k)
     if stake <= 0:                    # 薄 edge × 高赔率：注额舍入到 $0.0，等同空仓
-        return DecisionSelection(
+        return make(
             selected_id="PASS", candidate=None, source="zero_stake",
-            fallback_reason=fallback, k=k, stake=0.0, judgment=judgment,
-            **common)
-    return DecisionSelection(
+            fallback_reason=fallback, k=k, stake=0.0, judgment=judgment)
+    return make(
         selected_id=chosen.candidate_id, candidate=chosen, source=source,
         fallback_reason=fallback, k=k, stake=stake,
-        judgment=judgment, tier="value", **common)
+        judgment=judgment, tier="value")
 
 
 def _explore_candidate(
@@ -1294,6 +1331,13 @@ def _fallback_label(reason: str) -> str:
     if reason.startswith("request_error:"):
         return f"调用失败（{reason.split(':', 1)[1]}）"
     return _FALLBACK_LABELS.get(reason, reason or "未知原因")
+
+
+def _focus_k_tail(raw_k: float, k: float) -> str:
+    """k 被侧重口径调整过时，注额说明末尾补「；侧重口径 ×倍数 → k=…」，便于对数。"""
+    if raw_k <= 0 or abs(k - raw_k) < 1e-12:
+        return ""
+    return f"；侧重口径 ×{k / raw_k:g} → k={k:g}"
 
 
 def _selection_block(selection: DecisionSelection) -> list[str]:
@@ -1341,6 +1385,8 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
             f"- **选中项**：{candidate.play} @ {candidate.odds:.2f}"
             f"（edge {candidate.edge:+.1%}，p_最终 {candidate.p_final:.1%}）")
     lines.append(f"- **决策来源**：{source_line}")
+    if selection.focus_note:
+        lines.append(f"- **侧重调整**：{selection.focus_note}")
     if candidate is None:
         lines.append("- **注额**：pass，空仓")
     elif selection.tier == "explore":
@@ -1350,21 +1396,28 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
     elif selection.signal is not None:
         quality = selection.quality if selection.quality is not None else config.QUALITY_DEFAULT
         base = config.SIGNAL_BASE_K.get(selection.signal, config.SIGNAL_BASE_K["none"])
+        raw_k = base * quality_factor(selection.quality)
+        focus_tail = _focus_k_tail(raw_k, selection.k)
         lines.append(
             f"- **注额**：${selection.stake:.1f}"
             f"（价值注；k={_k_label(base)}（信号强度"
             f"{_EVIDENCE_LABELS.get(selection.signal, selection.signal)}）"
-            f"×{quality_factor(selection.quality):g}（数据质量 {quality}）={selection.k:g}"
-            f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，已截单注上限）")
+            f"×{quality_factor(selection.quality):g}（数据质量 {quality}）"
+            f"={(raw_k if focus_tail else selection.k):g}"
+            f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，已截单注上限"
+            f"{focus_tail}）")
     else:
         # 旧格式报告：证据强度定 k，过渡期上限 1/8
+        raw_k = kelly_fraction(None, None, evidence=selection.evidence,
+                               confidence_score=selection.confidence_score)
+        focus_tail = _focus_k_tail(raw_k, selection.k)
         lines.append(
             f"- **注额**：${selection.stake:.1f}"
-            f"（k={_k_label(selection.k)}，证据强度"
+            f"（k={_k_label(raw_k if focus_tail else selection.k)}，证据强度"
             f"{_EVIDENCE_LABELS.get(selection.evidence, selection.evidence)}，过渡期上限 1/8"
             + (f"，置信度 {selection.confidence_score}" if selection.confidence_score is not None else "")
             + f"；本金 {config.PARLAY_STAKE_BANKROLL:.0f}×k×edge/(赔率−1)，"
-              f"已截单注上限）")
+              f"已截单注上限{focus_tail}）")
     payload = {
         "schema": "decision_final/1",
         "selected_id": selection.selected_id,
@@ -1383,6 +1436,9 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
         "fallback_reason": selection.fallback_reason,
         "jev_confidence": judgment.confidence if judgment else None,
     }
+    if selection.focus_modes:
+        # 只增不改（schema 仍为 decision_final/1）；无侧重时不写，预设精算报告逐字不变
+        payload["focus"] = list(selection.focus_modes)
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False).replace("-->", "--\\u003e")
     # 注释放在段首：放在注额行之后会被注额解析当作续行（含 "pass" 字样）
@@ -1398,7 +1454,7 @@ _MODEL_PICK_LABELS = (
 _MODEL_SELECTED_ID_RE = re.compile(r"^\s*[-*]\s*\*\*选中候选\s*ID(?:\*\*|\s*[：:])")
 # 代码写入的最终选定段（紧跟 decision_final 注释的四行）
 _PRIOR_BLOCK_LINE_RE = re.compile(
-    r"^- \*\*(?:选中候选 ID|选中项|决策来源|注额)\*\*：")
+    r"^- \*\*(?:选中候选 ID|选中项|决策来源|侧重调整|注额)\*\*：")
 
 
 def _strip_prior_selection_block(section: str) -> str:

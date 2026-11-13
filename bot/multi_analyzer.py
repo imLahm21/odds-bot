@@ -11,7 +11,7 @@ from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from . import analyzer, config, db, full_model_settings, llm_client
+from . import analyzer, config, db, focus, full_model_settings, llm_client
 
 log = logging.getLogger("odds_bot.multi_analyzer")
 
@@ -62,9 +62,19 @@ def _read_rules(kind: str) -> str:
     return text
 
 
+def _focus_enabled(bundle: dict) -> bool:
+    """本次运行是否把 extra_instruction 当作用户侧重解析。
+    复盘盲推传入的是系统写的盲推说明（不是用户侧重），不走侧重任务段与第 9 节。"""
+    return bool(bundle.get("focus_enabled", True))
+
+
 def _json_instruction(module_id: str, role: str,
-                      extra_instruction: str) -> str:
-    focus = extra_instruction.strip() or "无额外侧重。"
+                      extra_instruction: str, *, review: bool = False) -> str:
+    # 复盘模块的侧重保持原文（本次不改复盘侧重逻辑）；精算模块用解析后的侧重标签
+    if review:
+        focus_text = extra_instruction.strip() or "无额外侧重。"
+    else:
+        focus_text = focus.label(focus.parse(extra_instruction)) or "无额外侧重。"
     return (
         "你是全模型交叉精算中的【%s】。模块ID=%s。\n"
         "只分析本模块职责，不生成完整赛前报告，不替其他模块下结论。\n"
@@ -77,7 +87,7 @@ def _json_instruction(module_id: str, role: str,
         "not_applicable。\n"
         "用户自定义侧重：%s\n"
         "自定义侧重只能改变关注重点，不能违反项目SOP或证据层权限。"
-    ) % (role, module_id, focus)
+    ) % (role, module_id, focus_text)
 
 
 def _review_module_input(task: dict, bundle: dict) -> str:
@@ -124,7 +134,7 @@ def _review_module_system(task: dict, bundle: dict) -> str:
         "盲推写「无倾向」不算判错。\n"
     )
     return rules + task_rule + _json_instruction(
-        module_id, task["label"], bundle.get("extra_instruction", ""))
+        module_id, task["label"], bundle.get("extra_instruction", ""), review=True)
 
 
 def _module_input(task: dict, bundle: dict) -> str:
@@ -177,7 +187,8 @@ def _module_system(task: dict, bundle: dict) -> str:
         rules = ("数据审计只负责节点完整度、时间分类、字段缺失和报价同步性，"
                  "不得预测赛果。")
     return rules + "\n\n===== 模块任务 =====\n" + _json_instruction(
-        module_id, role, bundle.get("extra_instruction", ""))
+        module_id, role, bundle.get("extra_instruction", ""),
+        review=not _focus_enabled(bundle))
 
 
 def _parse_json(raw: str) -> tuple[dict | None, str]:
@@ -389,13 +400,15 @@ def _audit_input(bundle: dict, report: str, cards: list[dict]) -> str:
     )
 
 
-def _basic_report_issues(report: str) -> list[str]:
+def _basic_report_issues(report: str, focus_required: bool = False) -> list[str]:
     issues = []
     for number in range(1, 9):
         if not re.search(rf"(?m)^###\s*{number}\s*[.、]", report or ""):
             issues.append(f"缺少 ### {number} 主段")
     if report and "### 8. 投注决策" not in report:
         issues.append("缺少 ### 8. 投注决策")
+    if focus_required and not focus.has_section_9(report):
+        issues.append("缺少 ### 9. 侧重专题")
     if len(report or "") < 500:
         issues.append("报告正文过短")
     return issues
@@ -403,14 +416,16 @@ def _basic_report_issues(report: str) -> list[str]:
 
 def _audit_report(bundle: dict, report: str, cards: list[dict], *,
                   spec: dict | None = None, excluded_models=(), rescue: dict | None = None) -> dict:
-    deterministic = _basic_report_issues(report)
+    deterministic = _basic_report_issues(
+        report, focus_required=_focus_enabled(bundle)
+        and not focus.parse(bundle.get("extra_instruction", "")).empty)
     system = (
         "你是最终报告审计员。只输出合法JSON，不要Markdown。\n"
         "检查报告是否遵守项目SOP的证据四层：市场层只给 p_市场 基准、不定方向；"
         "方向只来自「已验证」假设或基本面明文覆盖条件，两者都没有时各判定必须写「无倾向」；"
         "「假设」「观察中」只记录命中；数据质量只影响注额。"
         "检查第1到第8节、第7节的信号强度与数据质量两行、数据缺失、edge、Kelly、"
-        "档位（价值注/探索注/空仓）、比分和用户自定义侧重。不要重写报告。\n"
+        "档位（价值注/探索注/空仓）、比分，以及有侧重时第 9 节是否逐条回应。不要重写报告。\n"
         '{"ok":true,"issues":[{"section":"7","problem":"...",'
         '"required_fix":"..."}]}'
     )
@@ -431,11 +446,20 @@ def _audit_report(bundle: dict, report: str, cards: list[dict], *,
 
 def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
     metrics: dict[str, int] = {}
+    instruction = bundle.get("extra_instruction", "")
+    focus_on = _focus_enabled(bundle)
     system, user = analyzer._analyze_prompts(
         bundle["csv_text"], bundle["fundamentals"], bundle["home"],
-        bundle["away"], bundle["league"], bundle.get("extra_instruction", ""),
+        bundle["away"], bundle["league"], instruction if focus_on else "",
         metrics,
     )
+    if not focus_on and instruction.strip():
+        # 复盘盲推说明：是系统约束而非用户侧重，按原方式接在任务说明之后
+        system += (
+            "\n\n===== 本次运行说明 =====\n"
+            "在不违背上述 SOP 步骤与「输出格式」章节结构（必须保留 ### 1~8 各段标题）"
+            "的前提下，遵守以下要求：\n" + instruction.strip()
+        )
     card_text = json.dumps(cards, ensure_ascii=False, indent=2)
     user += (
         "\n### 全模型专家卡片（失败模块也必须保留其状态）\n"
@@ -447,6 +471,11 @@ def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
         "只作为假设命中记录，不得改方向；数据质量只调注额。\n"
         "必须保留现有输出格式的 ### 1 到 ### 8，必须包含 ### 8. 投注决策。\n"
     )
+    # 侧重任务段 _analyze_prompts 已加在数据之后，但专家卡片与合并要求又接在其后；
+    # 再追加一次，保证它仍是整个输入的最后一段。
+    focus_obj = focus.parse(instruction)
+    if focus_on and not focus_obj.empty:
+        user += "\n" + analyzer.focus_task_block(focus_obj)
     return system, user, metrics
 
 
@@ -589,9 +618,14 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         league: str, goals_block: str = "", extra_instruction: str = "",
         cancel=None,
         progress: Callable[[str, dict | None], None] | None = None, *,
-        profile: str = "analyze", settings: dict | None = None
+        profile: str = "analyze", settings: dict | None = None,
+        apply_focus_modes: bool = True,
         ) -> tuple[str, dict]:
-    """执行全模型精算，返回 (报告, 执行摘要)。"""
+    """执行全模型精算，返回 (报告, 执行摘要)。
+
+    全模型入口只有自由文字：侧重模式由 focus.parse 的关键词检测得到。
+    apply_focus_modes=False 时定稿不使用侧重模式（复盘盲推用）。"""
+    focus_obj = focus.parse(extra_instruction)
     if profile not in full_model_settings.PROFILES:
         return "", {"results": [], "error": "未知全模型配置"}
     if cancel is not None and cancel.is_set():
@@ -605,6 +639,7 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         routes.get("_rescue", full_model_settings.rescue_defaults(profile)))
     bundle = {
         "rescue": rescue, "cancel": cancel,
+        "focus_enabled": apply_focus_modes,
         "csv_text": csv_text or "",
         "fundamentals": fundamentals or "",
         "home": home or "",
@@ -667,6 +702,8 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
             "你是报告修复器。只修复给定问题，保留原报告事实和方向权限，"
             "输出完整修复后的 ### 1 到 ### 8 报告，不要解释修复过程。"
         )
+        if apply_focus_modes and not focus_obj.empty:
+            repair_system += "本场有用户侧重：须保留或补齐 ### 9. 侧重专题（放在第 8 节之后）。"
         repaired, repair_route = _call_route(
             repair_system,
             "### 原报告\n" + report + "\n### 审计问题\n" + issues,
@@ -689,7 +726,14 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
     # Reuse the ordinary SOP's bounded decision layer only after the last LLM
     # repair. This also finalizes review's result-blind first-stage forecast;
     # run_review must never reselect a wager after seeing the actual result.
-    report = analyzer.finalize_decision(report, home, away, league)
+    # apply_focus_modes=False（复盘盲推）：侧重不改变盲推的定稿与注额，也不标注侧重。
+    if apply_focus_modes and focus_obj.modes:
+        report = analyzer.finalize_decision(report, home, away, league,
+                                            modes=focus_obj.modes)
+    else:
+        report = analyzer.finalize_decision(report, home, away, league)
+    if apply_focus_modes:
+        report = focus.stamp(report, focus_obj)
     if cancel is not None and cancel.is_set():
         return "", {"cancelled": True, "results": results, "audit": audit}
     report += "\n\n" + _render_appendix(results, audit, synthesis)
@@ -744,12 +788,12 @@ def _review_synthesis_prompt(bundle: dict,
         bundle["home"], bundle["away"], bundle["league"],
         bundle.get("fundamentals", ""), metrics,
     )
-    focus = bundle.get("extra_instruction", "").strip()
-    if focus:
+    review_focus = bundle.get("extra_instruction", "").strip()
+    if review_focus:
         system += (
             "\n\n===== 用户复盘侧重 =====\n"
             "在不改变盲推事实、不泄漏赛果到第一阶段的前提下，重点回应：\n"
-            + focus
+            + review_focus
         )
     user += (
         "\n### 全模型复盘专家卡片\n"

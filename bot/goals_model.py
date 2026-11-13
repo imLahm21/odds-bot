@@ -509,6 +509,70 @@ def format_states_block(st: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _focus_matrix(st: dict | None) -> dict[tuple[int, int], float] | None:
+    """侧重注入段共用：按 states_for_csv 已拆好的 λ 重建比分矩阵。"""
+    if not st:
+        return None
+    try:
+        lam_h, lam_a = float(st["lambda_home"]), float(st["lambda_away"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return score_matrix(lam_h, lam_a)
+
+
+def format_score_block(st: dict | None, top_n: int, margin: float) -> str:
+    """「波胆重点」注入段：概率最高的 top_n 个比分，附公平赔率与有价值的报价下限。
+
+    公平赔率 = 1/概率；下限 = 公平赔率 × (1+margin)。库里没有波胆报价，不算 edge。"""
+    title = "### 比分概率表（代码计算）"
+    m = _focus_matrix(st)
+    if m is None:
+        return f"{title}\n（大小球盘口缺失，无法计算）\n"
+    top = sorted(m.items(), key=lambda kv: (-kv[1], kv[0]))[:max(int(top_n), 0)]
+    lines = [
+        title,
+        "",
+        f"- 依据：λ 主 {st['lambda_home']} / 客 {st['lambda_away']}"
+        "（Dixon-Coles 修正双泊松，与「进球分布模型」同一组 λ）",
+        "",
+        "| 比分 | 概率 | 公平赔率 | 有价值的报价下限 |",
+        "|------|------|----------|------------------|",
+    ]
+    for (i, j), p in top:
+        fair = 1.0 / p
+        lines.append(f"| {i}:{j} | {p:.1%} | {fair:.2f} | {fair * (1 + margin):.2f} |")
+    lines += [
+        "",
+        f"- 以上 {len(top)} 个比分合计概率 {sum(p for _, p in top):.1%}",
+        "> 模型估计，非观测频率；无市场报价，不计 edge。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def format_total_goals_block(st: dict | None) -> str:
+    """「大小球重点」注入段：总进球数 0~4 与 5+ 的概率，及 P(≤2)、P(≥3)。"""
+    title = "### 总进球分布（代码计算）"
+    m = _focus_matrix(st)
+    if m is None:
+        return f"{title}\n（大小球盘口缺失，无法计算）\n"
+    dist = [0.0] * 6                              # 0,1,2,3,4,5+
+    for (i, j), p in m.items():
+        dist[min(i + j, 5)] += p
+    names = ("0球", "1球", "2球", "3球", "4球", "5球+")
+    lines = [
+        title,
+        "",
+        f"- 依据：λ_total = {st['lambda_total']}"
+        f"（主 {st['lambda_home']} / 客 {st['lambda_away']}）",
+        "- " + " / ".join(f"{n} {p:.1%}" for n, p in zip(names, dist)),
+        f"- P(≤2) = {sum(dist[:3]):.1%}，P(≥3) = {sum(dist[3:]):.1%}",
+        "> 模型估计；大小球方向仍以市场去抽水概率为准。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def parse_csv_lines(csv_text: str) -> tuple[list[float], list[tuple],
                                             float | None,
                                             tuple[float, float, float] | None]:

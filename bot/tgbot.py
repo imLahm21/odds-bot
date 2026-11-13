@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 
 from . import (config, db, api_client, analyzer, llm_client, multi_analyzer,
                ghost_publish, wechat_publish, lesson_archive, report_paths,
-               full_model_ui)
+               full_model_ui, focus)
 
 load_dotenv()
 log = logging.getLogger("odds_bot.tgbot")
@@ -287,9 +287,15 @@ _ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm",
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
-# 等待用户回复自定义侧重的会话状态：chat_id -> (fixture_id, effort)
-# 用户点「✍️ 自定义侧重」并选完推理强度后置位，下一条非命令文本被当作侧重消费后清除。
-_pending_custom: dict[int, tuple[int, str]] = {}
+# 自定义侧重的按钮选择态：chat_id -> {"fid", "effort", "modes": set[str]}
+# 用户点「✍️ 自定义侧重」并选完推理强度后置位，展示侧重键盘（fo:t:<mode> 切换、
+# fo:x 补充文字、fo:go 开始精算）；开始或转入补充文字后清除。
+_pending_focus: dict[int, dict] = {}
+
+# 等待用户回复自定义侧重文字的会话状态：chat_id -> (fixture_id, effort, modes)
+# 侧重键盘点「✍️ 补充文字」后置位，下一条非命令文本与已选模式一起
+# 经 focus.encode 编码为 extra_instruction，消费后清除。
+_pending_custom: dict[int, tuple[int, str, tuple[str, ...]]] = {}
 
 # 全模型精算的自定义侧重等待态：chat_id -> fixture_id。
 # 与旧版 _pending_custom 分开，避免改变旧版 effort→文本流程。
@@ -2304,6 +2310,87 @@ def _effort_keyboard(chat_id: int, mode: str, fid: int) -> dict:
                                 for i in range(0, len(buttons), 3)]}
 
 
+_FOCUS_PROMPT = ("✍️ 选择本场侧重（可多选）：\n"
+                 "· 大小球 / 波胆：报告新增第 9 节专题\n"
+                 "· 激进：凯利分数 ×2；保守：减半且不下探索注\n"
+                 "· 补充文字：伤停消息、想深挖的节点、情景假设")
+
+
+def _focus_keyboard(state: dict) -> dict:
+    """自定义侧重键盘：四个模式按钮（已选加 ✅）+ 补充文字 + 开始精算。
+    回调格式 fo:t:<mode>（切换）/ fo:x（补充文字）/ fo:go（开始）。"""
+    chosen = state.get("modes") or set()
+
+    def button(mode: str) -> dict:
+        text = focus.MODES[mode]["label"]
+        return {"text": ("✅ " + text) if mode in chosen else text,
+                "callback_data": f"fo:t:{mode}"}
+
+    return {"inline_keyboard": [
+        [button("ou"), button("score")],
+        [button("aggressive"), button("conservative")],
+        [{"text": "✍️ 补充文字", "callback_data": "fo:x"},
+         {"text": "▶️ 开始精算", "callback_data": "fo:go"}],
+    ]}
+
+
+def _handle_focus_callback(cb_id: str, chat_id: int, message_id: int,
+                           data: str) -> None:
+    """侧重键盘回调（访客可用，与自定义侧重入口权限一致）。"""
+    state = _pending_focus.get(chat_id)
+    if state is None:
+        answer_callback(cb_id, "已失效，请重新 /analyze")
+        return
+    modes: set[str] = state["modes"]
+    if data.startswith("fo:t:"):
+        mode = data[len("fo:t:"):]
+        if mode not in focus.MODES:
+            answer_callback(cb_id, "未知侧重")
+            return
+        if mode in modes:
+            modes.discard(mode)
+            answer_callback(cb_id, f"已取消 {focus.MODES[mode]['label']}")
+        else:
+            if mode in focus.EXCLUSIVE:          # 激进与保守互斥：后选的覆盖先选的
+                modes.difference_update(focus.EXCLUSIVE)
+            modes.add(mode)
+            answer_callback(cb_id, f"已选 {focus.MODES[mode]['label']}")
+        edit_markup(chat_id, message_id, _focus_keyboard(state))
+        return
+    ordered = tuple(key for key in focus.MODES if key in modes)
+    fid, eff = state["fid"], state["effort"]
+    if data == "fo:go":
+        if not ordered:
+            answer_callback(cb_id, "请至少选一个侧重，或点补充文字")
+            return
+        tid = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid,
+                               focus.encode(ordered), eff)
+        if not tid:
+            answer_callback(cb_id, f"并行分析已达上限（{_ANALYSIS_MAX_PER_CHAT}），"
+                                   "请先停止一个或等待")
+            return
+        _pending_focus.pop(chat_id, None)
+        answer_callback(cb_id, "已开始精算…")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        send(chat_id, f"收到自定义侧重（{focus.label(focus.parse(focus.encode(ordered)))}），"
+                      f"开始精算 fixture {fid} …")
+        return
+    if data == "fo:x":
+        _pending_focus.pop(chat_id, None)
+        _pending_custom[chat_id] = (fid, eff, ordered)
+        answer_callback(cb_id, "请回复补充文字")
+        edit_markup(chat_id, message_id, {"inline_keyboard": []})
+        chosen = ("已选侧重：" + " + ".join(focus.MODES[k]["label"] for k in ordered) + "\n"
+                  if ordered else "")
+        send(chat_id,
+             f"{chosen}✍️ 请发一条消息，补充对 fixture {fid} 的信息或关注点\n"
+             "例：「主队主力前锋确认缺阵」「重点看临场④的异动」「如果临场再升盘怎么办」\n"
+             "（直接发文字即可；发 /cancel 取消）",
+             {"force_reply": True, "input_field_placeholder": "输入补充信息…"})
+        return
+    answer_callback(cb_id, "未知操作")
+
+
 def _effort_prompt(chat_id: int) -> str:
     """当前身份重档主模型及其可选强度，供三个入口统一展示。"""
     visitor = not _is_admin(chat_id)
@@ -2359,8 +2446,7 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
                   "🧠 基本面预分析 = 先用轻量模型把两队近况/交锋/赛程/积分榜"
                   "分析成一份可读概述（可选、较慢，可随时停止；跑基本面时仍可发其它命令）；\n"
                   "🎯 预设精算 = 跳过预分析，直接按标准 SOP 跑结果预测；\n"
-                  "✍️ 自定义侧重 = 在 SOP 基础上加你的一句侧重要求"
-                  "（如「重点看临场异动」「忽略基本面只看盘口」）。\n"
+                  "✍️ 自定义侧重 = 选大小球 / 波胆 / 激进 / 保守，或补充一句信息。\n"
                   "🧪 全模型交叉精算 = 按职责调用所选模型分别分析，"
                   "按保存的职责链合并、独立审计（管理员功能；职责提示词仍是旧分层措辞，过渡期结论勿用于下注）。\n"
                   "🎯/✍️ 选完后再按当前重档模型选择可用的中英双语推理强度。\n"
@@ -2446,7 +2532,8 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
              effort: str = "", task_id: str = "",
              cancel: "threading.Event | None" = None) -> None:
     """第二步：真正跑 SOP 精算。
-    extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发）。
+    extra_instruction 非空时为用户自定义侧重（由 ✍️ 自定义触发，focus.encode 编码的
+    模式 + 补充文字）。
     effort 为推理强度；具体可选值按当前模型能力表过滤后透传给 analyzer。
     task_id/cancel：本任务的中断句柄——停止按钮带 task_id，置位 cancel 后循环收尾。
     """
@@ -2486,14 +2573,15 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
     # 省去一次轻量调用与等待。（第一步展示的轻量概述仅供用户预览，与此独立。）
 
     # 流式精算 + 原地进度播报
-    tag = "✍️自定义" if extra_instruction.strip() else "🎯预设"
+    focus_obj = focus.parse(extra_instruction)
+    tag = "🎯预设" if focus_obj.empty else "✍️自定义"
     eff_label = config.LLM_EFFORT_LABELS.get(effort, "")
     if eff_label:
         tag += f"·{eff_label}"
     title = (f"⏳ 正在精算 {meta['home']} vs {meta['away']}"
              f"（{tag}，{_tier_model_label(chat_id)}，重档约 2~8 分钟）")
-    if extra_instruction.strip():
-        title += f"\n侧重：{extra_instruction.strip()[:80]}"
+    if not focus_obj.empty:
+        title += f"\n侧重：{focus.label(focus_obj)[:120]}"
     total = analyzer._TOTAL_STAGES
     done_stages: list[str] = []
     stop_kb = {"inline_keyboard": [[
@@ -3167,10 +3255,12 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
     )
     if extra_instruction.strip():
         blind_focus += "\n用户复盘侧重：" + extra_instruction.strip()
+    # 盲推说明不是用户侧重：不解析侧重模式、不要求第 9 节、不改盲推的定稿与注额
     forecast, blind_summary = multi_analyzer.run(
         csv_str, "", meta["home"], meta["away"], meta["league"],
         goals_block=goals_block, extra_instruction=blind_focus,
         cancel=cancel, progress=on_blind_progress, profile="review", settings=snapshot,
+        apply_focus_modes=False,
     )
     if cancel is not None and cancel.is_set():
         if msg_id:
@@ -3813,7 +3903,7 @@ def handle_message(msg: dict) -> None:
 
     # 若该 chat 正在等待「自定义侧重」输入，优先消费这条消息
     if chat_id in _pending_custom:
-        fid, eff = _pending_custom.pop(chat_id)
+        fid, eff, modes = _pending_custom.pop(chat_id)
         if text.lstrip("/").lower() in ("cancel", "取消"):
             send(chat_id, "已取消自定义精算。")
             return
@@ -3823,7 +3913,8 @@ def handle_message(msg: dict) -> None:
         else:
             # 提交到独立分析池（不占 per-chat 执行器）——期间该 chat 仍可用其它命令、
             # 停止按钮，且可再并行发起新的分析（受每 chat 上限约束）。
-            tid = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid, text, eff)
+            extra = focus.encode(modes, text[:config.FOCUS_TEXT_MAX_CHARS])
+            tid = _submit_analysis(chat_id, "精算", _run_sop, chat_id, fid, extra, eff)
             if tid:
                 send(chat_id, f"收到自定义侧重，开始精算 fixture {fid} …")
             else:
@@ -4031,7 +4122,8 @@ def handle_callback(cb: dict) -> None:
     tl:<league_id>[:<page>] 联赛开关 / lp:<page> 联赛翻页 /
     ag:<league_id>:<season> 搜索结果添加 / tb:<bookmaker_id> 庄家开关 /
     az:<fixture_id> 预设精算 / ac:<fixture_id> 自定义侧重 /
-    ae:<mode>:<fixture_id>:<effort> 选推理强度后执行（mode=p预设/c自定义/r复盘）
+    ae:<mode>:<fixture_id>:<effort> 选推理强度后执行（mode=p预设/c自定义/r复盘）/
+    fo:t:<mode> 切换侧重 / fo:x 补充侧重文字 / fo:go 按所选侧重开始精算
     """
     cb_id = cb.get("id")
     data = cb.get("data", "")
@@ -4480,9 +4572,14 @@ def handle_callback(cb: dict) -> None:
         fid = int(data[3:])
         answer_callback(cb_id, "请选择推理强度")
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
-        send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再发你的侧重要求。\n"
+        send(chat_id, "✍️ 自定义侧重：先选推理强度，下一步再选侧重（大小球 / 波胆 / 激进 / 保守 / 补充文字）。\n"
                       f"{_effort_prompt(chat_id)}",
              _effort_keyboard(chat_id, "c", fid))
+        return
+
+    # 自定义侧重键盘：fo:t:<mode> 切换 / fo:x 补充文字 / fo:go 开始精算
+    if data.startswith("fo:"):
+        _handle_focus_callback(cb_id, chat_id, message_id, data)
         return
 
     # 全模型交叉复盘：不弹统一强度，分标准/自定义两种入口。
@@ -4583,14 +4680,11 @@ def handle_callback(cb: dict) -> None:
         edit_markup(chat_id, message_id, {"inline_keyboard": []})
         eff_label = config.LLM_EFFORT_LABELS[eff]
         if mode == "c":
-            answer_callback(cb_id, f"强度：{eff_label}，请回复侧重要求")
-            _pending_custom[chat_id] = (fid, eff)
-            send(chat_id,
-                 f"✍️ 强度已设【{eff_label}】。请发一条消息，描述对 fixture {fid} "
-                 "的精算侧重要求\n"
-                 "例：「重点分析临场④异动」「忽略基本面只看盘口资金流」「给保守口径」。\n"
-                 "（直接发文字即可；发 /cancel 取消）",
-                 {"force_reply": True, "input_field_placeholder": "输入精算侧重…"})
+            answer_callback(cb_id, f"强度：{eff_label}，请选择侧重")
+            state = {"fid": fid, "effort": eff, "modes": set()}
+            _pending_focus[chat_id] = state
+            send(chat_id, f"强度已设【{eff_label}】。\n" + _FOCUS_PROMPT,
+                 _focus_keyboard(state))
         elif mode.startswith("r"):
             # 复盘：mode = rb(只盲推)/rc(只对照)/ra(两步全跑)
             sub_map = {"rb": "blind", "rc": "compare", "ra": "all"}

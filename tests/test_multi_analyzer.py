@@ -106,7 +106,8 @@ class TestMultiAnalyzer(unittest.TestCase):
             {"gpt-6-sol", "grok-4.6", "gpt-5.6-terra", "deepseek-v4.1-flash",
              "glm-5.3-flash", "grok-4.5", "gpt-6.1-sol", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "grok-4.7",
              "gemini-3.8-flash", "claude-sonnet-5-5", "gemini-4-argon",
-             "claude-sonnet-5-5-high", "gemini-3.8-flash-high", "gemini-4-argon-high"},
+             "claude-sonnet-5-5-high", "gemini-3.8-flash-high", "gemini-4-argon-high",
+             "gemini-4-hydrogen-xhigh"},
         )
         models = {task["model"] for task in config.FULL_CONSULT_TASKS}
         models.add(config.FULL_CONSULT_SYNTHESIS["model"])
@@ -257,6 +258,7 @@ class TestMultiAnalyzer(unittest.TestCase):
             "### 3. 资金流向与热度\nx\n### 4. 操盘手法匹配\nx\n"
             "### 5. 风控验证\nx\n### 6. 缺失节点预测\nx\n"
             "### 7. 最终精算结论\nx\n### 8. 投注决策\nx\n"
+            "### 9. 侧重专题\nx\n"            # 有侧重时审计要求第 9 节
             + ("x" * 600)
         )
 

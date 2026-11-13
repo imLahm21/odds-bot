@@ -192,6 +192,7 @@ class TestModelProfile(unittest.TestCase):
                 "gpt-6-astra-cpa": ("cpa_gpt",),
                 "gpt-6.1-sol-cpa": ("cpa_gpt",),
                 "gpt-6.1-terra-cpa": ("cpa_gpt",),
+                "gemini-4-hydrogen-xhigh": ("cpa_gemini",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -235,6 +236,7 @@ class TestModelProfile(unittest.TestCase):
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+            "gemini-4-hydrogen-xhigh",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
@@ -242,7 +244,8 @@ class TestModelProfile(unittest.TestCase):
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                                     "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                                     "gemini-4-argon", "claude-sonnet-5-5-high",
-                                    "gemini-3.8-flash-high", "gemini-4-argon-high"})
+                                    "gemini-3.8-flash-high", "gemini-4-argon-high",
+                                    "gemini-4-hydrogen-xhigh"})
         self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
@@ -251,7 +254,8 @@ class TestModelProfile(unittest.TestCase):
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                           "gemini-4-argon", "claude-sonnet-5-5-high",
-                          "gemini-3.8-flash-high", "gemini-4-argon-high"})
+                          "gemini-3.8-flash-high", "gemini-4-argon-high",
+                          "gemini-4-hydrogen-xhigh"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 
@@ -260,8 +264,9 @@ class TestModelProfile(unittest.TestCase):
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+            "gemini-4-hydrogen-xhigh",
         )
-        self.assertEqual(tuple(config.LLM_MODELS)[-7:], new_models)
+        self.assertEqual(tuple(config.LLM_MODELS)[-8:], new_models)
         for tier, expected in (
             ("heavy", new_models),
             ("balanced", new_models[1:4] + new_models[5:]),
@@ -652,7 +657,8 @@ class TestModelProfile(unittest.TestCase):
             "cpa_gpt": {"gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
                         "gpt-5.6-luna", "gpt-6-luna"},
             "cpa_claude": {"claude-opus-5-5-high", "claude-sonnet-5-5-high"},
-            "cpa_gemini": {"gemini-3.8-flash-high", "gemini-4-argon-high"},
+            "cpa_gemini": {"gemini-3.8-flash-high", "gemini-4-argon-high",
+                           "gemini-4-hydrogen-xhigh"},
         }
         endpoints = llm_client._parse_route_endpoints(
             ",".join(f"{group}|test-key-{group}|https://cpa.example.test:8443/v1|{group}"
@@ -697,6 +703,7 @@ class TestModelProfile(unittest.TestCase):
             ("claude-sonnet-5-5-high", "cpa_claude"),
             ("gemini-3.8-flash-high", "cpa_gemini"),
             ("gemini-4-argon-high", "cpa_gemini"),
+            ("gemini-4-hydrogen-xhigh", "cpa_gemini"),
         )
         with (
             patch.object(llm_client, "_ENDPOINTS", endpoints),
@@ -960,9 +967,11 @@ class TestModelProfile(unittest.TestCase):
                 choices = {cb[len(prefix):] for cb in callbacks if cb.startswith(prefix)}
                 self.assertEqual(choices, set(config.llm_models_in_group(group)))
                 if group in {"cpa_claude", "cpa_gemini"}:
-                    self.assertTrue(all(choice.endswith("-high") for choice in choices))
+                    self.assertTrue(all(choice.endswith(("-high", "-xhigh"))
+                                        for choice in choices))
                 elif group in {"ik_claude", "ik_gemini"}:
-                    self.assertFalse(any(choice.endswith("-high") for choice in choices))
+                    self.assertFalse(any(choice.endswith(("-high", "-xhigh"))
+                                         for choice in choices))
                 self.assertTrue(all(len(cb.encode("utf-8")) <= 64 for cb in callbacks))
                 self.assertIn("lm:", callbacks)
 

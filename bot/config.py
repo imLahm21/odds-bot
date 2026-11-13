@@ -367,6 +367,13 @@ EXPLORE_MODE = os.getenv("EXPLORE_MODE", "on").strip().lower()   # on / off
 EXPLORE_MIN_EDGE = float(os.getenv("EXPLORE_MIN_EDGE", "-0.03"))  # 只在价格接近公平时探索
 EXPLORE_STAKE = float(os.getenv("EXPLORE_STAKE", "1.0"))          # 每注固定美元数
 EXPLORE_DAILY_MAX = int(os.getenv("EXPLORE_DAILY_MAX", "5"))      # 每日探索注上限（按报告生成日）
+# ─── 自定义侧重（见 docs/自定义侧重优化计划.md）─────────────────────────────
+FOCUS_AGGRESSIVE_K_MULT = float(os.getenv("FOCUS_AGGRESSIVE_K_MULT", "2.0"))
+FOCUS_CONSERVATIVE_K_MULT = float(os.getenv("FOCUS_CONSERVATIVE_K_MULT", "0.5"))
+FOCUS_K_MAX = 0.5                 # 激进口径下凯利分数的上限
+FOCUS_SCORE_TOP_N = 8             # 比分概率表行数
+FOCUS_SCORE_VALUE_MARGIN = 0.15   # 波胆报价需高出公平赔率的比例
+FOCUS_TEXT_MAX_CHARS = 2000
 # Beta 提示：/parlay 仍在打磨，各处引用此常量，日后一键去 Beta。
 PARLAY_BETA_NOTICE = ("⚠️ /parlay 为 Beta 实验功能，串关判定仍在打磨，"
                       "结果仅供参考，请自行复核。")
@@ -596,6 +603,11 @@ LLM_MODELS: dict[str, dict] = {
         "label": "CPA · GPT-6.1 Terra", "tiers": ("heavy", "balanced"),
         "efforts": _EFFORT_OPENAI_TERRA, "upstream": "gpt-6.1-terra",
     },
+    # CPA 完整 ID，-xhigh 随模型名原样发送；efforts 暂沿用 Gemini 4 本地能力表，待探针验证。
+    "gemini-4-hydrogen-xhigh": {
+        "label": "CPA · Gemini 4 Hydrogen XHigh", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_GEMINI_4_ARGON,
+    },
 }
 
 
@@ -745,6 +757,7 @@ LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
     "claude-sonnet-5-5-high": ("cpa_claude",),
     "gemini-3.8-flash-high": ("cpa_gemini",),
     "gemini-4-argon-high": ("cpa_gemini",),
+    "gemini-4-hydrogen-xhigh": ("cpa_gemini",),
 }
 
 
@@ -899,6 +912,7 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "claude-sonnet-5-5-high": "flagship",
     "gemini-4-argon": "flagship",
     "gemini-4-argon-high": "flagship",
+    "gemini-4-hydrogen-xhigh": "flagship",
     "gpt-5.6-luna": "specialized_fast",
     "gpt-6-luna": "specialized_fast",
     "gpt-5.6-terra": "specialized_fast",
