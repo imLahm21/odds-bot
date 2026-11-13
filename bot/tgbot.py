@@ -499,6 +499,7 @@ def setup_commands() -> None:
         {"command": "wxpublish", "description": "把报告改写成合规基本面文章存微信公众号草稿（管理员）"},
         {"command": "lesson", "description": "把历史复盘归档为实战教训（管理员）"},
         {"command": "llm", "description": "LLM 端点测试/故障转移/熔断参数面板（管理员）"},
+        {"command": "hypstats", "description": "统计假设登记后的命中率并给状态建议（管理员）"},
     ]
     resp = _post("setMyCommands", {"commands": commands})
     if resp and resp.get("ok"):
