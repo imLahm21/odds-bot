@@ -18,7 +18,7 @@ prepare_publish_stubs()
 from bot import analyzer, config, db, full_model_settings as settings, full_model_ui as ui, llm_client, multi_analyzer as multi, tgbot  # noqa: E402
 
 
-_RESCUE = {"model": "gpt-6.1-sol", "effort": "high", "route_group": "cpa_gpt"}
+_RESCUE = {"model": "gpt-6.1-sol-cpa", "effort": "high", "route_group": "cpa_gpt"}
 _OFF = {"model": "", "effort": "", "route_group": ""}
 _JSON = '{"module":"offline","summary":"ok","findings":[]}'
 
@@ -53,11 +53,11 @@ class TestRescueStorage(_RescueFixture):
 
     def test_invalid_rescue_edits_are_rejected_without_changes(self):
         self.assertTrue(db.set_full_model_rescue(self.conn, "analyze", "", "", "")[0])
-        invalid = [("missing", "gpt-6.1-sol", "high", "cpa_gpt"),
+        invalid = [("missing", "gpt-6.1-sol-cpa", "high", "cpa_gpt"),
                    ("analyze", "missing-model", "high", "cpa_gpt"),
-                   ("analyze", "gpt-6.1-sol", "ultra", "cpa_gpt"),
-                   ("analyze", "gpt-6.1-sol", "high", "ik_claude"),
-                   ("analyze", "gpt-6.1-sol", "high", ""),
+                   ("analyze", "gpt-6.1-sol-cpa", "ultra", "cpa_gpt"),
+                   ("analyze", "gpt-6.1-sol-cpa", "high", "ik_claude"),
+                   ("analyze", "gpt-6.1-sol-cpa", "high", ""),
                    ("analyze", "", "high", "cpa_gpt"),
                    ("analyze", None, "high", "cpa_gpt")]
         for args in invalid:
@@ -67,7 +67,7 @@ class TestRescueStorage(_RescueFixture):
 
     def test_bad_saved_group_uses_pinned_default_without_overwriting_row(self):
         self.conn.execute("INSERT INTO full_model_rescue VALUES (?,?,?,?,?)",
-                          ("analyze", "gpt-6.1-sol", "high", "ik_claude", "offline"))
+                          ("analyze", "gpt-6.1-sol-cpa", "high", "ik_claude", "offline"))
         with self.assertLogs(db.log, level="WARNING"):
             self.assertEqual(db.get_full_model_rescue(self.conn, "analyze"), _RESCUE)
         self.assertEqual(self.conn.execute("SELECT route_group FROM full_model_rescue").fetchone()[0], "ik_claude")
@@ -132,26 +132,26 @@ class TestPinnedRescueClient(unittest.TestCase):
 
     def test_blocking_rescue_hits_only_cpa_even_when_ik_has_higher_priority(self):
         with patch.object(llm_client, "_do_chat", return_value=("ok", True, "", False, False, False)) as request:
-            result = llm_client.chat_model("system", "user", "gpt-6.1-sol", effort="high", route_group="cpa_gpt")
+            result = llm_client.chat_model("system", "user", "gpt-6.1-sol-cpa", effort="high", route_group="cpa_gpt")
         self.assertEqual(result, "ok")
         request.assert_called_once()
         self.assertEqual(request.call_args.args[0]["route_group"], "cpa_gpt")
 
     def test_cpa_failure_does_not_silently_use_ik(self):
         with patch.object(llm_client, "_do_chat", return_value=("", False, "HTTP 429", False, True, False)) as request:
-            result = llm_client.chat_model("system", "user", "gpt-6.1-sol", route_group="cpa_gpt")
+            result = llm_client.chat_model("system", "user", "gpt-6.1-sol-cpa", route_group="cpa_gpt")
         self.assertTrue(result.startswith("LLM 请求失败"))
         request.assert_called_once()
         self.assertEqual(request.call_args.args[0]["route_group"], "cpa_gpt")
 
     def test_ordinary_explicit_call_keeps_existing_multi_group_behavior(self):
         with patch.object(llm_client, "_do_chat", return_value=("ok", True, "", False, False, False)) as request:
-            self.assertEqual(llm_client.chat_model("system", "user", "gpt-6.1-sol"), "ok")
+            self.assertEqual(llm_client.chat_model("system", "user", "gpt-6.1-sol-cpa"), "ok")
         self.assertEqual(request.call_args.args[0]["route_group"], "ik_gpt")
 
     def test_forbidden_group_never_requests_any_endpoint(self):
         with patch.object(llm_client, "_do_chat") as request:
-            result = llm_client.chat_model("system", "user", "gpt-6.1-sol", route_group="cpa_claude")
+            result = llm_client.chat_model("system", "user", "gpt-6.1-sol-cpa", route_group="cpa_claude")
         self.assertTrue(result.startswith("LLM 请求失败"))
         request.assert_not_called()
         self.endpoints.assert_not_called()
@@ -159,16 +159,16 @@ class TestPinnedRescueClient(unittest.TestCase):
     def test_streaming_pin_and_real_model_trace(self):
         used = Mock()
         with patch.object(llm_client, "_stream_one", return_value=iter([("done", "report")])) as request:
-            events = list(llm_client.stream_chat_model("system", "user", "gpt-6.1-sol",
+            events = list(llm_client.stream_chat_model("system", "user", "gpt-6.1-sol-cpa",
                 effort="high", route_group="cpa_gpt", on_model_used=used))
         self.assertEqual(events, [("done", "report")])
         request.assert_called_once()
         self.assertEqual(request.call_args.args[0]["route_group"], "cpa_gpt")
-        used.assert_called_once_with("gpt-6.1-sol", "high")
+        used.assert_called_once_with("gpt-6.1-sol-cpa", "high")
 
     def test_streaming_cpa_failure_does_not_use_ik(self):
         with patch.object(llm_client, "_stream_one", return_value=iter([("error", "HTTP 524")])) as request:
-            events = list(llm_client.stream_chat_model("system", "user", "gpt-6.1-sol", route_group="cpa_gpt"))
+            events = list(llm_client.stream_chat_model("system", "user", "gpt-6.1-sol-cpa", route_group="cpa_gpt"))
         self.assertEqual(events[-1][0], "error")
         request.assert_called_once()
         self.assertEqual(request.call_args.args[0]["route_group"], "cpa_gpt")
@@ -198,7 +198,7 @@ class TestRescueExecution(unittest.TestCase):
             result, route = self._call()
         self.assertIsNotNone(result)
         self.assertEqual([call.kwargs["model"] for call in request.call_args_list],
-                         ["grok-4.7", "claude-opus-5-5-high", "gpt-6.1-sol", "gpt-6.1-sol"])
+                         ["grok-4.7", "claude-opus-5-5-high", "gpt-6.1-sol-cpa", "gpt-6.1-sol-cpa"])
         self.assertTrue(all(call.args == ("original system", "original input") for call in request.call_args_list))
         self.assertEqual(request.call_args.kwargs["route_group"], "cpa_gpt")
         self.assertEqual(request.call_args.kwargs["effort"], "high")
@@ -220,7 +220,7 @@ class TestRescueExecution(unittest.TestCase):
         self.assertEqual(request.call_count, 4)
         self.assertFalse(route["rescue_used"])
         self.assertTrue(route["rescue_attempted"])
-        self.assertEqual(route["model"], "gpt-6.1-sol")
+        self.assertEqual(route["model"], "gpt-6.1-sol-cpa")
         self.assertIn("公共兜底也失败", multi.execution_note({**route, "status": "error"}))
 
     def test_disabled_rescue_stops_after_normal_chain(self):
@@ -239,7 +239,7 @@ class TestRescueExecution(unittest.TestCase):
         request.assert_not_called()
 
     def test_rescue_is_also_excluded_when_it_wrote_the_report(self):
-        excluded = {pair["model"] for pair in settings.candidates(self.spec)} | {"gpt-6.1-sol"}
+        excluded = {pair["model"] for pair in settings.candidates(self.spec)} | {"gpt-6.1-sol-cpa"}
         with patch.object(llm_client, "chat_model") as request:
             result, route = self._call(excluded_models=excluded)
         self.assertIsNone(result)
@@ -268,10 +268,10 @@ class TestRescueExecution(unittest.TestCase):
             result = multi._run_one(self.spec, {"rescue": _RESCUE, "csv_text": "csv"})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["requested_model"], "grok-4.7")
-        self.assertEqual(result["model"], "gpt-6.1-sol")
+        self.assertEqual(result["model"], "gpt-6.1-sol-cpa")
         self.assertEqual(result["route_group"], "cpa_gpt")
         text = multi._render_appendix([result], {"ok": True})
-        self.assertIn("初始 grok-4.7；最后尝试 gpt-6.1-sol", text)
+        self.assertIn("初始 grok-4.7；最后尝试 gpt-6.1-sol-cpa", text)
         self.assertIn("公共兜底也失败 · cpa_gpt", text)
 
     def test_same_model_can_be_retried_once_with_the_explicit_rescue_group_and_effort(self):
@@ -279,7 +279,7 @@ class TestRescueExecution(unittest.TestCase):
         with patch.object(llm_client, "chat_model", side_effect=["LLM 请求失败（offline）"] * 3 + [_JSON]) as request:
             _, route = self._call()
         self.assertEqual(request.call_count, 4)
-        self.assertEqual(request.call_args_list[0].kwargs["model"], "gpt-6.1-sol")
+        self.assertEqual(request.call_args_list[0].kwargs["model"], "gpt-6.1-sol-cpa")
         self.assertNotIn("route_group", request.call_args_list[0].kwargs)
         self.assertEqual(request.call_args.kwargs["route_group"], "cpa_gpt")
         self.assertTrue(route["rescue_used"])
@@ -287,7 +287,7 @@ class TestRescueExecution(unittest.TestCase):
 
 class TestStreamingRescue(unittest.TestCase):
     def _synthesize(self, stream, review=False):
-        trace = {"model": "gpt-6-astra", "effort": "xhigh"}
+        trace = {"model": "gpt-6-astra-cpa", "effort": "xhigh"}
         prompt = "_review_synthesis_prompt" if review else "_synthesis_prompt"
         fn = multi._review_synthesize if review else multi._synthesize
         with patch.object(multi, prompt, return_value=("original system", "original input", {})), \
@@ -309,7 +309,7 @@ class TestStreamingRescue(unittest.TestCase):
             self.assertEqual(request.call_args.kwargs["route_group"], "cpa_gpt")
             self.assertEqual(request.call_args.kwargs["fallback_models"], ())
             self.assertTrue(trace["rescue_used"])
-            self.assertEqual(trace["model"], "gpt-6.1-sol")
+            self.assertEqual(trace["model"], "gpt-6.1-sol-cpa")
 
     def test_partial_normal_output_does_not_regenerate_with_rescue(self):
         def stream(*args, **kwargs):
@@ -327,7 +327,7 @@ class TestStreamingRescue(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertTrue(trace["rescue_attempted"])
         self.assertFalse(trace["rescue_used"])
-        self.assertEqual(trace["model"], "gpt-6.1-sol")
+        self.assertEqual(trace["model"], "gpt-6.1-sol-cpa")
         self.assertEqual(trace["route_group"], "cpa_gpt")
 
     def test_normal_stream_success_never_calls_rescue(self):
@@ -353,11 +353,11 @@ class TestStreamingRescue(unittest.TestCase):
 
 class TestRescueUI(_RescueFixture):
     def test_model_group_effort_are_saved_together_only_on_final_selection(self):
+        # 供应商按模型名分离后每个模型只有一个授权组，选完模型直接进强度页（组随模型确定）
         index = list(config.LLM_MODELS).index("gpt-6-astra")
-        _, keyboard, _ = ui.handle_callback(self.conn, f"fmc:gc:a:{index}")
-        group_callback = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
-                              if "ik_gpt" in button["text"])
-        _, keyboard, _ = ui.handle_callback(self.conn, group_callback)
+        self.assertEqual(config.llm_route_groups_for_model("gpt-6-astra"), ("ik_gpt",))
+        text, keyboard, _ = ui.handle_callback(self.conn, f"fmc:gc:a:{index}")
+        self.assertIn("ik_gpt", text)
         self.assertEqual(db.get_full_model_rescue(self.conn, "analyze"), _RESCUE)
         save = next(button["callback_data"] for row in keyboard["inline_keyboard"] for button in row
                     if button["text"] == config.LLM_EFFORT_LABELS["low"])
@@ -439,7 +439,7 @@ class TestRescuePipeline(unittest.TestCase):
         self.assertEqual(repair.call_args.kwargs["rescue"], _RESCUE)
         self.assertTrue(summary["synthesis"]["rescue_used"])
         self.assertEqual(summary["synthesis"]["route_group"], "cpa_gpt")
-        self.assertIn("gpt-6.1-sol", self.audit.call_args.kwargs["excluded_models"])
+        self.assertIn("gpt-6.1-sol-cpa", self.audit.call_args.kwargs["excluded_models"])
         self.assertIn("公共兜底", report)
 
     def test_phase_two_does_not_reselect_even_when_rescue_is_available(self):
@@ -458,7 +458,7 @@ class TestRescueProgress(unittest.TestCase):
 
         def run(*args, **kwargs):
             kwargs["progress"]("module", {
-                "id": "risk_review", "model": "gpt-6.1-sol", "effort": "high", "status": "error",
+                "id": "risk_review", "model": "gpt-6.1-sol-cpa", "effort": "high", "status": "error",
                 "requested_model": "deepseek-v4-pro", "route_group": "cpa_gpt",
                 "rescue_configured": True, "rescue_attempted": True, "rescue_used": False,
                 "attempts": [{"status": "error"}],
@@ -482,7 +482,7 @@ class TestRescueProgress(unittest.TestCase):
             stack.enter_context(patch.object(tgbot, "_archive_report", return_value=None))
             tgbot._run_multi_sop(123, 456)
         texts = [call.args[2] for call in edits.call_args_list]
-        self.assertTrue(any("最后尝试 gpt-6.1-sol / high" in text
+        self.assertTrue(any("最后尝试 gpt-6.1-sol-cpa / high" in text
                             and "公共兜底也失败 · cpa_gpt" in text for text in texts))
 
 

@@ -848,7 +848,8 @@ def _apply_completion_options(payload: dict, model: str, route_group: str,
 def _payload(model: str, system: str, user: str, max_tokens: int,
              effort: str, stream: bool, route_group: str) -> dict:
     p = {
-        "model": model,
+        # 本地别名（如 gpt-6-astra-cpa）只用于选路与配置，上游只认真实模型名
+        "model": config.llm_upstream_model(model),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -1595,7 +1596,7 @@ def probe(idx: int, which: str = "heavy", *, model: str = "",
         probe_to = min(30, int(st["non_stream_timeout"]))
     else:
         probe_to = max(1, min(300, int(timeout_seconds)))
-    payload = {"model": req_model,
+    payload = {"model": config.llm_upstream_model(req_model),
                "messages": [{"role": "user", "content": prompt}]}
     _apply_completion_options(payload, req_model, ep["route_group"],
                               max_tokens, effort, force_effort=force_effort)

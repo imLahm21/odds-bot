@@ -92,7 +92,7 @@ class TestFullModelExclusions(unittest.TestCase):
             self.assertEqual(saved, raw)
 
     def test_legacy_blocked_fallback_is_cleared_without_resetting_other_manual_choices(self):
-        pairs = [{"model": "gpt-6-astra", "effort": "xhigh"},
+        pairs = [{"model": "gpt-6-astra-cpa", "effort": "xhigh"},
                  {"model": _BLOCKED, "effort": "high"},
                  {"model": "claude-sonnet-5-5-high", "effort": "medium"}]
         raw = self._save_legacy("market_primary", pairs)

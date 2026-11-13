@@ -312,6 +312,7 @@ def seed_config(conn: sqlite3.Connection) -> None:
         "VALUES (?,?,?)", tier_rows)
     _migrate_llm_tier_model_profile(conn, now)
     _migrate_cpa_light_models(conn, now)
+    _migrate_cpa_gpt_split(conn, now)
     # 版本化迁移之后只【报告】指向未登记模型的槽位，不改值——
     # 用户可能故意把某槽位指到网关上的私有模型（见 set_llm_runtime_state 的
     # allow_any 与「未知自定义值保持不动」契约）。已下线的旧模型名由
@@ -353,6 +354,63 @@ def _migrate_cpa_light_models(conn: sqlite3.Connection, now: str) -> None:
         (_LLM_CPA_LIGHT_PROFILE_KEY, version, now))
     if changed:
         log.info("CPA 轻档升级：%d 个旧 Luna 槽位已改为 gpt-6-luna", changed)
+
+
+_LLM_CPA_GPT_SPLIT_KEY = "_cpa_gpt_split_version"
+
+
+def _migrate_cpa_gpt_split(conn: sqlite3.Connection, now: str) -> int:
+    """IK / CPA 的 GPT 按模型名分离：已保存的同名 GPT 一次性改写为 CPA 别名。
+
+    分离前 gpt-6-astra / gpt-6.1-sol 同挂 ik_gpt 与 cpa_gpt、实际只走 CPA；分离后这两个
+    名字只代表 IK。为保持原行为，把 12 个档位槽、全模型职责链、全模型兜底里的旧名改成
+    config.LLM_CPA_GPT_SPLIT_MAP 的目标；明确钉在 ik_gpt 的兜底不动。
+    版本标记保证只执行一次，之后用户在 /llm 面板选回 IK 版不会被再次改写。返回改写条数。
+    """
+    version = "2026-11-12-split"
+    row = conn.execute(
+        "SELECT value FROM llm_runtime_state WHERE key=?",
+        (_LLM_CPA_GPT_SPLIT_KEY,)).fetchone()
+    if row and row[0] == version:
+        return 0
+    mapping = config.LLM_CPA_GPT_SPLIT_MAP
+    changed = 0
+    for old, new in mapping.items():
+        for key in _runtime_defaults():
+            changed += conn.execute(
+                "UPDATE llm_runtime_state SET value=?, updated_at=? WHERE key=? AND value=?",
+                (new, now, key, old)).rowcount
+    for profile, role, raw in conn.execute(
+            "SELECT profile, role, slots_json FROM full_model_routes").fetchall():
+        try:
+            pairs = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(pairs, list):
+            continue
+        touched = False
+        for pair in pairs:
+            if isinstance(pair, dict) and pair.get("model") in mapping:
+                pair["model"] = mapping[pair["model"]]
+                touched = True
+        if touched:
+            conn.execute(
+                "UPDATE full_model_routes SET slots_json=?, updated_at=? "
+                "WHERE profile=? AND role=?",
+                (json.dumps(pairs, ensure_ascii=False), now, profile, role))
+            changed += 1
+    for old, new in mapping.items():
+        changed += conn.execute(
+            "UPDATE full_model_rescue SET model=?, updated_at=? "
+            "WHERE model=? AND route_group != 'ik_gpt'", (new, now, old)).rowcount
+    conn.execute(
+        "INSERT INTO llm_runtime_state (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (_LLM_CPA_GPT_SPLIT_KEY, version, now))
+    if changed:
+        log.info("IK / CPA GPT 分离：%d 处已保存的同名 GPT 改写为 CPA 别名", changed)
+    return changed
 
 
 def _migrate_llm_tier_model_profile(conn: sqlite3.Connection, now: str) -> int:

@@ -152,8 +152,10 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 `cpa_gpt`/`cpa_claude`/`cpa_gemini`。一条密钥只属于一个组，CPA 三组也须分别使用不同的 Key。
 组内可配多条密钥轮转。缺组时该组模型在 `/llm` 面板标 ❌，可用回退模型顶上。
 
-**CPA 接入**：两款 Luna 统一走 `cpa_gpt`，旧 `openai_gpt` 组已移除。`gpt-6-astra`、
-`gpt-6.1-sol` 保持同名，可使用 IK / CPA 两组已配置的端点，按健康状态排序及轮转选路。
+**CPA 接入**：供应商按模型名分离，一个模型名只属于一个授权组。两款 Luna 统一走 `cpa_gpt`，
+旧 `openai_gpt` 组已移除。GPT 的标准名（`gpt-6-astra`、`gpt-6.1-sol` 等）只走 IK；CPA 的 GPT
+用本地别名 `gpt-6-astra-cpa`、`gpt-6.1-sol-cpa`、`gpt-6.1-terra-cpa`，只走 `cpa_gpt`，请求时自动换回
+上游真实模型名（去掉 `-cpa`）；别名未单列 token 预算时沿用上游同名模型的配置。
 Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-high` 变体仅走 CPA。
 
 | CPA 专用模型 ID | 密钥组 | 可选档位 | 输出预算示例 | 输入预警线示例 |

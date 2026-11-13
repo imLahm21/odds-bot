@@ -403,7 +403,7 @@ CLEANUP_LIVE_DAYS = 7         # 走地快照(live_odds_history)保留 N 天。�
 # LLM_MODEL 是【重档默认模型】的兼容常量：等于 LLM_TIER_MODELS["heavy"]["default"]。
 # 运行时实际用哪个重档模型由 db.llm_runtime_state 决定（/llm 面板可切 astra/grok），
 # llm_client 按【档位 tier】而非模型名路由（见 _resolve_model）。此常量供 probe_llm 等直读兜底。
-LLM_MODEL = "gpt-6-astra"
+LLM_MODEL = "gpt-6-astra-cpa"
 LLM_TIMEOUT = 300             # 秒，重档推理 + 长报告，给足超时
 def _positive_env_int(name: str, default: int) -> int:
     """读取正整数环境变量；空值、非整数或非正数均安全回退默认值。"""
@@ -443,7 +443,10 @@ LLM_MODEL_MAX_TOKENS: dict[str, int] = _parse_model_token_limits(
 
 def llm_max_tokens_for_model(model: str) -> int:
     """返回模型的重档输出预算（按模型覆盖 > 全局默认）。"""
-    return LLM_MODEL_MAX_TOKENS.get(model, LLM_MAX_TOKENS)
+    if model in LLM_MODEL_MAX_TOKENS:
+        return LLM_MODEL_MAX_TOKENS[model]
+    # 本地别名（-cpa）未单列时沿用上游同名模型的预算
+    return LLM_MODEL_MAX_TOKENS.get(llm_upstream_model(model), LLM_MAX_TOKENS)
 
 
 # 输入规模只做预警，绝不截断、不压缩、不阻止请求。估算值因不同供应商 tokenizer
@@ -456,7 +459,9 @@ LLM_MODEL_INPUT_WARN_TOKENS: dict[str, int] = _parse_model_token_limits(
 
 def llm_input_warn_tokens_for_model(model: str) -> int:
     """返回模型的输入 token 预警线（按模型覆盖 > 全局预警线）。"""
-    return LLM_MODEL_INPUT_WARN_TOKENS.get(model, LLM_INPUT_WARN_TOKENS)
+    if model in LLM_MODEL_INPUT_WARN_TOKENS:
+        return LLM_MODEL_INPUT_WARN_TOKENS[model]
+    return LLM_MODEL_INPUT_WARN_TOKENS.get(llm_upstream_model(model), LLM_INPUT_WARN_TOKENS)
 
 
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
@@ -551,9 +556,9 @@ LLM_MODELS: dict[str, dict] = {
     "grok-4.7":         {"label": "Grok 4.7", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GROK_46},
     # ── 轻型池：走地实时研判 ──
-    "gpt-5.6-luna":     {"label": "GPT-5.6 Luna", "tiers": ("light",),
+    "gpt-5.6-luna":     {"label": "CPA · GPT-5.6 Luna", "tiers": ("light",),
                            "efforts": _EFFORT_OPENAI_LUNA},
-    "gpt-6-luna":      {"label": "GPT-6 Luna", "tiers": ("light",),
+    "gpt-6-luna":      {"label": "CPA · GPT-6 Luna", "tiers": ("light",),
                            "efforts": _EFFORT_OPENAI_LUNA},
     # Append new candidates to preserve existing index-based menu callbacks.
     "gemini-4-argon":   {"label": "Gemini 4 Argon", "tiers": ("heavy", "balanced"),
@@ -577,7 +582,26 @@ LLM_MODELS: dict[str, dict] = {
         "label": "CPA · Gemini 4 Argon High", "tiers": ("heavy", "balanced"),
         "efforts": _EFFORT_GEMINI_4_ARGON,
     },
+    # CPA 的 GPT 与 IK 上游同名，故用本地别名（-cpa 后缀）分开登记，一个模型名只属于一个
+    # 授权组；请求时按 upstream 换回上游真实模型名（见 llm_upstream_model）。
+    "gpt-6-astra-cpa": {
+        "label": "CPA · GPT-6 Astra", "tiers": ("heavy",),
+        "efforts": _EFFORT_OPENAI_ASTRA, "upstream": "gpt-6-astra",
+    },
+    "gpt-6.1-sol-cpa": {
+        "label": "CPA · GPT-6.1 Sol", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OPENAI_61_SOL, "upstream": "gpt-6.1-sol",
+    },
+    "gpt-6.1-terra-cpa": {
+        "label": "CPA · GPT-6.1 Terra", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OPENAI_TERRA, "upstream": "gpt-6.1-terra",
+    },
 }
+
+
+def llm_upstream_model(model: str) -> str:
+    """发给上游的真实模型名。本地别名（如 gpt-6-astra-cpa）换回 upstream，其余原样返回。"""
+    return (LLM_MODELS.get(model) or {}).get("upstream") or model
 
 
 def llm_model_label(model: str) -> str:
@@ -617,7 +641,7 @@ def llm_model_supports_effort(model: str, effort: str) -> bool:
 #    取值会被 db 的档位校验拒掉、并被 _sanitize 拉回本档默认。
 LLM_TIER_MODELS: dict[str, dict] = {
     "heavy":    {"label": "重档·主精算",
-                 "default": "gpt-6-astra",
+                 "default": "gpt-6-astra-cpa",
                  "visitor_default": "deepseek-v4-pro"},
     "balanced": {"label": "平衡·基本面/SEO",
                  "default": "gpt-5.6-terra",
@@ -649,7 +673,7 @@ def llm_tier_default(tier: str, visitor: bool = False) -> str:
 # Both light models share one key group; leave fallback unset by default.
 LLM_FALLBACK_TIER_MODELS: dict[str, dict[str, str]] = {
     "heavy": {
-        "admin": "grok-4.6",        # 主 astra 走 ik_gpt / cpa_gpt → 回退落 ik_grok
+        "admin": "grok-4.6",        # 主 astra 走 cpa_gpt → 回退落 ik_grok
         "visitor": "glm-5.3",       # 主 deepseek-v4-pro → 回退落 ik_glm
     },
     "balanced": {
@@ -707,13 +731,14 @@ LLM_MODEL_FAMILY_GROUPS: dict[str, str] = {
     "claude": "ik_claude",
 }
 
-# 两款 Luna 走 cpa_gpt；已列出的同名 GPT 允许使用 IK / CPA 两组。
-# Claude / Gemini 标准名按家族走 IK，CPA 的 -high 完整 ID 仅走对应 CPA 组。
-# 返回多个组表示都可参与现有轮转，不表示元组前面的组始终优先。
+# 供应商按模型名分离：一个模型名只属于一个授权组。标准名（GPT / Claude / Gemini…）按家族走 IK；
+# CPA 的模型单独登记——Claude / Gemini 用 CPA 的 -high 完整 ID，GPT 用本地别名 -cpa
+# （上游同名，发送时换回，见 llm_upstream_model），两款 Luna 只有 CPA 提供。
 # 这里只声明程序允许的请求名，具体上游是否提供仍需通过该端点探针验证。
 LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "gpt-6-astra": ("ik_gpt", "cpa_gpt"),
-    "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
+    "gpt-6-astra-cpa": ("cpa_gpt",),
+    "gpt-6.1-sol-cpa": ("cpa_gpt",),
+    "gpt-6.1-terra-cpa": ("cpa_gpt",),
     "gpt-5.6-luna": ("cpa_gpt",),
     "gpt-6-luna": ("cpa_gpt",),
     "claude-opus-5-5-high": ("cpa_claude",),
@@ -842,6 +867,14 @@ LLM_RETIRED_MODEL_UPGRADE_MAP: dict[str, str] = {
     "gpt-5.6-sol": "gpt-6-sol",
 }
 
+# IK / CPA 的 GPT 分离（2026-11）：此前这两个名字同时挂 ik_gpt 与 cpa_gpt，实际只走 CPA
+# （IK-GPT 端点停用）。已保存的槽位 / 全模型职责 / 兜底一次性改写为 CPA 别名，保持原行为；
+# 明确钉在 ik_gpt 的兜底不改。迁移后这两个名字只代表 IK。
+LLM_CPA_GPT_SPLIT_MAP: dict[str, str] = {
+    "gpt-6-astra": "gpt-6-astra-cpa",
+    "gpt-6.1-sol": "gpt-6.1-sol-cpa",
+}
+
 # 全模型交叉精算/复盘的职责及初始值；各自的手动覆盖保存在 full_model_routes。
 # 不读取普通三档主模型；/llm 的全模型设置可分别调整两套配置及恢复默认。
 # consult_grade 是全模型专用能力等级，不等同于运行时 heavy/balanced/light 档位。
@@ -854,6 +887,8 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gpt-6-astra": "flagship",
     "gpt-6-sol": "flagship",
     "gpt-6.1-sol": "flagship",
+    "gpt-6-astra-cpa": "flagship",
+    "gpt-6.1-sol-cpa": "flagship",
     "gpt-5.6-sol": "flagship",
     "grok-4.6": "flagship",
     "grok-4.7": "flagship",
@@ -867,6 +902,7 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gpt-5.6-luna": "specialized_fast",
     "gpt-6-luna": "specialized_fast",
     "gpt-5.6-terra": "specialized_fast",
+    "gpt-6.1-terra-cpa": "specialized_fast",
     "glm-5.3-flash": "specialized_fast",
     "grok-4.5": "specialized_fast",
     "deepseek-v4.1-flash": "specialized_fast",
@@ -884,16 +920,16 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
     {"id": "fundamentals", "label": "基本面主分析", "model": "claude-sonnet-5-5-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-6.1-sol", "effort": "high"},
+         {"model": "gpt-6.1-sol-cpa", "effort": "high"},
           {"model": "gemini-4-argon-high", "effort": "high"},
      )},
     {"id": "fundamentals_review", "label": "基本面复核", "model": "gemini-4-argon-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
          {"model": "deepseek-v4-pro", "effort": "high"},
-          {"model": "gpt-6.1-sol", "effort": "high"},
+          {"model": "gpt-6.1-sol-cpa", "effort": "high"},
      )},
-    {"id": "market_primary", "label": "盘口主分析", "model": "gpt-6.1-sol",
+    {"id": "market_primary", "label": "盘口主分析", "model": "gpt-6.1-sol-cpa",
      "effort": "xhigh", "max_tokens": 0,
      "fallbacks": (
          {"model": "deepseek-v4-pro", "effort": "max"},
@@ -903,7 +939,7 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
          {"model": "claude-opus-5-5-high", "effort": "high"},
-          {"model": "gpt-6.1-sol", "effort": "high"},
+          {"model": "gpt-6.1-sol-cpa", "effort": "high"},
      )},
     {"id": "numeric_summary", "label": "数字整理", "model": "deepseek-v4.1-flash",
      "effort": "high", "max_tokens": 0,
@@ -921,18 +957,18 @@ FULL_CONSULT_TASKS: tuple[dict, ...] = (
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
          {"model": "deepseek-v4-pro", "effort": "max"},
-         {"model": "gpt-6.1-sol", "effort": "xhigh"},
+         {"model": "gpt-6.1-sol-cpa", "effort": "xhigh"},
      )},
     {"id": "lesson_match", "label": "教训匹配", "model": "claude-sonnet-5-5-high",
      "effort": "high", "max_tokens": 0,
      "fallbacks": (
-         {"model": "gpt-6.1-sol", "effort": "high"},
+         {"model": "gpt-6.1-sol-cpa", "effort": "high"},
           {"model": "gemini-4-argon-high", "effort": "high"},
      )},
 )
 
 FULL_CONSULT_SYNTHESIS = {
-    "model": "gpt-6-astra", "effort": "xhigh", "max_tokens": 0,
+    "model": "gpt-6-astra-cpa", "effort": "xhigh", "max_tokens": 0,
     "fallbacks": (
         {"model": "claude-opus-5-5-high", "effort": "high"},
         {"model": "deepseek-v4-pro", "effort": "max"},
@@ -948,8 +984,8 @@ FULL_CONSULT_AUDIT = {
 # Only after a role's normal chain is exhausted; a group pin is mandatory.
 # These are initial values, independently overridable for analysis and review.
 FULL_CONSULT_RESCUE_DEFAULTS = {
-    "analyze": {"model": "gpt-6.1-sol", "effort": "high", "route_group": "cpa_gpt"},
-    "review": {"model": "gpt-6.1-sol", "effort": "high", "route_group": "cpa_gpt"},
+    "analyze": {"model": "gpt-6.1-sol-cpa", "effort": "high", "route_group": "cpa_gpt"},
+    "review": {"model": "gpt-6.1-sol-cpa", "effort": "high", "route_group": "cpa_gpt"},
 }
 FULL_CONSULT_MAX_WORKERS = 4
 FULL_CONSULT_TIMEOUT = 300

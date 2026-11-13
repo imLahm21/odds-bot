@@ -48,7 +48,7 @@ from scripts import probe_llm_efforts                       # noqa: E402
 
 
 PRIMARY = {
-    "model_heavy": "gpt-6-astra",
+    "model_heavy": "gpt-6-astra-cpa",
     "model_heavy_visitor": "deepseek-v4-pro",
     "model_balanced": "gpt-5.6-terra",
     "model_balanced_visitor": "deepseek-v4.1-flash",
@@ -161,16 +161,16 @@ class TestModelProfile(unittest.TestCase):
             "balanced": {"admin": "grok-4.5", "visitor": "glm-5.3-flash"},
             "light": {"admin": "", "visitor": ""},
         })
-        self.assertEqual(config.LLM_MODEL, "gpt-6-astra")
+        self.assertEqual(config.LLM_MODEL, "gpt-6-astra-cpa")
         self.assertEqual(config.LLM_LIVE_MODEL, "gpt-6-luna")
         self.assertEqual(
             {model: config.llm_route_groups_for_model(model)
              for model in config.LLM_MODELS},
             {
-                "gpt-6-astra": ("ik_gpt", "cpa_gpt"),
+                "gpt-6-astra": ("ik_gpt",),
                 "gpt-5.6-sol": ("ik_gpt",),
                 "gpt-6-sol": ("ik_gpt",),
-                "gpt-6.1-sol": ("ik_gpt", "cpa_gpt"),
+                "gpt-6.1-sol": ("ik_gpt",),
                 "claude-opus-5-5": ("ik_claude",),
                 "claude-sonnet-5-5": ("ik_claude",),
                 "grok-4.7": ("ik_grok",),
@@ -189,6 +189,9 @@ class TestModelProfile(unittest.TestCase):
                 "claude-sonnet-5-5-high": ("cpa_claude",),
                 "gemini-3.8-flash-high": ("cpa_gemini",),
                 "gemini-4-argon-high": ("cpa_gemini",),
+                "gpt-6-astra-cpa": ("cpa_gpt",),
+                "gpt-6.1-sol-cpa": ("cpa_gpt",),
+                "gpt-6.1-terra-cpa": ("cpa_gpt",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -231,8 +234,10 @@ class TestModelProfile(unittest.TestCase):
             "claude-opus-5-5", "claude-sonnet-5-5", "gemini-4-argon",
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
+            "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
+                                    "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
                                     "glm-5.3-flash", "grok-4.5",
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                                     "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
@@ -242,6 +247,7 @@ class TestModelProfile(unittest.TestCase):
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {"gpt-5.6-terra", "deepseek-v4.1-flash",
+                          "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                           "gemini-4-argon", "claude-sonnet-5-5-high",
@@ -253,11 +259,12 @@ class TestModelProfile(unittest.TestCase):
         new_models = (
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
+            "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
         )
-        self.assertEqual(tuple(config.LLM_MODELS)[-4:], new_models)
+        self.assertEqual(tuple(config.LLM_MODELS)[-7:], new_models)
         for tier, expected in (
             ("heavy", new_models),
-            ("balanced", new_models[1:]),
+            ("balanced", new_models[1:4] + new_models[5:]),
         ):
             self.assertEqual(tuple(config.llm_tier_eligible_models(tier))[-len(expected):],
                              expected)
@@ -642,7 +649,8 @@ class TestModelProfile(unittest.TestCase):
 
     def test_cpa_routes_and_payloads_use_exact_provider_model_names(self):
         expected = {
-            "cpa_gpt": {"gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-luna", "gpt-6-luna"},
+            "cpa_gpt": {"gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+                        "gpt-5.6-luna", "gpt-6-luna"},
             "cpa_claude": {"claude-opus-5-5-high", "claude-sonnet-5-5-high"},
             "cpa_gemini": {"gemini-3.8-flash-high", "gemini-4-argon-high"},
         }
@@ -663,7 +671,9 @@ class TestModelProfile(unittest.TestCase):
                         self.assertEqual([ep["route_group"] for _, ep in routed], [group])
                         payload = llm_client._payload(
                             model, "system", "user", 1024, "high", True, group)
-                        self.assertEqual(payload["model"], model)
+                        # -cpa 是本地别名：选路用别名，发给上游的是真实模型名
+                        self.assertEqual(payload["model"], config.llm_upstream_model(model))
+                        self.assertNotIn("-cpa", payload["model"])
                         self.assertEqual(payload["reasoning_effort"], "high")
                         self.assertEqual(probe_llm_efforts._endpoint_indices(model),
                                          tuple(idx for idx, _ in routed))
@@ -755,12 +765,15 @@ class TestModelProfile(unittest.TestCase):
             luna = llm_client._endpoints_by_priority("gpt-5.6-luna")
             first_gpt = llm_client._endpoints_by_priority("gpt-6-astra")
             second_gpt = llm_client._endpoints_by_priority("gpt-6-astra")
+            cpa_gpt = llm_client._endpoints_by_priority("gpt-6-astra-cpa")
             self.assertEqual(llm_client.routing_issues(), [])
 
         self.assertEqual([ep["label"] for _, ep in grok], ["Grok"])
         self.assertEqual([ep["label"] for _, ep in luna], ["CPA"])
         self.assertEqual(
-            {ep["label"] for _, ep in first_gpt}, {"GPT-1", "GPT-2", "CPA"})
+            {ep["label"] for _, ep in first_gpt}, {"GPT-1", "GPT-2"})
+        # IK / CPA 按模型名分离：同一上游模型的两个本地名各走各的供应商
+        self.assertEqual([ep["label"] for _, ep in cpa_gpt], ["CPA"])
         self.assertNotEqual(
             first_gpt[0][1]["label"], second_gpt[0][1]["label"])
 
@@ -1622,6 +1635,7 @@ class TestModelProfile(unittest.TestCase):
             for key in ("model_light", "model_light_visitor",
                         "fallback_light", "fallback_light_visitor"):
                 expected[key] = "gpt-6-luna"
+            expected["model_balanced"] = "gpt-6.1-sol-cpa"   # IK / CPA GPT 分离迁移
             self.assertEqual(db.get_llm_runtime_state(conn), expected)
 
             # 之后管理员主动改选旧模型，重启时不重复迁移覆盖。
@@ -1630,6 +1644,52 @@ class TestModelProfile(unittest.TestCase):
             db.seed_config(conn)
             expected["model_light"] = "gpt-5.6-luna"
             self.assertEqual(db.get_llm_runtime_state(conn), expected)
+        finally:
+            conn.close()
+
+    def test_cpa_gpt_split_migration_rewrites_saved_names_once(self):
+        """IK / CPA GPT 分离：已保存的同名 GPT 改写为 CPA 别名；钉在 ik_gpt 的兜底不动；只跑一次。"""
+        import json
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(db.SCHEMA)
+            saved = full_state(PRIMARY)
+            saved.update({"model_heavy": "gpt-6-astra", "fallback_heavy": "gpt-6.1-sol",
+                          "model_balanced": "gpt-6-sol"})
+            conn.executemany(
+                "INSERT INTO llm_runtime_state (key, value) VALUES (?,?)",
+                [*saved.items(), (db._LLM_MODEL_PROFILE_KEY,
+                                  config.LLM_TIER_MODEL_PROFILE_VERSION)])
+            conn.execute(
+                "INSERT INTO full_model_routes (profile, role, slots_json) VALUES (?,?,?)",
+                ("analyze", "market_primary", json.dumps([
+                    {"model": "gpt-6.1-sol", "effort": "xhigh"},
+                    {"model": "deepseek-v4-pro", "effort": "max"},
+                    {"model": "", "effort": ""}])))
+            conn.execute("INSERT INTO full_model_rescue VALUES (?,?,?,?,?)",
+                         ("analyze", "gpt-6.1-sol", "high", "cpa_gpt", None))
+            conn.execute("INSERT INTO full_model_rescue VALUES (?,?,?,?,?)",
+                         ("review", "gpt-6-astra", "low", "ik_gpt", None))
+            db.seed_config(conn)
+            state = db.get_llm_runtime_state(conn)
+            self.assertEqual(state["model_heavy"], "gpt-6-astra-cpa")
+            self.assertEqual(state["fallback_heavy"], "gpt-6.1-sol-cpa")
+            self.assertEqual(state["model_balanced"], "gpt-6-sol")      # 仅 IK 有，不动
+            slots = json.loads(conn.execute(
+                "SELECT slots_json FROM full_model_routes").fetchone()[0])
+            self.assertEqual(slots[0]["model"], "gpt-6.1-sol-cpa")
+            self.assertEqual(slots[1]["model"], "deepseek-v4-pro")
+            self.assertEqual(db.get_full_model_rescue(conn, "analyze"),
+                             {"model": "gpt-6.1-sol-cpa", "effort": "high",
+                              "route_group": "cpa_gpt"})
+            self.assertEqual(db.get_full_model_rescue(conn, "review"),
+                             {"model": "gpt-6-astra", "effort": "low",
+                              "route_group": "ik_gpt"})
+
+            # 之后管理员主动选回 IK 版，重启不再改写
+            self.assertTrue(db.set_llm_runtime_state(conn, "model_heavy", "gpt-6-astra"))
+            db.seed_config(conn)
+            self.assertEqual(db.get_llm_runtime_state(conn)["model_heavy"], "gpt-6-astra")
         finally:
             conn.close()
 
@@ -1676,7 +1736,7 @@ class TestModelProfile(unittest.TestCase):
             conn.commit()
             db.seed_config(conn)
             self.assertEqual(
-                db.get_llm_runtime_state(conn)["model_heavy"], "gpt-6-astra")
+                db.get_llm_runtime_state(conn)["model_heavy"], "gpt-6-astra-cpa")
         finally:
             conn.close()
 
@@ -1740,7 +1800,7 @@ class TestModelProfile(unittest.TestCase):
 
                 llm_client.reset_runtime_models()
                 self.assertEqual(
-                    llm_client.get_tier_model("heavy"), "gpt-6-astra")
+                    llm_client.get_tier_model("heavy"), "gpt-6-astra-cpa")
                 self.assertEqual(
                     llm_client.get_tier_model("heavy", visitor=True),
                     "deepseek-v4-pro")

@@ -40,7 +40,7 @@ class TestFullModelRuntime(unittest.TestCase):
 
     @contextmanager
     def _stream_transport(self, fallback=False, review=False):
-        actual = "claude-opus-5-5-high" if fallback else "gpt-6-astra"
+        actual = "claude-opus-5-5-high" if fallback else "gpt-6-astra-cpa"
         endpoint = {"label": "offline", "route_group": "cpa_claude" if fallback else "ik_gpt",
                     "base_url": "https://offline.invalid/v1", "key": "offline"}
 
@@ -81,7 +81,7 @@ class TestFullModelRuntime(unittest.TestCase):
         used = Mock()
         with self._stream_transport(fallback=True):
             events = list(llm_client.stream_chat_model(
-                "system", "user", "gpt-6-astra", effort="xhigh",
+                "system", "user", "gpt-6-astra-cpa", effort="xhigh",
                 fallback_models=("claude-opus-5-5-high",), fallback_efforts=("high",),
                 on_model_used=used))
         self.assertEqual([event[0] for event in events], ["delta", "done"])
@@ -93,7 +93,7 @@ class TestFullModelRuntime(unittest.TestCase):
             llm_client, "_stream_one", return_value=iter([("done", _report())])
         ):
             events = list(llm_client.stream_chat_model(
-                "system", "user", "gpt-6-astra", effort="xhigh",
+                "system", "user", "gpt-6-astra-cpa", effort="xhigh",
                 fallback_models=("claude-opus-5-5-high",), fallback_efforts=("high",),
                 on_model_used=used))
         self.assertEqual([event[0] for event in events], ["done"])
@@ -120,16 +120,16 @@ class TestFullModelRuntime(unittest.TestCase):
                 return ('{"ok":false,"issues":["fix"]}' if model == "claude-opus-5-5-high"
                         else '{"ok":true,"issues":[]}')
             calls.append(("repair", model))
-            return "LLM 请求失败（offline）" if model == "gpt-6-astra" else _report() + "\n修复标记"
+            return "LLM 请求失败（offline）" if model == "gpt-6-astra-cpa" else _report() + "\n修复标记"
 
         with self._stream_transport(), patch.object(llm_client, "chat_model", side_effect=chat):
             report, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League")
         self.assertIn("修复标记", report)
         self.assertEqual(calls, [
-            ("audit", "claude-opus-5-5-high"), ("repair", "gpt-6-astra"),
+            ("audit", "claude-opus-5-5-high"), ("repair", "gpt-6-astra-cpa"),
             ("repair", "claude-opus-5-5-high"), ("audit", "gemini-4-argon-high"),
         ])
-        self.assertEqual(set(summary["writers"]), {"gpt-6-astra", "claude-opus-5-5-high"})
+        self.assertEqual(set(summary["writers"]), {"gpt-6-astra-cpa", "claude-opus-5-5-high"})
 
     def test_cpa_and_ik_names_of_same_model_are_not_independent_auditors(self):
         with patch.object(llm_client, "chat_model", return_value='{"ok":true}') as chat:
@@ -154,7 +154,7 @@ class TestFullModelRuntime(unittest.TestCase):
 
     def test_filtering_writers_does_not_invalidate_original_cross_group_chain(self):
         spec = deepcopy(config.FULL_CONSULT_AUDIT)
-        spec["fallbacks"] = ({"model": "gpt-6.1-sol", "effort": "high"},
+        spec["fallbacks"] = ({"model": "gpt-6.1-sol-cpa", "effort": "high"},
                              {"model": "gpt-6-sol", "effort": "high"})
         with patch.object(llm_client, "chat_model", side_effect=["invalid json", '{"ok":true}']) as chat:
             result, route = multi_analyzer._call_route(
@@ -162,7 +162,7 @@ class TestFullModelRuntime(unittest.TestCase):
                 excluded_models={"claude-opus-5-5-high"})
         self.assertTrue(result["ok"])
         self.assertEqual(route["model"], "gpt-6-sol")
-        self.assertEqual([call.kwargs["model"] for call in chat.call_args_list], ["gpt-6.1-sol", "gpt-6-sol"])
+        self.assertEqual([call.kwargs["model"] for call in chat.call_args_list], ["gpt-6.1-sol-cpa", "gpt-6-sol"])
 
     def test_job_snapshots_are_not_affected_by_later_database_edits(self):
         conn = sqlite3.connect(":memory:")
@@ -182,7 +182,7 @@ class TestFullModelRuntime(unittest.TestCase):
             _, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League",
                                              settings=snapshot, progress=progress)
         actual = next(result for result in summary["results"] if result["id"] == "market_primary")
-        self.assertEqual(actual["model"], "gpt-6.1-sol")
+        self.assertEqual(actual["model"], "gpt-6.1-sol-cpa")
         self.assertEqual(db.get_full_model_profile(conn, "analyze")["market_primary"]["model"], "grok-4.7")
         self.snapshot.assert_not_called()
 

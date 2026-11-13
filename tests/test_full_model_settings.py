@@ -20,15 +20,15 @@ from bot import config, db, full_model_settings as settings, full_model_ui, tgbo
 
 _APPROVED = {
     "data_audit": "gpt-6-luna/low glm-5.3-flash/low deepseek-v4.1-flash/low",
-    "fundamentals": "claude-sonnet-5-5-high/high gpt-6.1-sol/high gemini-4-argon-high/high",
-    "fundamentals_review": "gemini-4-argon-high/high deepseek-v4-pro/high gpt-6.1-sol/high",
-    "market_primary": "gpt-6.1-sol/xhigh deepseek-v4-pro/max gemini-4-argon-high/high",
-    "market_challenge": "grok-4.7/high claude-opus-5-5-high/high gpt-6.1-sol/high",
+    "fundamentals": "claude-sonnet-5-5-high/high gpt-6.1-sol-cpa/high gemini-4-argon-high/high",
+    "fundamentals_review": "gemini-4-argon-high/high deepseek-v4-pro/high gpt-6.1-sol-cpa/high",
+    "market_primary": "gpt-6.1-sol-cpa/xhigh deepseek-v4-pro/max gemini-4-argon-high/high",
+    "market_challenge": "grok-4.7/high claude-opus-5-5-high/high gpt-6.1-sol-cpa/high",
     "numeric_summary": "deepseek-v4.1-flash/high glm-5.3-flash/high gpt-6-luna/medium",
     "risk_review": "deepseek-v4-pro/max claude-opus-5-5-high/high gemini-4-argon-high/high",
-    "cross_market": "gemini-4-argon-high/high deepseek-v4-pro/max gpt-6.1-sol/xhigh",
-    "lesson_match": "claude-sonnet-5-5-high/high gpt-6.1-sol/high gemini-4-argon-high/high",
-    "synthesis": "gpt-6-astra/xhigh claude-opus-5-5-high/high deepseek-v4-pro/max",
+    "cross_market": "gemini-4-argon-high/high deepseek-v4-pro/max gpt-6.1-sol-cpa/xhigh",
+    "lesson_match": "claude-sonnet-5-5-high/high gpt-6.1-sol-cpa/high gemini-4-argon-high/high",
+    "synthesis": "gpt-6-astra-cpa/xhigh claude-opus-5-5-high/high deepseek-v4-pro/max",
     "audit": "claude-opus-5-5-high/high gemini-4-argon-high/high deepseek-v4-pro/max",
 }
 
@@ -81,12 +81,12 @@ class TestFullModelSettings(_ProfileFixture):
 
     def test_primary_and_both_fallback_pairs_persist_independently(self):
         self._set()
-        self._set(slot=1, model="gpt-6-astra", effort="low")
+        self._set(slot=1, model="gpt-6-astra-cpa", effort="low")
         self._set(slot=2, model="claude-sonnet-5-5-high", effort="medium")
         pairs = settings.slots(db.get_full_model_profile(self.conn, "analyze")["market_primary"])
         self.assertEqual(pairs, [
             {"model": "grok-4.7", "effort": "high"},
-            {"model": "gpt-6-astra", "effort": "low"},
+            {"model": "gpt-6-astra-cpa", "effort": "low"},
             {"model": "claude-sonnet-5-5-high", "effort": "medium"},
         ])
         self.assertEqual(db.get_full_model_profile(self.conn, "review"), settings.defaults("review"))
@@ -192,7 +192,7 @@ class TestFullModelUI(_ProfileFixture):
         self.assertEqual(db.get_full_model_profile(self.conn, "analyze")["market_primary"]["effort"], "high")
 
     def test_effort_menu_only_contains_model_registered_options_and_provider_default(self):
-        index = list(config.LLM_MODELS).index("gpt-6.1-sol")
+        index = list(config.LLM_MODELS).index("gpt-6.1-sol-cpa")
         _, keyboard, _ = full_model_ui.handle_callback(self.conn, f"fmc:c:r:3:0:{index}")
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
         self.assertIn("模型默认（不发送参数）", labels)
