@@ -283,7 +283,7 @@ ALLOWED_CHAT_IDS = _parse_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")) \
 
 # 仅管理员可用的配置类命令（访客调用会被拒绝）
 _ADMIN_ONLY_CMDS = {"leagues", "bookmakers", "add", "remove", "publish", "llm",
-                    "lesson", "wxpublish"}
+                    "lesson", "wxpublish", "hypstats"}
 
 API_BASE = f"{config.TELEGRAM_API}/bot{TOKEN}"
 
@@ -664,6 +664,7 @@ _HELP_ADMIN_EXTRA = (
     "（选日期→选报告，自动生成+合规提示+存草稿，人工后台确认后发）\n"
     "/lesson — 把 report/ 历史复盘（_review）蒸馏归档为实战教训（选日期→选报告）\n"
     "/llm — LLM 端点连通性测试 + 故障转移/熔断参数面板（测试延迟、改重试/超时/熔断阈值）\n"
+    "/hypstats — 统计假设登记后的样本命中率并给出状态建议\n"
 )
 HELP = _HELP_VISITOR + _HELP_ADMIN_EXTRA   # 兼容旧引用：完整版
 
@@ -1839,6 +1840,64 @@ def _lesson_report_keyboard(chat_id: int, date: str) -> dict | None:
     return {"inline_keyboard": rows}
 
 
+HYPSTATS_FOOTER = "状态不会自动变更；确认后请在本地改 rules/假设登记表.md 并提交。"
+
+
+def _import_hypothesis_scripts():
+    """scripts/ 不是包：临时把它加进 sys.path 再 import（同 build_hypothesis_stats.py 文件头）。"""
+    import sys
+    scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "scripts")
+    added = scripts_dir not in sys.path
+    if added:
+        sys.path.insert(0, scripts_dir)
+    try:
+        import backtest_hypotheses
+        import build_hypothesis_stats
+    finally:
+        if added and scripts_dir in sys.path:
+            sys.path.remove(scripts_dir)
+    return backtest_hypotheses, build_hypothesis_stats
+
+
+def _cmd_hypstats(chat_id: int) -> None:
+    """/hypstats（仅管理员）：补取比分 → 统计假设登记后样本 → 发回报告与状态建议。
+    后台执行；不写登记表、不改假设状态（规则文件由 git 管理，服务器上不改）。"""
+    send(chat_id, "⏳ 正在补取比分并统计假设登记后样本，完成后发回报告…")
+    _submit_bg(_run_hypstats, chat_id)
+
+
+def _run_hypstats(chat_id: int) -> None:
+    try:
+        bt, stats = _import_hypothesis_scripts()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("/hypstats 加载统计脚本失败")
+        send(chat_id, f"❌ 加载统计脚本失败：{exc}", plain=True)
+        return
+    # 登记日期未填写时先返回脚本的报错原文，不白白调 API 取比分
+    if not stats.registration_date(stats.REGISTRY.read_text(encoding="utf-8")):
+        send(chat_id, stats.NO_REGISTRATION_DATE, plain=True)
+        return
+    db_path = config.DB_PATH if os.path.isabs(config.DB_PATH) else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), config.DB_PATH)
+    try:
+        fetched = bt.fetch_scores([db_path])
+    except Exception as exc:  # noqa: BLE001
+        log.exception("/hypstats 取比分失败")
+        send(chat_id, f"❌ 取比分失败：{exc}", plain=True)
+        return
+    try:
+        md, _ = stats.build_report([db_path])
+    except ValueError as exc:
+        send(chat_id, str(exc), plain=True)
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.exception("/hypstats 统计失败")
+        send(chat_id, f"❌ 统计失败：{exc}", plain=True)
+        return
+    _send_long(chat_id, f"📊 本次补取比分 {fetched} 个比赛日\n\n{md.rstrip()}\n\n{HYPSTATS_FOOTER}")
+
+
 def _cmd_lesson(chat_id: int) -> None:
     """独立命令：从 report/ 历史复盘报告里选一份，蒸馏归档为实战教训（仅管理员）。
     补足「错过 /review 后那个按钮」或「给历史复盘补归教训」的入口。"""
@@ -2441,14 +2500,14 @@ def _cmd_analyze(chat_id: int, args: list[str]) -> None:
     ]}
     if _is_admin(chat_id):
         kb["inline_keyboard"].append(
-            [{"text": "🧪 全模型交叉精算（待适配新分层）", "callback_data": f"am:{fid}"}])
+            [{"text": "🧪 全模型交叉精算", "callback_data": f"am:{fid}"}])
     send(chat_id, "请选择下一步：\n"
                   "🧠 基本面预分析 = 先用轻量模型把两队近况/交锋/赛程/积分榜"
                   "分析成一份可读概述（可选、较慢，可随时停止；跑基本面时仍可发其它命令）；\n"
                   "🎯 预设精算 = 跳过预分析，直接按标准 SOP 跑结果预测；\n"
                   "✍️ 自定义侧重 = 选大小球 / 波胆 / 激进 / 保守，或补充一句信息。\n"
-                  "🧪 全模型交叉精算 = 按职责调用所选模型分别分析，"
-                  "按保存的职责链合并、独立审计（管理员功能；职责提示词仍是旧分层措辞，过渡期结论勿用于下注）。\n"
+                  "🧪 全模型交叉精算 = 按职责调用所选模型分别分析，再合并并独立审计"
+                  "（管理员功能；耗时约 10~20 分钟）。\n"
                   "🎯/✍️ 选完后再按当前重档模型选择可用的中英双语推理强度。\n"
                   "（预分析不影响精算质量——主 SOP 本就会自行研判原始基本面）", kb)
 
@@ -2650,6 +2709,38 @@ def _run_sop(chat_id: int, fid: int, extra_instruction: str = "",
         send(chat_id, f"📁 报告已归档：{path}")
 
 
+def _audit_notice(audit: dict | None) -> str:
+    """全模型审计未通过时发给用户的一句话（WP-9.4）；通过或无审计返回空串。"""
+    if not audit or audit.get("ok"):
+        return ""
+    blockers = multi_analyzer._audit_blockers(audit)
+    if audit.get("audit_error") and not blockers:
+        text = "⚠️ 审计未完成：审计模型链失败（详见报告末尾的执行记录）"
+    else:
+        text = f"⚠️ 审计未通过：{len(blockers)} 项阻断问题（详见报告末尾的执行记录）"
+    if audit.get("repair_rejected"):
+        text += "\n修复稿未通过验收，以下为原稿"
+    return text
+
+
+def _send_audit_notice(chat_id: int, audit: dict | None) -> None:
+    text = _audit_notice(audit)
+    if text:
+        send(chat_id, text, plain=True)
+
+
+def _full_time_score(entry: dict | None) -> tuple[int, int] | None:
+    """fetch_fixture_result 的全场比分（与 _fmt_result 同样读 entry["goals"]）；任一缺失返回 None。"""
+    goals = (entry or {}).get("goals") or {}
+    home, away = goals.get("home"), goals.get("away")
+    if home is None or away is None:
+        return None
+    try:
+        return int(home), int(away)
+    except (TypeError, ValueError):
+        return None
+
+
 def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
                    task_id: str = "",
                    cancel: "threading.Event | None" = None) -> None:
@@ -2691,7 +2782,8 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
     display_results = {}
     statuses.update({"synthesis": "⬜", "audit": "⬜"})
     title = (f"⏳ 全模型交叉精算：{meta['home']} vs {meta['away']}\n"
-             f"共 {len(tasks) + 2} 个职责，使用已保存的精算模型与推理强度")
+             f"共 {len(tasks) + 2} 个职责，使用已保存的精算模型与推理强度（约 10~20 分钟）")
+    repairing = {"on": False}
     stop_kb = {"inline_keyboard": [[
         {"text": "🛑 停止全模型精算", "callback_data": f"stopan:{task_id}"}]]}
 
@@ -2706,6 +2798,8 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
                          f"{display_efforts[task['id']] or '模型默认'}){note}")
         lines.append(f"{statuses['synthesis']} 最终合并模型链")
         lines.append(f"{statuses['audit']} 最终审计模型链")
+        if repairing["on"]:
+            lines.append("🛠 修复中（只改审计指出的阻断问题，验收通过才替换原稿）")
         return "\n".join(lines)
 
     msg_id = send(chat_id, progress_text(), stop_kb)
@@ -2724,6 +2818,13 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
             statuses["synthesis"] = "🛟"
         elif kind == "synthesis" and statuses["synthesis"] != "🛟":
             statuses["synthesis"] = "🔄"
+        elif kind == "audit":
+            statuses["synthesis"] = "✅"
+            statuses["audit"] = "🔄"
+            repairing["on"] = False
+        elif kind == "repair":
+            statuses["audit"] = "⚠️"
+            repairing["on"] = True
         elif kind == "warning":
             log.warning("全模型精算预警：%s", result)
         if msg_id:
@@ -2757,6 +2858,7 @@ def _run_multi_sop(chat_id: int, fid: int, extra_instruction: str = "",
                         for t in tasks)
                    + f"\n{statuses['synthesis']} 最终合并模型链"
                    + f"\n{statuses['audit']} 最终审计模型链", _NO_KB)
+    _send_audit_notice(chat_id, summary.get("audit"))
     _send_long(chat_id, _md_to_tg(report))
     path = _archive_report(meta, report, suffix="consult", chat_id=chat_id)
     if path:
@@ -3016,6 +3118,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     # 只对照时需要比分与已有盲推预判；只盲推时都不需要。按 sub_mode 分别准备。
     result_text = None
     forecast = None
+    score = None
     if sub_mode in ("all", "compare"):
         # 实时拉最终结果（不入库，复盘一次性使用）
         entry = api_client.fetch_fixture_result(fid)
@@ -3023,6 +3126,7 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
             send(chat_id, f"无法拉取 fixture {fid} 的结果（API 无返回）")
             return
         result_text, short = _fmt_result(entry)
+        score = _full_time_score(entry)
         finished = {"FT", "AET", "PEN"}
         if result_text is None or short not in finished:
             send(chat_id, f"⚠️ fixture {fid} 尚未结束（状态：{short or '未知'}），"
@@ -3145,7 +3249,8 @@ def _run_review(chat_id: int, fid: int, effort: str = "",
     report = None
     for ev in analyzer.review_stream(csv_str, forecast, result_text,
                                      meta["home"], meta["away"], meta["league"],
-                                     effort, fund_brief, visitor=_visitor):
+                                     effort, fund_brief, visitor=_visitor,
+                                     score=score):
         if cancel is not None and cancel.is_set():
             if msg_id:
                 edit_text(chat_id, msg_id,
@@ -3217,6 +3322,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         send(chat_id, f"无法拉取 fixture {fid} 的结果（API 无返回）")
         return
     result_text, short = _fmt_result(entry)
+    score = _full_time_score(entry)
     if result_text is None or short not in {"FT", "AET", "PEN"}:
         send(chat_id, f"⚠️ fixture {fid} 尚未结束（状态：{short or '未知'}），"
                       "无法复盘。请在比赛结束后再试。")
@@ -3227,7 +3333,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
     goals_block = goals_model.format_states_block(states)
     stop_kb = {"inline_keyboard": [[
         {"text": "🛑 停止全模型复盘", "callback_data": f"stopan:{task_id}"}]]}
-    title = f"⏳ 全模型交叉复盘：{meta['home']} vs {meta['away']}"
+    title = f"⏳ 全模型交叉复盘：{meta['home']} vs {meta['away']}（两步合计约 20~40 分钟）"
     phase = {"name": "第一阶段·全模型盲推", "done": 0}
 
     def progress_text() -> str:
@@ -3246,6 +3352,10 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
             phase["done"] += 1
         elif kind == "synthesis":
             phase["name"] = "第一阶段·最终合并模型链盲推"
+        elif kind == "audit":
+            phase["name"] = "第一阶段·盲推审计中"
+        elif kind == "repair":
+            phase["name"] = "第一阶段·🛠 盲推修复中"
         if msg_id:
             edit_text(chat_id, msg_id, progress_text(), stop_kb)
 
@@ -3260,7 +3370,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         csv_str, "", meta["home"], meta["away"], meta["league"],
         goals_block=goals_block, extra_instruction=blind_focus,
         cancel=cancel, progress=on_blind_progress, profile="review", settings=snapshot,
-        apply_focus_modes=False,
+        apply_focus_modes=False, count_explore=False,
     )
     if cancel is not None and cancel.is_set():
         if msg_id:
@@ -3271,6 +3381,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         if msg_id:
             edit_text(chat_id, msg_id, f"❌ 全模型盲推失败：{error}", _NO_KB)
         return
+    _send_audit_notice(chat_id, blind_summary.get("audit"))
     _send_long(chat_id, _md_to_tg("🔮 第一步·全模型盲推预判\n\n" + forecast))
 
     # 盲推完成之后才拉取基本面并进入赛果归因，保持两阶段边界。
@@ -3293,6 +3404,10 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
             phase["done"] += 1
         elif kind == "review_synthesis":
             phase["name"] = "第二阶段·最终合并模型链复盘"
+        elif kind == "review_audit":
+            phase["name"] = "第二阶段·复盘审计中"
+        elif kind == "review_repair":
+            phase["name"] = "第二阶段·🛠 复盘修复中"
         if msg_id:
             edit_text(chat_id, msg_id, progress_text(), stop_kb)
 
@@ -3301,6 +3416,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
         meta["home"], meta["away"], meta["league"],
         goals_block=goals_block, extra_instruction=extra_instruction,
         cancel=cancel, progress=on_review_progress, settings=snapshot,
+        score=score,
     )
     if cancel is not None and cancel.is_set():
         if msg_id:
@@ -3315,6 +3431,7 @@ def _run_multi_review(chat_id: int, fid: int, extra_instruction: str = "",
     if msg_id:
         edit_text(chat_id, msg_id, title + "\n\n✅ 全模型盲推与对照复盘完成。",
                   _NO_KB)
+    _send_audit_notice(chat_id, review_summary.get("audit"))
     _send_long(chat_id, _md_to_tg(report))
     full = ("# 第一步·全模型盲推预判（不看比分与基本面）\n\n"
             + forecast
@@ -3994,6 +4111,8 @@ def handle_message(msg: dict) -> None:
         _cmd_lesson(chat_id)
     elif cmd == "llm":
         _cmd_llm(chat_id)
+    elif cmd == "hypstats":
+        _cmd_hypstats(chat_id)
     else:
         send(chat_id, "未知命令，发 /help 看用法")
 

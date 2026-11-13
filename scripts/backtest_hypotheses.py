@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-import math
 import shutil
 import sqlite3
 import sys
@@ -29,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot import hypotheses, market_facts  # noqa: E402
+from bot.hypothesis_settle import Tally, pnl, settle_home, settle_trigger  # noqa: E402,F401
 
 OUT = ROOT / "scripts" / "output" / "hypotheses"
 SCORES = OUT / "scores_by_date"
@@ -76,19 +76,48 @@ def default_sources() -> list[Path]:
 
 # ─── 比分 ────────────────────────────────────────────────────────────────────
 
-def cmd_scores(args) -> None:
+# 已结束（含取消/延期/腰斩/判负）的比赛状态：缓存里出现其它状态说明取数时比赛还没踢完
+FINAL_STATUSES = ("FT", "AET", "PEN", "CANC", "PST", "ABD", "AWD", "WO")
+STALE_DAYS = 7
+
+
+def _needs_fetch(day: str, today: str) -> bool:
+    """某比赛日是否需要（重新）取比分：没有缓存 → 取；缓存里有未完场条目且该日
+    距今不超过 STALE_DAYS 天 → 重取；更早的不再重取（避免对永远不会完场的条目反复请求）。"""
+    path = SCORES / f"{day}.json"
+    if not path.exists():
+        return True
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if all(r.get("status") in FINAL_STATUSES for r in rows):
+        return False
+    from datetime import date
+    try:
+        age = (date.fromisoformat(today) - date.fromisoformat(day)).days
+    except ValueError:
+        return False
+    return 0 <= age <= STALE_DAYS
+
+
+def fetch_scores(paths, table: str = "fixtures") -> int:
+    """按比赛日调 API-Football 取比分写入缓存；返回本次新取的天数。
+    paths：数据库路径列表；table：含 commence_utc 列的赛程表名。"""
     from bot import api_client
     SCORES.mkdir(parents=True, exist_ok=True)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     dates = set()
-    for path in (args.db or default_sources()):
+    for path in paths:
         conn = open_db(Path(path))
         try:
-            for (commence,) in conn.execute("SELECT commence_utc FROM fixtures"):
-                if commence and commence < time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()):
+            for (commence,) in conn.execute(f"SELECT commence_utc FROM {table}"):
+                if commence and commence < now:
                     dates.add(commence[:10])
         finally:
             conn.close()
-    todo = sorted(d for d in dates if not (SCORES / f"{d}.json").exists())
+    today = now[:10]
+    todo = sorted(d for d in dates if _needs_fetch(d, today))
     print(f"比赛日 {len(dates)} 个，待取 {len(todo)} 个")
     for day in todo:
         data = api_client.api_get("/fixtures", {"date": day})
@@ -101,6 +130,11 @@ def cmd_scores(args) -> None:
         (SCORES / f"{day}.json").write_text(json.dumps(rows), encoding="utf-8")
         print(day, len(rows))
         time.sleep(0.3)
+    return len(todo)
+
+
+def cmd_scores(args) -> None:
+    fetch_scores(args.db or default_sources())
 
 
 def load_scores() -> dict[int, tuple[int, int]]:
@@ -113,102 +147,8 @@ def load_scores() -> dict[int, tuple[int, int]]:
 
 
 # ─── 结算 ────────────────────────────────────────────────────────────────────
-
-def settle_home(margin: int, line: float) -> float:
-    """主队让球 line（负 = 让出）在主队净胜 margin 下的结算：1 / .5 / 0 / −.5 / −1。"""
-    def one(l: float) -> float:
-        adj = margin + l
-        return 1.0 if adj > 1e-9 else (-1.0 if adj < -1e-9 else 0.0)
-    if abs(line * 4) % 2 == 1:
-        return (one(line - 0.25) + one(line + 0.25)) / 2
-    return one(line)
-
-
-def pnl(result: float, odds: float) -> float:
-    if result > 0:
-        return result * (odds - 1)
-    return result
-
-
-class Tally:
-    __slots__ = ("n", "hits", "misses", "push", "stake", "ret", "pnls", "dated")
-
-    def __init__(self):
-        self.n = self.hits = self.misses = self.push = 0
-        self.stake = self.ret = 0.0
-        self.pnls: list[float] = []
-        self.dated: list[tuple[str, float]] = []
-
-    def add(self, result: float, odds: float | None, when: str):
-        self.n += 1
-        if result > 0:
-            self.hits += 1
-        elif result < 0:
-            self.misses += 1
-        else:
-            self.push += 1
-        if odds:
-            p = pnl(result, odds)
-            self.stake += 1
-            self.ret += p
-            self.pnls.append(p)
-            self.dated.append((when, p))
-
-    @property
-    def hit_rate(self) -> float | None:
-        d = self.hits + self.misses
-        return self.hits / d if d else None
-
-    @property
-    def roi(self) -> float | None:
-        return self.ret / self.stake if self.stake else None
-
-    def ci95(self) -> tuple[float, float] | None:
-        d = self.hits + self.misses
-        if not d:
-            return None
-        p, z = self.hits / d, 1.96
-        denom = 1 + z * z / d
-        center = (p + z * z / (2 * d)) / denom
-        half = z * math.sqrt(p * (1 - p) / d + z * z / (4 * d * d)) / denom
-        return center - half, center + half
-
-    def halves_same_sign(self) -> bool | None:
-        if len(self.dated) < 2:
-            return None
-        rows = sorted(self.dated)
-        mid = len(rows) // 2
-        a, b = sum(p for _, p in rows[:mid]), sum(p for _, p in rows[mid:])
-        return (a > 0) == (b > 0)
-
-    def robust_sign(self) -> bool | None:
-        if len(self.pnls) < 2:
-            return None
-        drop = max(self.pnls, key=abs)
-        rest = list(self.pnls)
-        rest.remove(drop)
-        return (sum(rest) > 0) == (self.ret > 0)
-
-
-def settle_trigger(t: hypotheses.Trigger, facts: market_facts.MarketFacts,
-                   score: tuple[int, int]) -> tuple[float, float | None] | None:
-    gh, ga = score
-    if t.market == "ah" and facts.lines:
-        final = facts.lines[-1]
-        r_home = settle_home(gh - ga, final.handicap)
-        upper_is_home = facts.upper == "home"
-        r_upper = r_home if upper_is_home else -r_home
-        if t.side == "upper":
-            return r_upper, final.upper_water
-        return -r_upper, final.lower_water
-    if t.market == "1x2":
-        outcome = "home" if gh > ga else ("away" if gh < ga else "draw")
-        if t.side.startswith("not_"):
-            return (1.0 if outcome != t.side[4:] else -1.0), None
-        odds = (facts.euro_final or {}).get(t.side)
-        return (1.0 if outcome == t.side else -1.0), odds
-    return None
-
+# settle_home / pnl / Tally / settle_trigger 已移入 bot/hypothesis_settle.py（复盘共用）；
+# 这里按原名重新导出，build_hypothesis_stats.py 的 bt.Tally / bt.settle_trigger 照常可用。
 
 def evaluate_all(paths, table, scores, since: str | None = None):
     tallies: dict[str, Tally] = defaultdict(Tally)

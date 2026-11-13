@@ -71,22 +71,23 @@ def write_back(text: str, tallies: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--db", action="append", help="默认线上库 odds.db（odds_history）")
-    ap.add_argument("--table", default="odds_history")
-    ap.add_argument("--write", action="store_true", help="把「后」列写回登记表（不改状态列）")
-    args = ap.parse_args()
+NO_REGISTRATION_DATE = ("登记表表头尚未填写登记日期（「部署时在此填写：YYYY-MM-DD」），"
+                        "无法区分登记前后样本。")
+
+
+def build_report(paths, table: str = "odds_history") -> tuple[str, dict]:
+    """统计登记后样本并生成报告 md（含状态建议）；返回 (md, {假设编号: Tally})。
+    登记日期未填写时抛 ValueError(NO_REGISTRATION_DATE)。不写任何文件。"""
     text = REGISTRY.read_text(encoding="utf-8")
     since = registration_date(text)
     if not since:
-        sys.exit("登记表表头尚未填写登记日期（「部署时在此填写：YYYY-MM-DD」），无法区分登记前后样本。")
-    paths = [Path(p) for p in (args.db or [ROOT / config.DB_PATH])]
-    if args.table == "odds_history":
+        raise ValueError(NO_REGISTRATION_DATE)
+    paths = [Path(p) for p in paths]
+    if table == "odds_history":
         tallies, triggered, n_fix, n_scored = _live(paths, since)
     else:
         tallies, triggered, n_fix, n_scored = bt.evaluate_all(
-            paths, args.table, bt.load_scores(), since=since)
+            paths, table, bt.load_scores(), since=since)
     md, _ = bt.render(tallies, triggered, n_fix, n_scored, f"假设登记后样本（{since} 起）")
     status = {c: s for c, (s, _p) in hypotheses.registry_status().items()}
     md += "\n## 状态建议（须人工确认后改表）\n\n| 假设 | 现状态 | 建议 |\n|------|--------|------|\n"
@@ -94,11 +95,25 @@ def main() -> None:
         cur, new = status.get(code, "—"), suggest(t)
         if not cur.startswith(new):
             md += f"| {code} | {cur} | {new} |\n"
+    return md, dict(tallies)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--db", action="append", help="默认线上库 odds.db（odds_history）")
+    ap.add_argument("--table", default="odds_history")
+    ap.add_argument("--write", action="store_true", help="把「后」列写回登记表（不改状态列）")
+    args = ap.parse_args()
+    try:
+        md, tallies = build_report(args.db or [ROOT / config.DB_PATH], args.table)
+    except ValueError as exc:
+        sys.exit(str(exc))
     out = bt.OUT / "hypothesis_stats.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md, encoding="utf-8")
     print(md)
     if args.write:
+        text = REGISTRY.read_text(encoding="utf-8")
         REGISTRY.write_text(write_back(text, tallies), encoding="utf-8", newline="\n")
         print(f"已写回「后」列：{REGISTRY}")
 

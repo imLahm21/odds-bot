@@ -357,7 +357,9 @@ class TestMultiAnalyzerFocus(unittest.TestCase):
         self.assertIn("缺少 ### 9. 侧重专题",
                       multi_analyzer._basic_report_issues(self.REPORT, focus_required=True))
         with_9 = self.REPORT + "\n### 9. 侧重专题\nx\n"
-        self.assertEqual(multi_analyzer._basic_report_issues(with_9, focus_required=True), [])
+        # 该夹具没有第 7 节两行与候选表，另有阻断项；这里只看第 9 节这一条
+        self.assertNotIn("缺少 ### 9. 侧重专题",
+                         multi_analyzer._basic_report_issues(with_9, focus_required=True))
 
     def test_json_instruction_uses_label_for_analyze_only(self):
         text = multi_analyzer._json_instruction("m", "角色", "激进一点")

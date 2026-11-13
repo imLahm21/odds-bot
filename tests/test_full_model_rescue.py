@@ -184,7 +184,7 @@ class TestRescueExecution(unittest.TestCase):
 
     def test_normal_success_at_any_level_never_calls_rescue(self):
         for failures in range(3):
-            with self.subTest(failures=failures), patch.object(llm_client, "chat_model",
+            with self.subTest(failures=failures), patch.object(llm_client, "collect_model",
                 side_effect=["LLM 请求失败（offline）"] * failures + [_JSON]) as request:
                 result, route = self._call()
                 self.assertIsNotNone(result)
@@ -194,7 +194,7 @@ class TestRescueExecution(unittest.TestCase):
                 self.assertTrue(all("route_group" not in call.kwargs for call in request.call_args_list))
 
     def test_three_model_failures_trigger_one_pinned_rescue_on_unchanged_input(self):
-        with patch.object(llm_client, "chat_model", side_effect=["LLM 请求失败（offline）"] * 3 + [_JSON]) as request:
+        with patch.object(llm_client, "collect_model", side_effect=["LLM 请求失败（offline）"] * 3 + [_JSON]) as request:
             result, route = self._call()
         self.assertIsNotNone(result)
         self.assertEqual([call.kwargs["model"] for call in request.call_args_list],
@@ -207,14 +207,14 @@ class TestRescueExecution(unittest.TestCase):
         self.assertIn("公共兜底成功", multi.execution_note({**route, "status": "ok"}))
 
     def test_invalid_json_exhaustion_also_uses_rescue(self):
-        with patch.object(llm_client, "chat_model", side_effect=["not json"] * 3 + [_JSON]) as request:
+        with patch.object(llm_client, "collect_model", side_effect=["not json"] * 3 + [_JSON]) as request:
             result, route = self._call()
         self.assertIsNotNone(result)
         self.assertTrue(route["rescue_used"])
         self.assertEqual(request.call_count, 4)
 
     def test_rescue_failure_is_terminal_and_distinct_from_primary_failure(self):
-        with patch.object(llm_client, "chat_model", return_value="LLM 请求失败（offline）") as request:
+        with patch.object(llm_client, "collect_model", return_value="LLM 请求失败（offline）") as request:
             result, route = self._call()
         self.assertIsNone(result)
         self.assertEqual(request.call_count, 4)
@@ -224,7 +224,7 @@ class TestRescueExecution(unittest.TestCase):
         self.assertIn("公共兜底也失败", multi.execution_note({**route, "status": "error"}))
 
     def test_disabled_rescue_stops_after_normal_chain(self):
-        with patch.object(llm_client, "chat_model", return_value="LLM 请求失败（offline）") as request:
+        with patch.object(llm_client, "collect_model", return_value="LLM 请求失败（offline）") as request:
             result, route = self._call(rescue=_OFF)
         self.assertIsNone(result)
         self.assertEqual(request.call_count, 3)
@@ -232,7 +232,7 @@ class TestRescueExecution(unittest.TestCase):
 
     def test_rescue_cannot_bypass_invalid_normal_configuration(self):
         self.spec["effort"] = "not-supported"
-        with patch.object(llm_client, "chat_model") as request:
+        with patch.object(llm_client, "collect_model") as request:
             result, route = self._call()
         self.assertIsNone(result)
         self.assertIn("配置错误", route["error"])
@@ -240,7 +240,7 @@ class TestRescueExecution(unittest.TestCase):
 
     def test_rescue_is_also_excluded_when_it_wrote_the_report(self):
         excluded = {pair["model"] for pair in settings.candidates(self.spec)} | {"gpt-6.1-sol-cpa"}
-        with patch.object(llm_client, "chat_model") as request:
+        with patch.object(llm_client, "collect_model") as request:
             result, route = self._call(excluded_models=excluded)
         self.assertIsNone(result)
         self.assertTrue(route["rescue_skipped"])
@@ -258,13 +258,13 @@ class TestRescueExecution(unittest.TestCase):
                 cancel.set()
             return "LLM 请求失败（offline）"
 
-        with patch.object(llm_client, "chat_model", side_effect=fail) as request:
+        with patch.object(llm_client, "collect_model", side_effect=fail) as request:
             _, route = self._call(cancel=cancel)
         self.assertEqual(request.call_count, 3)
         self.assertFalse(route["rescue_attempted"])
 
     def test_failed_expert_keeps_the_last_actual_attempt_not_the_primary_label(self):
-        with patch.object(llm_client, "chat_model", return_value="LLM 请求失败（offline）"):
+        with patch.object(llm_client, "collect_model", return_value="LLM 请求失败（offline）"):
             result = multi._run_one(self.spec, {"rescue": _RESCUE, "csv_text": "csv"})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["requested_model"], "grok-4.7")
@@ -276,7 +276,7 @@ class TestRescueExecution(unittest.TestCase):
 
     def test_same_model_can_be_retried_once_with_the_explicit_rescue_group_and_effort(self):
         self.spec = settings.defaults("analyze")["market_primary"]
-        with patch.object(llm_client, "chat_model", side_effect=["LLM 请求失败（offline）"] * 3 + [_JSON]) as request:
+        with patch.object(llm_client, "collect_model", side_effect=["LLM 请求失败（offline）"] * 3 + [_JSON]) as request:
             _, route = self._call()
         self.assertEqual(request.call_count, 4)
         self.assertEqual(request.call_args_list[0].kwargs["model"], "gpt-6.1-sol-cpa")
@@ -296,6 +296,7 @@ class TestStreamingRescue(unittest.TestCase):
         return result, trace, request
 
     def test_zero_content_chain_failure_then_cpa_rescue_for_both_modes(self):
+        normal = len(settings.candidates(config.FULL_CONSULT_SYNTHESIS))
         for review in (False, True):
             def stream(system, user, **kwargs):
                 if kwargs.get("route_group"):
@@ -305,26 +306,33 @@ class TestStreamingRescue(unittest.TestCase):
                     yield "error", "all normal models unavailable"
             result, trace, request = self._synthesize(stream, review)
             self.assertEqual(result, "complete report")
-            self.assertEqual(request.call_count, 2)
+            # 合并逐个候选调用：常规链每个模型各一次，耗尽后公共兜底一次
+            self.assertEqual(request.call_count, normal + 1)
             self.assertEqual(request.call_args.kwargs["route_group"], "cpa_gpt")
-            self.assertEqual(request.call_args.kwargs["fallback_models"], ())
+            self.assertTrue(all(call.kwargs["fallback_models"] == ()
+                                for call in request.call_args_list))
             self.assertTrue(trace["rescue_used"])
             self.assertEqual(trace["model"], "gpt-6.1-sol-cpa")
 
-    def test_partial_normal_output_does_not_regenerate_with_rescue(self):
+    def test_partial_normal_output_moves_on_to_next_model(self):
+        # V12：合并正文不实时展示，部分正文后出错也换下一个候选重写
         def stream(*args, **kwargs):
-            yield "delta", "partial original report"
-            yield "error", "stream interrupted"
+            if kwargs["model"] == "gpt-6-astra-cpa":
+                yield "delta", "partial original report"
+                yield "error", "stream interrupted"
+            else:
+                yield "done", "complete from fallback"
         result, trace, request = self._synthesize(stream)
-        self.assertEqual(result, "")
-        self.assertEqual(request.call_count, 1)
-        self.assertEqual(trace["rescue_skipped_reason"], "partial_output")
+        self.assertEqual(result, "complete from fallback")
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(trace["partial_output"])
+        self.assertNotIn("rescue_skipped_reason", trace)
         self.assertFalse(trace.get("rescue_attempted", False))
 
     def test_rescue_failure_does_not_loop_back_to_normal_models(self):
         result, trace, request = self._synthesize(lambda *args, **kwargs: iter([("error", "offline")]))
         self.assertEqual(result, "")
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, len(settings.candidates(config.FULL_CONSULT_SYNTHESIS)) + 1)
         self.assertTrue(trace["rescue_attempted"])
         self.assertFalse(trace["rescue_used"])
         self.assertEqual(trace["model"], "gpt-6.1-sol-cpa")
@@ -345,7 +353,7 @@ class TestStreamingRescue(unittest.TestCase):
                 yield "error", "interrupted"
         result, trace, request = self._synthesize(stream)
         self.assertEqual(result, "")
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, len(settings.candidates(config.FULL_CONSULT_SYNTHESIS)) + 1)
         self.assertTrue(trace["rescue_attempted"])
         self.assertFalse(trace["rescue_used"])
         self.assertNotIn("rescue_skipped_reason", trace)
@@ -434,7 +442,9 @@ class TestRescuePipeline(unittest.TestCase):
     def test_repair_rescue_is_tracked_and_excluded_from_the_next_audit(self):
         self.audit.side_effect = [{"ok": False, "issues": ["fix"]}, {"ok": True, "issues": []}]
         route = {**_RESCUE, "rescue_used": True, "rescue_attempted": True, "rescue_configured": True}
-        with patch.object(multi, "_call_route", return_value=("repaired", route)) as repair:
+        # 修复稿验收另有专门测试（test_full_model_hardening）；这里只看兜底路由的记账
+        with patch.object(multi, "_call_route", return_value=("repaired", route)) as repair, \
+             patch.object(multi, "_accept_repair", return_value=True):
             report, summary = multi.run("csv", "fund", "H", "A", "League", settings=settings.defaults("analyze"))
         self.assertEqual(repair.call_args.kwargs["rescue"], _RESCUE)
         self.assertTrue(summary["synthesis"]["rescue_used"])

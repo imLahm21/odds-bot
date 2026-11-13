@@ -19,6 +19,19 @@ def _card(module_id: str) -> str:
     ) % module_id
 
 
+# 能通过确定性检查的最小精算报告：第 7 节有信号强度 / 数据质量两行，第 8 节候选表可解析
+# （新增的阻断项检查，见 multi_analyzer._basic_report_issues）。
+SECTIONS_7_8 = (
+    "### 7. 最终精算结论\n- **亚盘判定**：无倾向\n- **信号强度**：无\n"
+    "- **数据质量**：85 / 100\n"
+    "### 8. 投注决策\n"
+    "| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |\n"
+    "|----|------|------|-------------|--------|--------|------|------|\n"
+    "| C01 | 主胜 | 2.00 | 50% | 54% | 54% | +8.0% | eligible |\n"
+    "- **选中候选 ID**：C01\n"
+)
+
+
 class TestMultiAnalyzer(unittest.TestCase):
     def setUp(self):
         snapshot = patch.object(multi_analyzer, "profile_snapshot", side_effect=full_model_settings.defaults)
@@ -148,7 +161,7 @@ class TestMultiAnalyzer(unittest.TestCase):
                 return "LLM 请求失败（测试故障）"
             return _card(task["id"])
 
-        with patch.object(multi_analyzer.llm_client, "chat_model",
+        with patch.object(multi_analyzer.llm_client, "collect_model",
                           side_effect=fake_chat):
             result = multi_analyzer._run_one(
                 task, {"home": "h", "away": "a", "league": "l",
@@ -173,7 +186,7 @@ class TestMultiAnalyzer(unittest.TestCase):
             calls.append(model)
             return "not-json" if len(calls) == 1 else _card(task["id"])
 
-        with patch.object(multi_analyzer.llm_client, "chat_model",
+        with patch.object(multi_analyzer.llm_client, "collect_model",
                           side_effect=fake_chat):
             result = multi_analyzer._run_one(
                 task, {"home": "h", "away": "a", "league": "l",
@@ -184,12 +197,17 @@ class TestMultiAnalyzer(unittest.TestCase):
         self.assertTrue(result["fallback_used"])
         self.assertIn("JSON", result["attempts"][0]["error"])
 
-    def test_synthesis_passes_model_specific_fallback_efforts(self):
-        seen = {}
+    def test_synthesis_tries_each_model_with_its_own_effort(self):
+        # 合并改为逐个候选流式调用：每次不带模型回退链，回退模型用自己的强度
+        seen = []
+        chain = full_model_settings.candidates(config.FULL_CONSULT_SYNTHESIS)
 
         def fake_stream(system, user, model, **kwargs):
-            seen.update({"model": model, **kwargs})
-            yield ("done", "report")
+            seen.append({"model": model, **kwargs})
+            if model == chain[-1]["model"]:
+                yield ("done", "report")
+            else:
+                yield ("error", "LLM 请求失败（offline）")
 
         with patch.object(multi_analyzer.llm_client,
                           "stream_chat_model", side_effect=fake_stream):
@@ -197,21 +215,15 @@ class TestMultiAnalyzer(unittest.TestCase):
                 {"csv_text": "csv", "fundamentals": "fund",
                  "home": "h", "away": "a", "league": "l"}, [])
 
-        fallbacks = config.FULL_CONSULT_SYNTHESIS["fallbacks"]
         self.assertEqual(result, "report")
-        self.assertEqual(
-            seen["fallback_models"],
-            tuple(item["model"] for item in fallbacks),
-        )
-        self.assertEqual(
-            seen["fallback_efforts"],
-            tuple(item["effort"] for item in fallbacks),
-        )
+        self.assertEqual([call["model"] for call in seen], [item["model"] for item in chain])
+        self.assertEqual([call["effort"] for call in seen], [item["effort"] for item in chain])
+        self.assertTrue(all(call["fallback_models"] == () for call in seen))
 
     def test_audit_transfers_to_same_grade_model_and_uses_zero_budget(self):
         report = (
-            "\n".join(f"### {n}. section" for n in range(1, 9))
-            + "\n### 8. 投注决策\n" + ("x" * 600)
+            "\n".join(f"### {n}. section" for n in range(1, 7))
+            + "\n" + SECTIONS_7_8 + ("x" * 600)
         )
         calls = []
 
@@ -221,7 +233,7 @@ class TestMultiAnalyzer(unittest.TestCase):
                 return "LLM 请求失败（审计主模型故障）"
             return '{"ok":true,"issues":[]}'
 
-        with patch.object(multi_analyzer.llm_client, "chat_model",
+        with patch.object(multi_analyzer.llm_client, "collect_model",
                           side_effect=fake_chat):
             audit = multi_analyzer._audit_report(
                 {"home": "h", "away": "a", "league": "l",
@@ -257,8 +269,8 @@ class TestMultiAnalyzer(unittest.TestCase):
             "### 1. 数据提取\nx\n### 2. 盘口定性\nx\n"
             "### 3. 资金流向与热度\nx\n### 4. 操盘手法匹配\nx\n"
             "### 5. 风控验证\nx\n### 6. 缺失节点预测\nx\n"
-            "### 7. 最终精算结论\nx\n### 8. 投注决策\nx\n"
-            "### 9. 侧重专题\nx\n"            # 有侧重时审计要求第 9 节
+            + SECTIONS_7_8
+            + "### 9. 侧重专题\nx\n"            # 有侧重时审计要求第 9 节
             + ("x" * 600)
         )
 
@@ -267,7 +279,7 @@ class TestMultiAnalyzer(unittest.TestCase):
             yield ("done", report)
 
         with (
-            patch.object(multi_analyzer.llm_client, "chat_model",
+            patch.object(multi_analyzer.llm_client, "collect_model",
                          side_effect=fake_chat),
             patch.object(multi_analyzer.llm_client, "stream_chat_model",
                          side_effect=fake_stream),
@@ -300,10 +312,10 @@ class TestMultiAnalyzer(unittest.TestCase):
             )
             return _card(module_id)
 
-        report = "### 1. x\n### 2. x\n### 3. x\n### 4. x\n### 5. x\n### 6. x\n### 7. x\n### 8. 投注决策\n" + ("x" * 600)
+        report = "### 1. x\n### 2. x\n### 3. x\n### 4. x\n### 5. x\n### 6. x\n" + SECTIONS_7_8 + ("x" * 600)
 
         with (
-            patch.object(multi_analyzer.llm_client, "chat_model",
+            patch.object(multi_analyzer.llm_client, "collect_model",
                          side_effect=fake_chat),
             patch.object(
                 multi_analyzer.llm_client, "stream_chat_model",
@@ -349,7 +361,7 @@ class TestMultiAnalyzer(unittest.TestCase):
             yield ("done", review_report)
 
         with (
-            patch.object(multi_analyzer.llm_client, "chat_model",
+            patch.object(multi_analyzer.llm_client, "collect_model",
                          side_effect=fake_chat),
             patch.object(multi_analyzer.llm_client, "stream_chat_model",
                          side_effect=fake_stream),

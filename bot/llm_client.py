@@ -915,14 +915,19 @@ def _limited_chat(limited: bool, ep: dict, payload: dict, read_to: int,
     slot = _group_slot(ep["route_group"])
     started = monotonic()
     slot.acquire()
+    acquired = monotonic()
+    ok = False
     try:
-        waited = monotonic() - started
+        waited = acquired - started
         if waited >= 1:
             log.info("LLM排队结束 request=%s group=%s waited=%.0fs",
                      request_id or "-", ep["route_group"], waited)
-        return _do_chat(ep, payload, read_to, max_retries, request_id)
+        result = _do_chat(ep, payload, read_to, max_retries, request_id)
+        ok = bool(result[1])
+        return result
     finally:
         slot.release()
+        _log_timing(ep, payload, acquired - started, None, monotonic() - acquired, ok)
 
 
 def _limited_stream(limited: bool, ep: dict, payload: dict, first_byte_to: int,
@@ -939,14 +944,32 @@ def _limited_stream(limited: bool, ep: dict, payload: dict, first_byte_to: int,
     started = monotonic()
     while not slot.acquire(timeout=_QUEUE_POLL_SECONDS):
         yield (_QUEUED_EVENT, int(monotonic() - started))
+    acquired = monotonic()
+    first = None
+    ok = False
     try:
-        waited = monotonic() - started
+        waited = acquired - started
         if waited >= 1:
             log.info("LLM排队结束 group=%s endpoint=%s waited=%.0fs",
                      ep["route_group"], ep["label"], waited)
-        yield from _stream_one(ep, payload, first_byte_to, idle_to, max_retries)
+        for ev in _stream_one(ep, payload, first_byte_to, idle_to, max_retries):
+            if ev[0] == "delta" and first is None:
+                first = monotonic() - acquired
+            elif ev[0] == "done":
+                ok = True
+            yield ev
     finally:
         slot.release()
+        _log_timing(ep, payload, acquired - started, first, monotonic() - acquired, ok)
+
+
+def _log_timing(ep: dict, payload: dict, queue: float, first: float | None,
+                total: float, ok: bool) -> None:
+    """受并发上限约束的请求结束时记一条耗时（queue=等名额；first=拿到名额到首个 delta；
+    total=拿到名额到结束）。不受上限约束的请求不记（走地每分钟一次，避免刷日志）。"""
+    log.info("LLM耗时 group=%s endpoint=%s model=%s queue=%.0fs first=%s total=%.0fs ok=%s",
+             ep.get("route_group", ""), ep.get("label", ""), payload.get("model", ""),
+             queue, "-" if first is None else f"{first:.0f}s", total, ok)
 
 
 # ─── 阻塞调用（带端点内重试 + 跨端点故障转移）────────────────────────────────
@@ -1607,6 +1630,47 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
             log.warning("显式流式模型 %s 不可用，切换到调用方指定回退模型 %s",
                         current_model, chain[position + 1])
     yield ("error", last_err or "LLM 显式模型链全部不可用")
+
+
+# 与 analyzer._LLM_ERR_PREFIXES 保持一致（llm_client 不能反向 import analyzer）
+_ERR_PREFIXES = (
+    "LLM 请求失败", "LLM 超时", "LLM 网络错误",
+    "LLM 返回无 choices", "LLM 返回空内容", "LLM 输出 token 耗尽", "LLM_API_KEY",
+    "未配置 LLM_ROUTE_ENDPOINTS",
+)
+
+
+def collect_model(system: str, user: str, model: str, effort: str = "",
+                  max_tokens: int = 0, input_metrics: dict | None = None,
+                  route_group: str = "", cancel=None) -> str:
+    """流式调用一个明确模型并收集全文；契约同 chat_model（成功返回正文，失败返回
+    以既有错误前缀开头的串，不抛异常）。
+
+    供全模型的模块 / 审计 / 修复使用：流式没有非流式那种「读超时 300 秒后同端点
+    再重试」的问题。不做模型间回退（调用方逐个候选负责）；已有部分正文后出错同样
+    按失败返回——全模型的中间产物不展示给用户，可以安全换模型重来。
+    cancel（threading.Event）每收到一个事件检查一次，置位即关闭流并返回取消错误。
+    """
+    stream = stream_chat_model(system, user, model=model, effort=effort,
+                               max_tokens=max_tokens, input_metrics=input_metrics,
+                               route_group=route_group)
+    try:
+        for kind, payload in stream:
+            if cancel is not None and cancel.is_set():
+                return "LLM 请求失败（已取消）"
+            if kind == "done":
+                return str(payload or "").strip()
+            if kind == "error":
+                text = str(payload or "")
+                return text if text.startswith(_ERR_PREFIXES) else f"LLM 请求失败（{text or '流式中断'}）"
+            # delta / queued / warning：只是进度，继续等 done
+        if cancel is not None and cancel.is_set():
+            return "LLM 请求失败（已取消）"
+        return "LLM 请求失败（流式未返回完成事件）"
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
 
 
 # ─── 连通性探针（最小 chat 请求；不计入 Breaker 统计）───────────────────────

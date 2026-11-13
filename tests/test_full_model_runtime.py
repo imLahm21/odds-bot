@@ -18,10 +18,22 @@ prepare_publish_stubs()
 from bot import analyzer, config, db, full_model_settings as settings, llm_client, multi_analyzer, tgbot  # noqa: E402
 
 
+_SECTIONS_7_8 = (
+    "### 7. 最终精算结论\n- **信号强度**：无\n- **数据质量**：85 / 100\n"
+    "### 8. 投注决策\n"
+    "| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |\n"
+    "|----|------|------|-------------|--------|--------|------|------|\n"
+    "| C01 | 主胜 | 2.00 | 50% | 54% | 54% | +8.0% | eligible |\n"
+    "- **选中候选 ID**：C01\n"
+)
+
+
 def _report(review=False):
-    count = 6 if review else 8
-    return "\n".join(f"### {n}. " + ("投注决策" if n == 8 else "分析")
-                     for n in range(1, count + 1)) + "\n" + "证据。" * 220
+    if review:
+        return "\n".join(f"### {n}. 分析" for n in range(1, 7)) + "\n" + "证据。" * 220
+    # 精算报告须能通过确定性检查（第 7 节两行 + 可解析的第 8 节候选表）
+    return ("\n".join(f"### {n}. 分析" for n in range(1, 7)) + "\n"
+            + _SECTIONS_7_8 + "证据。" * 220)
 
 
 def _expert(task, bundle):
@@ -66,7 +78,7 @@ class TestFullModelRuntime(unittest.TestCase):
 
     def test_actual_stream_fallback_cannot_audit_its_own_output(self):
         with self._stream_transport(fallback=True), patch.object(
-            llm_client, "chat_model", return_value='{"ok":true,"issues":[]}'
+            llm_client, "collect_model", return_value='{"ok":true,"issues":[]}'
         ) as chat:
             report, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League")
         self.assertTrue(report)
@@ -101,7 +113,7 @@ class TestFullModelRuntime(unittest.TestCase):
 
     def test_post_match_review_uses_same_actual_writer_exclusion(self):
         with self._stream_transport(fallback=True, review=True), patch.object(
-            llm_client, "chat_model", return_value='{"ok":true,"issues":[]}'
+            llm_client, "collect_model", return_value='{"ok":true,"issues":[]}'
         ) as chat:
             report, summary = multi_analyzer.run_review(
                 "csv", "immutable forecast", "actual result", "fund", "Home", "Away", "League")
@@ -117,12 +129,12 @@ class TestFullModelRuntime(unittest.TestCase):
         def chat(system, user, model, **kwargs):
             if "最终报告审计员" in system:
                 calls.append(("audit", model))
-                return ('{"ok":false,"issues":["fix"]}' if model == "claude-opus-5-5-high"
-                        else '{"ok":true,"issues":[]}')
+                return ('{"ok":false,"issues":[{"severity":"blocker","problem":"fix"}]}'
+                        if model == "claude-opus-5-5-high" else '{"ok":true,"issues":[]}')
             calls.append(("repair", model))
             return "LLM 请求失败（offline）" if model == "gpt-6-astra-cpa" else _report() + "\n修复标记"
 
-        with self._stream_transport(), patch.object(llm_client, "chat_model", side_effect=chat):
+        with self._stream_transport(), patch.object(llm_client, "collect_model", side_effect=chat):
             report, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League")
         self.assertIn("修复标记", report)
         self.assertEqual(calls, [
@@ -132,7 +144,7 @@ class TestFullModelRuntime(unittest.TestCase):
         self.assertEqual(set(summary["writers"]), {"gpt-6-astra-cpa", "claude-opus-5-5-high"})
 
     def test_cpa_and_ik_names_of_same_model_are_not_independent_auditors(self):
-        with patch.object(llm_client, "chat_model", return_value='{"ok":true}') as chat:
+        with patch.object(llm_client, "collect_model", return_value='{"ok":true}') as chat:
             result, route = multi_analyzer._call_route(
                 "audit", "report", config.FULL_CONSULT_AUDIT, parse_json=True,
                 phase="audit", excluded_models={"claude-opus-5-5"})
@@ -143,7 +155,7 @@ class TestFullModelRuntime(unittest.TestCase):
     def test_no_independent_auditor_is_explicit_failure_without_self_request(self):
         spec = deepcopy(config.FULL_CONSULT_AUDIT)
         spec["fallbacks"] = ({"model": "claude-opus-5-5", "effort": "high"},)
-        with patch.object(llm_client, "chat_model") as chat:
+        with patch.object(llm_client, "collect_model") as chat:
             result, route = multi_analyzer._call_route(
                 "audit", "report", spec, parse_json=True, phase="audit",
                 excluded_models={"claude-opus-5-5-high"})
@@ -156,7 +168,7 @@ class TestFullModelRuntime(unittest.TestCase):
         spec = deepcopy(config.FULL_CONSULT_AUDIT)
         spec["fallbacks"] = ({"model": "gpt-6.1-sol-cpa", "effort": "high"},
                              {"model": "gpt-6-sol", "effort": "high"})
-        with patch.object(llm_client, "chat_model", side_effect=["invalid json", '{"ok":true}']) as chat:
+        with patch.object(llm_client, "collect_model", side_effect=["invalid json", '{"ok":true}']) as chat:
             result, route = multi_analyzer._call_route(
                 "audit", "report", spec, parse_json=True, phase="audit",
                 excluded_models={"claude-opus-5-5-high"})
@@ -178,7 +190,7 @@ class TestFullModelRuntime(unittest.TestCase):
                 ok, error = db.set_full_model_slot(conn, "analyze", "market_primary", 0, "grok-4.7", "high")
                 self.assertTrue(ok, error)
 
-        with self._stream_transport(), patch.object(llm_client, "chat_model", return_value='{"ok":true}'):
+        with self._stream_transport(), patch.object(llm_client, "collect_model", return_value='{"ok":true}'):
             _, summary = multi_analyzer.run("csv", "fund", "Home", "Away", "League",
                                              settings=snapshot, progress=progress)
         actual = next(result for result in summary["results"] if result["id"] == "market_primary")
@@ -191,7 +203,7 @@ class TestFullModelRuntime(unittest.TestCase):
         routes["market_primary"] = settings.replace_slot(routes["market_primary"], 0, "grok-4.7", "high")
         self.snapshot.return_value = routes
         self.snapshot.side_effect = None
-        with self._stream_transport(), patch.object(llm_client, "chat_model", return_value='{"ok":true}'):
+        with self._stream_transport(), patch.object(llm_client, "collect_model", return_value='{"ok":true}'):
             _, summary = multi_analyzer.run("csv", "", "Home", "Away", "League", profile="review")
         self.snapshot.assert_called_once_with("review")
         actual = next(result for result in summary["results"] if result["id"] == "market_primary")

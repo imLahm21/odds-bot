@@ -30,7 +30,8 @@ def _start_typesafe_shadow(target, *args, name: str) -> None:
 
 
 def finalize_decision(report: str, home: str = "", away: str = "",
-                      league: str = "", *, modes: tuple[str, ...] = ()) -> str:
+                      league: str = "", *, modes: tuple[str, ...] = (),
+                      count_explore: bool = True) -> str:
     """生成时定第 8 节选中项（TYPESAFE_DECISION_MODE）：
       off    —— 原样返回，沿用报告模型自己的选择；
       shadow —— 原样返回，后台跑一遍 Jev 选定并记 TYPESAFE_SHADOW 日志；
@@ -38,6 +39,7 @@ def finalize_decision(report: str, home: str = "", away: str = "",
                 → Jev 失败/低置信度退回 edge 最高 → 改写第 8 节并嵌入 decision_final。
     modes：自定义侧重模式（focus.MODES 的 key），active 时透传给 select_decision；
     conservative 不下探索注。off/shadow 行为不变。
+    count_explore=False（复盘盲推）：不查也不占当日探索注额度，只看 EXPLORE_MODE。
     任何异常都退回原报告，不影响精算主流程。"""
     mode = config.TYPESAFE_DECISION_MODE
     if mode == "off" or not (report or "").strip():
@@ -51,13 +53,14 @@ def finalize_decision(report: str, home: str = "", away: str = "",
         selection = typesafe_decisions.select_decision(
             report, home, away, league,
             min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE,
-            explore_allowed=("conservative" not in modes) and _explore_budget_left(),
+            explore_allowed=("conservative" not in modes) and (
+                _explore_budget_left() if count_explore else config.EXPLORE_MODE == "on"),
             modes=modes)
         typesafe_decisions.log_selection(report, selection)
         if selection is None:
             log.warning("第 8 节候选表无法解析，保留报告模型的选择")
             return report
-        if selection.tier == "explore":
+        if selection.tier == "explore" and count_explore:
             _count_explore()
         return typesafe_decisions.apply_selection(report, selection)
     except Exception as exc:
@@ -69,14 +72,17 @@ FOCUS_MISSING_SECTION_9_NOTE = "\n\n> ⚠️ 模型未输出「### 9. 侧重专�
 
 
 def _finalize_with_focus(report: str, home: str, away: str, league: str,
-                         extra_instruction: str = "") -> str:
+                         extra_instruction: str = "", *, count_explore: bool = True) -> str:
     """finalize_decision + 侧重标记：按侧重模式定稿，在「## 赛事：」行后标注本场侧重；
-    有侧重但模型漏写第 9 节时在末尾提示。无侧重时与 finalize_decision 完全一致。"""
+    有侧重但模型漏写第 9 节时在末尾提示。无侧重时与 finalize_decision 完全一致。
+    count_explore=False 透传给 finalize_decision（复盘盲推不占探索注额度）。"""
     focus_obj = focus.parse(extra_instruction)
+    kwargs = {}
     if focus_obj.modes:
-        report = finalize_decision(report, home, away, league, modes=focus_obj.modes)
-    else:
-        report = finalize_decision(report, home, away, league)
+        kwargs["modes"] = focus_obj.modes
+    if not count_explore:
+        kwargs["count_explore"] = False
+    report = finalize_decision(report, home, away, league, **kwargs)
     report = focus.stamp(report, focus_obj)
     if not focus_obj.empty and not focus.has_section_9(report):
         report += FOCUS_MISSING_SECTION_9_NOTE
@@ -536,7 +542,7 @@ def focus_task_block(focus_obj: "focus.Focus") -> str:
 def analyze(csv_text: str, fundamentals: str,
             home: str, away: str, league: str,
             extra_instruction: str = "", effort: str = "",
-            visitor: bool = False) -> str:
+            visitor: bool = False, *, count_explore: bool = True) -> str:
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
@@ -548,7 +554,7 @@ def analyze(csv_text: str, fundamentals: str,
                        input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
         report = _finalize_with_focus(report, home, away, league,
-                                      extra_instruction)
+                                      extra_instruction, count_explore=count_explore)
         has_h2h, has_form = fund_has(fundamentals)
         mf = rules_manifest(
             league_name=league, has_h2h=has_h2h, has_form=has_form)
@@ -1327,7 +1333,7 @@ _TOTAL_STAGES = 8
 def analyze_stream(csv_text: str, fundamentals: str,
                    home: str, away: str, league: str,
                    extra_instruction: str = "", effort: str = "",
-                   visitor: bool = False):
+                   visitor: bool = False, *, count_explore: bool = True):
     """流式精算。yield 进度/结果事件，供 bot 实时播报：
       ('warning', 预警串)   —— 预计输入超过 warn-only 阈值，请求仍继续
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..7）
@@ -1367,7 +1373,7 @@ def analyze_stream(csv_text: str, fundamentals: str,
             mf = rules_manifest(
                 league_name=league, has_h2h=has_h2h, has_form=has_form)
             report = _finalize_with_focus(payload, home, away, league,
-                                          extra_instruction)
+                                          extra_instruction, count_explore=count_explore)
             yield ("done", report + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)
@@ -1388,14 +1394,16 @@ def review_blind_stream(csv_text: str, home: str, away: str, league: str,
     blind_note = ("（赛后复盘·第一遍盲推：本次不提供基本面与比赛结果，"
                   "请仅依据盘口走势正向执行 SOP 步骤 1~8，给出赛前预判结论"
                   "与当时应下的投注决策。）")
+    # 盲推是复盘的一部分，不是当日真正的精算：不占当日探索注额度（V14）
     yield from analyze_stream(csv_text, blind_note, home, away, league,
-                              effort=effort, visitor=visitor)
+                              effort=effort, visitor=visitor, count_explore=False)
 
 
 def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
                     home: str, away: str, league: str,
                     fund_brief: str = "",
-                    input_metrics: dict | None = None) -> tuple[str, str]:
+                    input_metrics: dict | None = None,
+                    score: tuple[int, int] | None = None) -> tuple[str, str]:
     """构造复盘第二遍【对照】的 (system, user)。
 
     关键：第一遍已在不知道比分的情况下正向推出预判（forecast_text）。
@@ -1404,6 +1412,8 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
 
     fund_brief：基本面研判（两阶段预处理产物）。非空时本遍结合基本面做归因，
     解释盲推（纯盘口、无基本面）对/错背后是否有基本面成因；空则退回纯盘口复盘。
+
+    score：全场比分 (主, 客)。非空时在「实际结果」之后注入代码算好的【假设结算】表。
     """
     has_fund = bool(fund_brief.strip())
     fund_clause = (
@@ -1429,7 +1439,8 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
         "是否按规则执行；② 盘路信号一律按假设层看待：只统计命中与否，"
         "不因单场结果把「假设」「观察中」说成有效规律；③ 数据质量只影响注额，不参与对错归因。"
         "若提供了【市场事实】与【已触发假设】段落（代码按同一份盘口算出），"
-        "第 4、5 节的假设清单以其为准，逐条给出结论，不自行增删。\n\n"
+        "第 4、5 节的假设清单以其为准，逐条给出结论，不自行增删。"
+        "若提供了「假设结算」表，第 4、5 节的假设结论照抄该表，不要自行判断。\n\n"
         "严格按以下结构输出对照复盘报告：\n"
         "## 复盘：[主队] [比分] [客队]\n"
         "## 赛事：[联赛]  开球：[CST]\n\n"
@@ -1471,6 +1482,11 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
            if has_fund else "")
         + f"### 实际结果（现在才揭晓）\n{result_text}\n"
     )
+    if score is not None:
+        from . import hypothesis_settle
+        settlement = hypothesis_settle.settlement_block(csv_text, league, score)
+        if settlement:
+            user += "\n" + settlement + "\n"
     if input_metrics is not None:
         input_metrics.update({
             "rule_chars": len(rules),
@@ -1484,14 +1500,16 @@ def _review_prompts(csv_text: str, forecast_text: str, result_text: str,
 
 def review(csv_text: str, forecast_text: str, result_text: str,
            home: str, away: str, league: str, effort: str = "",
-           fund_brief: str = "", visitor: bool = False) -> str:
-    """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。visitor 透传角色。"""
+           fund_brief: str = "", visitor: bool = False, *,
+           score: tuple[int, int] | None = None) -> str:
+    """复盘第二遍对照（阻塞版）。fund_brief 非空则结合基本面研判归因。visitor 透传角色。
+    score：全场比分，非空时注入代码算好的假设结算表。"""
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法复盘。请在 .env 配置。"
     input_metrics: dict[str, int] = {}
     system, user = _review_prompts(
         csv_text, forecast_text, result_text, home, away, league, fund_brief,
-        input_metrics)
+        input_metrics, score=score)
     return _call_llm(system, user, effort, tier="heavy", visitor=visitor,
                      input_metrics=input_metrics)
 
@@ -1510,8 +1528,9 @@ _REVIEW_TOTAL_STAGES = 6
 
 def review_stream(csv_text: str, forecast_text: str, result_text: str,
                   home: str, away: str, league: str, effort: str = "",
-                  fund_brief: str = "", visitor: bool = False):
-    """复盘第二遍对照（流式）。yield 进度/结果事件（同 analyze_stream）：
+                  fund_brief: str = "", visitor: bool = False, *,
+                  score: tuple[int, int] | None = None):
+    """复盘第二遍对照（流式）。score：全场比分，非空时注入代码算好的假设结算表。yield 进度/结果事件（同 analyze_stream）：
       ('warning', 预警串)   —— 预计输入超过 warn-only 阈值，请求仍继续
       ('stage', n, 阶段名)  —— 模型开始写第 n 段（n=1..6）
       ('done', 完整报告)
@@ -1527,7 +1546,7 @@ def review_stream(csv_text: str, forecast_text: str, result_text: str,
     input_metrics: dict[str, int] = {}
     system, user = _review_prompts(
         csv_text, forecast_text, result_text, home, away, league, fund_brief,
-        input_metrics)
+        input_metrics, score=score)
     head_re = re.compile(r"(?m)^#{2,3}\s*(\d+)\s*[\.、]")
     seen: set[int] = set()
     for kind, payload in _stream_llm(system, user, effort, tier="heavy",

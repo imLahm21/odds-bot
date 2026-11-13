@@ -130,7 +130,7 @@ class TestFullModelExclusions(unittest.TestCase):
     def test_excluded_snapshot_and_direct_routes_never_request_models(self):
         routes = settings.defaults("analyze")
         routes["fundamentals_review"].update(model=_BLOCKED, fallbacks=())
-        with patch.object(multi, "_run_one") as expert, patch.object(llm_client, "chat_model") as chat:
+        with patch.object(multi, "_run_one") as expert, patch.object(llm_client, "collect_model") as chat:
             report, summary = multi.run("csv", "fund", "H", "A", "L", settings=routes)
             self.assertEqual(report, "")
             self.assertIn("配置错误", summary["error"])

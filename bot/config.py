@@ -1001,8 +1001,12 @@ FULL_CONSULT_RESCUE_DEFAULTS = {
     "analyze": {"model": "gpt-6.1-sol-cpa", "effort": "high", "route_group": "cpa_gpt"},
     "review": {"model": "gpt-6.1-sol-cpa", "effort": "high", "route_group": "cpa_gpt"},
 }
-FULL_CONSULT_MAX_WORKERS = 4
-FULL_CONSULT_TIMEOUT = 300
+FULL_CONSULT_MAX_WORKERS = 9          # 原为 4；实际并发由 LLM_GROUP_MAX_CONCURRENT 把关
+FULL_CONSULT_TIMEOUT = 300            # 已不被全模型使用（改流式）；保留定义避免外部引用报错
+FULL_CONSULT_MIN_OK_MODULES = 5       # 成功模块少于此数就不进入合并
+FULL_CONSULT_ROLE_DEADLINE = 900      # 单个职责的模型链总时限（秒）；超过后不再尝试下一个模型
+FULL_CONSULT_CARD_MAX_CHARS = 6000    # 单张专家卡片进入合并/审计提示词的字符上限
+FULL_CONSULT_REPAIR_MIN_RATIO = 0.6   # 修复后报告长度不得低于原报告的比例
 
 # ─── 重档并发上限（按供应商授权组）───────────────────────────────────────────
 # 同一授权组同时在跑的【重档/全模型】请求数上限；超出的在 llm_client 里排队，
