@@ -118,8 +118,8 @@ def _submit_bg(fn, *args) -> None:
 _ANALYSIS_MAX_CONCURRENT = 10     # 全局同时在跑的分析上限（超出则排队）
 _ANALYSIS_MAX_PER_CHAT = 6        # 单个 chat 同时在跑的精算上限（常见用法：27 分钟内 4~6 场）
 # 错峰分两种，按该 chat 重档主模型所在的授权组决定：
-#   CPA 组（单 key、无按分钟限流）：缓存预热——第一场立即发，其余各场只等到
-#     「第一场发出后 config.LLM_CACHE_WARMUP_SECONDS 秒」一起发，吃第一场的前缀缓存。
+#   CPA / OpenRouter 组（config.LLM_CACHE_WARMUP_GROUP_PREFIXES）：缓存预热——第一场立即发，
+#     其余各场只等到「第一场发出后 config.LLM_CACHE_WARMUP_SECONDS 秒」一起发，吃第一场的前缀缓存。
 #   其它组（IK，多 key 按分钟限流）：递增错峰——第 N 场延迟 (N-1)×间隔，把下行 token
 #     错开到不同 TPM 计费窗口，配合 llm_client 的端点轮转。
 # 封顶存在的意义：用户在开赛前 27 分钟才开始推算、开赛前必须下注，延迟不能无限累加。
@@ -185,7 +185,7 @@ def _stagger_delay(chat_id: int, kind: str, running: int) -> float:
     if kind not in _STAGGER_KINDS:
         return 0
     group = _heavy_route_group(chat_id)
-    if group.startswith("cpa_"):
+    if config.llm_group_uses_cache_warmup(group):
         warmup = config.LLM_CACHE_WARMUP_SECONDS
         if warmup <= 0:
             return 0
@@ -262,7 +262,7 @@ def _submit_analysis(chat_id: int, kind: str, fn, *args) -> str | None:
                       "callback_data": f"stopan:{task_id}"}]]})
     elif delay >= 1:
         why = ("等第一场写入缓存后一起发，省输入额度"
-               if _heavy_route_group(chat_id).startswith("cpa_")
+               if config.llm_group_uses_cache_warmup(_heavy_route_group(chat_id))
                else "错峰发起，避免多场同时打满单个 key 的限流")
         send(chat_id, f"⏳ 已排队：本场约 {delay:.0f}s 后开始（{why}）")
     return task_id

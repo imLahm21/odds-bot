@@ -763,6 +763,30 @@ class TestModelProfile(unittest.TestCase):
                          "anthropic/claude-opus-5.5")
         self.assertEqual(config.llm_upstream_model("gpt-6.1-sol-op"), "openai/gpt-6.1-sol")
 
+    def test_openrouter_claude_marks_system_prompt_for_caching(self):
+        """OpenRouter 上的 Claude 必须显式打缓存断点；其它组合保持纯字符串 system。"""
+        for model in _OP_CLAUDE:
+            with self.subTest(model=model):
+                payload = llm_client._payload(model, "规则库", "本场数据", 1024, "high",
+                                              True, "op_claude")
+                system, user = payload["messages"]
+                self.assertEqual(system["content"], [
+                    {"type": "text", "text": "规则库",
+                     "cache_control": {"type": "ephemeral"}}])
+                # 断点只在公共的 system 上；每场不同的 user 内容不入缓存
+                self.assertEqual(user["content"], "本场数据")
+                self.assertNotIn("cache_control", payload)
+        for model, group in (("gpt-6.1-sol-op", "op_gpt"), ("gemini-4-argon-op", "op_gemini"),
+                             ("grok-4.7-op", "op_grok"), ("claude-opus-5-5", "ik_claude"),
+                             ("claude-opus-5-5-high", "cpa_claude")):
+            with self.subTest(model=model):
+                payload = llm_client._payload(model, "规则库", "本场数据", 1024, "high",
+                                              False, group)
+                self.assertEqual(payload["messages"][0]["content"], "规则库")
+        # 空 system 不构造缓存块
+        empty = llm_client._payload("claude-opus-5-5-op", "", "u", 64, "", False, "op_claude")
+        self.assertEqual(empty["messages"][0]["content"], "")
+
     def test_openrouter_efforts_follow_openrouter_model_metadata(self):
         expected = {
             "gpt-6-astra-op": ("low", "medium", "high", "xhigh", "max"),

@@ -128,6 +128,17 @@ class StaggerTests(unittest.TestCase):
             tgbot._warmup_leader_at["cpa_gpt"] = time.monotonic() - 60
             self.assertEqual(tgbot._stagger_delay(1, "精算", 1), 0)
 
+    def test_openrouter_groups_also_wait_for_cache_warmup(self):
+        for group in ("op_gpt", "op_gemini", "op_claude", "op_grok"):
+            with self.subTest(group=group), \
+                    patch.object(tgbot, "_heavy_route_group", return_value=group):
+                tgbot._warmup_leader_at.clear()
+                self.assertEqual(tgbot._stagger_delay(1, "精算", 0), 0)
+                delay = tgbot._stagger_delay(1, "精算", 3)
+                self.assertTrue(24 < delay <= 25, delay)
+        self.assertFalse(config.llm_group_uses_cache_warmup("ik_claude"))
+        self.assertFalse(config.llm_group_uses_cache_warmup(""))
+
     def test_warmup_can_be_disabled(self):
         with patch.object(tgbot, "_heavy_route_group", return_value="cpa_gpt"), \
                 patch.object(config, "LLM_CACHE_WARMUP_SECONDS", 0):

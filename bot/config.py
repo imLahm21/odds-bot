@@ -1200,11 +1200,30 @@ def llm_model_is_light(model: str) -> bool:
     return "light" in ((LLM_MODELS.get(model) or {}).get("tiers") or ())
 
 
-# 缓存预热错峰：同一 CPA 组连点多场时，第一场立即发，其余各场只等到
+# 缓存预热错峰：同一 CPA / OpenRouter 组连点多场时，第一场立即发，其余各场只等到
 # 「第一场发出后 N 秒」再一起发，让它们吃到第一场写入的输入前缀缓存
 # （规则库 system prompt 约占输入一半；实测 Gemini 间隔 43s 的第二场命中 9.3 万缓存 token）。
 # 设 0 关闭。IK 组仍按 tgbot 的递增错峰（多 key 按分钟限流）。
 LLM_CACHE_WARMUP_SECONDS = _typesafe_nonnegative_int("LLM_CACHE_WARMUP_SECONDS", 25)
+# 走缓存预热错峰的授权组前缀。OpenRouter 按 token 计费，缓存命中即省钱；它在用过缓存后
+# 会把同模型的后续请求粘到同一上游（60 分钟无请求才失效），同批场次能命中第一场的缓存。
+LLM_CACHE_WARMUP_GROUP_PREFIXES = ("cpa_", "op_")
+
+
+def llm_group_uses_cache_warmup(group: str) -> bool:
+    """该授权组是否按「领头场先发、其余等缓存写好再发」错峰（否则走递增错峰）。"""
+    return bool(group) and group.startswith(LLM_CACHE_WARMUP_GROUP_PREFIXES)
+
+
+def llm_needs_system_cache_breakpoint(model: str, route_group: str) -> bool:
+    """经 OpenRouter 调 Claude 时须显式标记缓存位置，否则每次输入都按全价计费。
+
+    GPT / Gemini / Grok 在 OpenRouter 上自动缓存，不需要标记。不用 OpenRouter 的
+    顶层自动缓存：它把断点放在整段提示末尾，而每场比赛的 user 内容都不同，规则库
+    （system）这段公共前缀永远不会单独入缓存。
+    """
+    provider = (LLM_ROUTE_GROUPS.get(route_group) or {}).get("provider")
+    return provider == "openrouter" and llm_model_family(model) == "claude"
 
 # ─── LLM 故障转移 + 熔断器 可调参数（TG /llm 面板实时改，落 db.llm_settings）───
 # 这里是这 10 个参数的【唯一真相源】：db seed 读它灌默认值、TG 面板展示/校验读它、

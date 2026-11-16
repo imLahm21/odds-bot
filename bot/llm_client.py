@@ -847,13 +847,22 @@ def _apply_completion_options(payload: dict, model: str, route_group: str,
     return payload
 
 
+def _system_content(system: str, model: str, route_group: str) -> str | list[dict]:
+    """system 消息内容。经 OpenRouter 调 Claude 时在规则库末尾打缓存断点：
+    5 分钟内同一 system 的后续请求按 0.1 倍输入价读缓存（首次写入为 1.25 倍）。"""
+    if system and config.llm_needs_system_cache_breakpoint(model, route_group):
+        return [{"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}]
+    return system
+
+
 def _payload(model: str, system: str, user: str, max_tokens: int,
              effort: str, stream: bool, route_group: str) -> dict:
     p = {
         # 本地别名（如 gpt-6-astra-cpa）只用于选路与配置，上游只认真实模型名
         "model": config.llm_upstream_model(model),
         "messages": [
-            {"role": "system", "content": system},
+            {"role": "system", "content": _system_content(system, model, route_group)},
             {"role": "user", "content": user},
         ],
     }
