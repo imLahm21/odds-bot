@@ -20,13 +20,14 @@ Telegram bot —— 实时操控关注的联赛/庄家 + 查询数据
 """
 
 import os
+import re
 import time
 import uuid
 import logging
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from html import escape as _html_escape
+from html import escape as _html_escape, unescape as _html_unescape
 
 import requests
 from dotenv import load_dotenv
@@ -3497,8 +3498,74 @@ def _fmt_last_probe(idx: int) -> str:
     return f"　上次测试：{icon} {tier} {req} · {status} · {err}（{when}）"
 
 
-def _llm_panel_text() -> str:
-    """三段面板文字：端点池 / 熔断状态 / 可调参数。"""
+# Telegram 单条消息上限 4096 字符（按解析 HTML 后的可见文字计）。超长时 sendMessage /
+# editMessageText 会直接 400「message is too long」，/llm 面板就打不开。面板留出余量，
+# 端点变多时自动改用更短的端点格式；测试结果拼在面板前时也一并控长。
+_TG_PANEL_BUDGET = 3800
+
+
+def _tg_len(text: str) -> int:
+    """Telegram 计长口径：去掉 HTML 标签、还原实体后的可见文字，按 UTF-16 码元计。"""
+    visible = _html_unescape(re.sub(r"<[^>]+>", "", text or ""))
+    return len(visible.encode("utf-16-le")) // 2
+
+
+def _fit_lines(lines: list[str], budget: int) -> str:
+    """按顺序保留能放进 budget 的行，其余折叠成一行说明（不截断单行，避免切坏 HTML 标签）。"""
+    kept: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        cost = _tg_len(line) + 1
+        if used + cost > budget:
+            kept.append(f"…（另有 {len(lines) - index} 行未显示，面板太长）")
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept)
+
+
+def _llm_endpoint_needs_detail(i: int, st: dict) -> bool:
+    """端点是否异常：非正常熔断态、有连续失败，或上次测试失败。"""
+    last = llm_client.last_probe(i) or {}
+    return (st["state"] != "CLOSED" or st["consecutive"] > 0
+            or (bool(last) and not last.get("ok") and not last.get("skipped")))
+
+
+def _llm_endpoint_lines(eps: list[dict], stats: list[dict], mode: str) -> list[str]:
+    """端点明细。mode：full = 每端点三行；issues = 正常端点一行、异常端点保留明细；
+    brief = 每端点一行。端点多、面板超长时依次降级。"""
+    lines = []
+    for i, (ep, st) in enumerate(zip(eps, stats)):
+        sw = "🟢启用" if llm_client.is_enabled(i) else "⚪停用"
+        badge = _BREAKER_ZH.get(st["state"], st["state"])
+        group = f"<code>{ep['route_group']}</code>"
+        if mode == "brief" or (mode == "issues" and not _llm_endpoint_needs_detail(i, st)):
+            lines.append(f"{i}. <b>{ep['label']}</b> {sw} · {badge} · {group}")
+            continue
+        extra = ""
+        if st["state"] == "OPEN":
+            extra = f"，{st['open_remain']}s 后半开探活"
+        elif st["state"] == "HALF_OPEN":
+            extra = f"，已成功 {st['half_ok']}"
+        elif st["state"] == "DEGRADED":
+            extra = "，选路已降优先"
+        rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
+            if st["total"] else "无样本"
+        # 组内模型已在上方「密钥授权组」列出，这里不再逐端点重复
+        url = ep["base_url"].split("://", 1)[-1]
+        lines.append(
+            f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra} · {group}\n"
+            f"　<code>{url}</code> · 连续失败 {st['consecutive']} · 错误率 {rate}\n"
+            f"{_fmt_last_probe(i)}")
+    return lines
+
+
+def _llm_panel_text(budget: int = _TG_PANEL_BUDGET) -> str:
+    """三段面板文字：端点池 / 熔断状态 / 可调参数。
+
+    budget 是可见字符上限：放不下完整端点明细时依次退到「只展开异常端点」
+    「每端点一行」「省略端点明细」。
+    """
     if not llm_client.available():
         issues = llm_client.routing_issues()
         detail = "\n".join(f"· {item}" for item in issues)
@@ -3527,34 +3594,14 @@ def _llm_panel_text() -> str:
             f"· {mark} <code>{group}</code> {spec['label']}："
             f"{enabled}/{len(indices)} 启用\n"
             f"　模型：{', '.join(models) if models else '未绑定'}")
-    for i, (ep, st) in enumerate(zip(eps, stats)):
-        on = llm_client.is_enabled(i)
-        sw = "🟢启用" if on else "⚪停用"
-        badge = _BREAKER_ZH.get(st["state"], st["state"])
-        extra = ""
-        if st["state"] == "OPEN":
-            extra = f"，{st['open_remain']}s 后半开探活"
-        elif st["state"] == "HALF_OPEN":
-            extra = f"，已成功 {st['half_ok']}"
-        elif st["state"] == "DEGRADED":
-            extra = "，选路已降优先"
-        rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
-            if st["total"] else "无样本"
-        group = ep["route_group"]
-        models = [config.llm_model_display_id(m) for m in config.llm_models_in_group(group)]
-        lines.append(
-            f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
-            f"   <code>{ep['base_url']}</code>\n"
-            f"   连续失败 {st['consecutive']} · 错误率 {rate}\n"
-            f"　密钥组：<code>{group}</code>\n"
-            f"　组内模型：{'、'.join(models) or '未绑定'}\n"
-            f"{_fmt_last_probe(i)}")
+    lines.append("\n<b>🔌 端点明细</b>")
+    head = lines
 
     # 模型槽位段：3 档 × 2 角色，每槽位「主模型 + 回退模型」。
     # ❌ = 该模型的密钥组在 .env 里没配端点（这次故障的病根，必须一眼可见）。
-    lines.append("\n<b>🎚️ 模型槽位</b>（主模型那组全挂时自动落到回退模型）\n"
-                 "✅=密钥组已配 / ❌=缺密钥组 / ⚠️=未登记模型（按前缀路由，"
-                 "上游不认会 404）/ —=未设")
+    lines = ["\n<b>🎚️ 模型槽位</b>（主模型那组全挂时自动落到回退模型）\n"
+             "✅=密钥组已配 / ❌=缺密钥组 / ⚠️=未登记模型（按前缀路由，"
+             "上游不认会 404）/ —=未设"]
 
     def _slot_mark(ready: bool, retired: bool, model: str) -> str:
         if not model:
@@ -3579,7 +3626,25 @@ def _llm_panel_text() -> str:
         cur = _fmt_num(settings.get(key, spec["default"]))
         lines.append(f"· {spec['label']}：<b>{cur}</b>"
                      f"（{spec['min']}~{spec['max']}）")
-    return "\n".join(lines)
+    tail = lines
+
+    variants = (
+        _llm_endpoint_lines(eps, stats, "full"),
+        _llm_endpoint_lines(eps, stats, "issues"),
+        _llm_endpoint_lines(eps, stats, "brief"),
+        ["（端点太多，明细已省略；用下方「端点N」按钮开关、🧪 按钮按组测试）"],
+    )
+    for endpoint_lines in variants:
+        text = "\n".join(head + endpoint_lines + tail)
+        if _tg_len(text) <= budget:
+            break
+    return text
+
+
+def _llm_panel_with_results(result_lines: list[str]) -> str:
+    """测试结果 + 面板，合计控制在 Telegram 单条上限内（结果最多占一半）。"""
+    results = _fit_lines(result_lines, _TG_PANEL_BUDGET // 2)
+    return results + "\n\n" + _llm_panel_text(_TG_PANEL_BUDGET - _tg_len(results) - 2)
 
 
 def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
@@ -3858,9 +3923,7 @@ def _llm_run_probe(chat_id: int, message_id: int, target: str,
              "both": "重档+轻档"}.get(which, which)
     lines = [f"<b>🧪 连通性测试结果（{title}）</b>"]
     lines += [_fmt_probe_line(r) for r in results]
-    lines.append("")
-    lines.append(_llm_panel_text())
-    edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
+    edit_text(chat_id, message_id, _llm_panel_with_results(lines), _llm_panel_keyboard())
 
 
 def _llm_group_probe_keyboard(group: str) -> dict:
@@ -3895,9 +3958,7 @@ def _llm_run_group_probe(chat_id: int, message_id: int, group: str,
         results.append(result)
     lines = [f"<b>🧪 密钥组测试：{group} · {config.llm_model_display_id(model)}</b>"]
     lines += [_fmt_probe_line(result) for result in results]
-    lines.append("")
-    lines.append(_llm_panel_text())
-    edit_text(chat_id, message_id, "\n".join(lines), _llm_panel_keyboard())
+    edit_text(chat_id, message_id, _llm_panel_with_results(lines), _llm_panel_keyboard())
 
 
 def _prompt_fixarg(chat_id: int, cmd: str) -> None:

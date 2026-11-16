@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -1059,6 +1060,82 @@ class TestModelProfile(unittest.TestCase):
         self.assertIn("模型：deepseek-v4-pro-ikun, deepseek-v4.1-flash-ikun", panel)
         self.assertIn("gpt-5.6-luna-cpa, gpt-6-luna-cpa, gpt-6-astra-cpa", panel)
         self.assertFalse(any("-ikun" in cb for cb in callbacks))
+
+    def test_llm_panel_fits_telegram_limit_with_many_endpoints(self):
+        """线上 19 条端点时面板曾达 5488 可见字符，sendMessage 400 message is too long。"""
+        layout = {"ik_gpt": 3, "ik_grok": 1, "ik_deepseek": 2, "ik_glm": 2, "ik_gemini": 1,
+                  "ik_claude": 3, "cpa_gpt": 1, "cpa_claude": 1, "cpa_gemini": 1,
+                  "op_gpt": 1, "op_gemini": 1, "op_claude": 1, "op_grok": 1}
+        endpoints = []
+        for group, count in layout.items():
+            for n in range(count):
+                ep = self._group_endpoint(f"{group.upper()}-Endpoint-Label-{n}", group)
+                if group.startswith("op_"):
+                    ep["base_url"] = "https://openrouter.ai/api/v1"
+                endpoints.append(ep)
+        self.assertEqual(len(endpoints), 19)
+        settings = {key: spec["default"] for key, spec in config.LLM_SETTING_SPECS.items()}
+        slots = [{"label": spec["label"], "role": role,
+                  "primary": config.llm_tier_default(tier, role == "visitor"),
+                  "fallback": config.llm_tier_fallback(tier, role == "visitor"),
+                  "primary_ready": True, "primary_retired": False,
+                  "fallback_ready": True, "fallback_retired": False}
+                 for tier, spec in config.LLM_TIER_MODELS.items()
+                 for role in ("admin", "visitor")]
+        failing = 16      # op_gemini：上次测试失败，应保留明细
+
+        def last_probe(idx):
+            if idx != failing:
+                return {"ok": True, "which": "heavy", "ts": time.time(),
+                        "req_model": "gpt-6.1-sol", "latency_ms": 321}
+            return {"ok": False, "http_status": 503, "which": "heavy", "ts": time.time(),
+                    "req_model": "gemini-4-hydrogen-op", "latency_ms": 1234,
+                    "error": "upstream overloaded " * 10}
+        results = [{"label": ep["label"], "which": "heavy", "req_model": "gpt-6.1-sol",
+                    "ok": False, "http_status": 500, "latency_ms": 999,
+                    "error": "internal error " * 8} for ep in endpoints] * 2
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", [_FakeBreaker() for _ in endpoints]),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+            patch.object(llm_client, "get_settings", return_value=settings),
+            patch.object(llm_client, "slot_snapshot", return_value=slots),
+            patch.object(llm_client, "routing_issues", return_value=[]),
+            patch.object(llm_client, "last_probe", side_effect=last_probe),
+            patch.object(llm_client, "probe_all", return_value=results),
+            patch.object(tgbot, "edit_text") as edit,
+        ):
+            panel = tgbot._llm_panel_text()
+            self.assertLessEqual(tgbot._tg_len(panel), 4096)
+            # 组内模型只在授权组段列一次，不再逐端点重复
+            self.assertNotIn("组内模型", panel)
+            self.assertIn("gpt-6-astra-op", panel)
+            self.assertIn("deepseek-v4-pro-ikun", panel)
+            # 19 条端点放不下完整明细：正常端点一行，异常端点保留地址、错误率和上次测试
+            self.assertIn("0. <b>IK_GPT-Endpoint-Label-0</b> 🟢启用 · ✅正常 · "
+                          "<code>ik_gpt</code>\n1. ", panel)
+            self.assertIn("<code>openrouter.ai/api/v1</code> · 连续失败", panel)
+            self.assertIn("upstream overloaded", panel)
+            self.assertEqual(panel.count("上次测试"), 1)
+            # 长度预算足够时仍给完整明细
+            few = tgbot._llm_panel_text(100000)
+            self.assertEqual(few.count("上次测试"), 19)
+            # 预算很紧时退到每端点一行 / 省略明细，仍能发出
+            for budget in (2600, 1800):
+                with self.subTest(budget=budget):
+                    squeezed = tgbot._llm_panel_text(budget)
+                    self.assertLessEqual(tgbot._tg_len(squeezed),
+                                         max(budget, tgbot._tg_len(
+                                             tgbot._llm_panel_text(0))))
+                    self.assertIn("模型槽位", squeezed)
+                    self.assertIn("可调参数", squeezed)
+            # 全部端点测试结果（38 行长错误）拼在面板前也不超限
+            tgbot._llm_run_probe(1, 2, "all", "both")
+            text = edit.call_args.args[2]
+            self.assertLessEqual(tgbot._tg_len(text), 4096)
+            self.assertIn("连通性测试结果", text)
+            self.assertIn("行未显示", text)
+            self.assertIn("模型槽位", text)
 
     def test_display_ids_mark_provider_without_changing_model_ids(self):
         self.assertEqual(config.llm_model_display_id("gemini-3.8-flash"),
