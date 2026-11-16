@@ -182,7 +182,7 @@ Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-
 **OpenRouter 接入**：四个组 `op_gpt`/`op_gemini`/`op_claude`/`op_grok`，Base URL 填
 `https://openrouter.ai/api/v1`。四组各用一条独立 Key（同一 Key 不能跨组；可在 OpenRouter 后台给每条 Key
 单独设额度上限）。Key 用本地 PowerShell 脚本写入本地与服务器 `.env`（隐藏输入、自动备份、原子替换）：
-`& .\scripts\set_openrouter_keys.ps1 -SshTarget ubuntu@<服务器IP> -SshPort <端口>`。模型用本地别名「标准名 + `-op`」（如 `gpt-6.1-sol-op`、`claude-opus-5-5-op`），
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\set_openrouter_keys.ps1 -SshTarget ubuntu@<服务器IP> -SshPort <端口>`（仓库在 Google Drive 盘上时 RemoteSigned 会拒绝直接运行，`-ExecutionPolicy Bypass` 只对这一次进程生效、不改系统设置）。模型用本地别名「标准名 + `-op`」（如 `gpt-6.1-sol-op`、`claude-opus-5-5-op`），
 只走对应 `op_*` 组，请求时换成 OpenRouter 的 ID（如 `openai/gpt-6.1-sol`、`anthropic/claude-opus-5.5`）。
 别名未单列 token 预算/预警线时，沿用标准名（去掉 `-op`）的配置；全模型防自审也把它与 IK/CPA 同款视为同一模型。
 强度选项取自 OpenRouter 模型元数据 `reasoning.supported_efforts`（2026-11-15）。共 16 个：

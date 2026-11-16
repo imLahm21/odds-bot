@@ -10,7 +10,9 @@
   - 默认同时更新本地 .env 和服务器 .env（两边保持一致）；-SkipLocal / -SkipServer 可只改一边。
 
 .EXAMPLE
-  & ".\scripts\set_openrouter_keys.ps1" -SshTarget ubuntu@<服务器IP> -SshPort <端口>
+  # 仓库在 Google Drive（G:）上，RemoteSigned 会把它当远程脚本拒绝；只对这一次运行放行：
+  powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\set_openrouter_keys.ps1" `
+      -SshTarget ubuntu@<服务器IP> -SshPort <端口>
 #>
 param(
     [string]$SshTarget = $env:ODDS_SSH_TARGET,
