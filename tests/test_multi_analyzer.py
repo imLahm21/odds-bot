@@ -120,7 +120,7 @@ class TestMultiAnalyzer(unittest.TestCase):
              "glm-5.3-flash", "grok-4.5", "gpt-6.1-sol", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "grok-4.7",
              "gemini-3.8-flash", "claude-sonnet-5-5", "gemini-4-argon",
              "claude-sonnet-5-5-high", "gemini-3.8-flash-high", "gemini-4-argon-high",
-             "gemini-4-hydrogen-xhigh"},
+             "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen"},
         )
         models = {task["model"] for task in config.FULL_CONSULT_TASKS}
         models.add(config.FULL_CONSULT_SYNTHESIS["model"])

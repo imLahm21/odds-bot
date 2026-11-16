@@ -517,50 +517,53 @@ _EFFORT_GROK_46 = ("low", "medium", "high", "xhigh")
 _EFFORT_GROK_45 = ("low", "medium", "high")
 _EFFORT_DEEPSEEK = ("none", "low", "high", "max")
 _EFFORT_GEMINI_38 = ("low", "medium", "high")
-# Google documents low/medium/high (default medium); IK support is not yet probed.
-# https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
-# https://ai.google.dev/gemini-api/docs/openai#thinking
+# Google 官方（2026-11-15 查阅）：Argon / Carbon 为 low/medium/high（默认 medium）；
+# Hydrogen 另有 xhigh（默认 high，xhigh 仅 Hydrogen 支持）。Gemini 4 无法关闭思考，
+# 不开放 none。IK / CPA 是否原样转发各档尚未探针验证。
+# https://aistudio.google.com/docs/thinking
+# https://aistudio.google.com/docs/openai
 _EFFORT_GEMINI_4_ARGON = ("low", "medium", "high")
+_EFFORT_GEMINI_4_HYDROGEN = ("low", "medium", "high", "xhigh")
 # 两款 Claude 5.5 按官方五档登记；IK 兼容接口已通过阻塞/流式探针。
 _EFFORT_CLAUDE_55 = ("low", "medium", "high", "xhigh", "max")
 
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
     # Existing consultation tasks may still use models with no menu tier.
-    "gpt-6-astra":      {"label": "GPT-6 Astra", "tiers": ("heavy",),
+    "gpt-6-astra":      {"label": "IK · GPT-6 Astra", "tiers": ("heavy",),
                            "efforts": _EFFORT_OPENAI_ASTRA},
-    "gpt-6-sol":        {"label": "GPT-6 Sol", "tiers": ("heavy", "balanced"),
+    "gpt-6-sol":        {"label": "IK · GPT-6 Sol", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_OPENAI_SOL},
-    "gpt-6.1-sol":      {"label": "GPT-6.1 Sol", "tiers": ("heavy", "balanced"),
+    "gpt-6.1-sol":      {"label": "IK · GPT-6.1 Sol", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_OPENAI_61_SOL},
-    "claude-opus-5-5":  {"label": "Claude Opus 5.5", "tiers": ("heavy",),
+    "claude-opus-5-5":  {"label": "IK · Claude Opus 5.5", "tiers": ("heavy",),
                            "efforts": _EFFORT_CLAUDE_55},
-    "claude-sonnet-5-5": {"label": "Claude Sonnet 5.5", "tiers": ("heavy", "balanced"),
+    "claude-sonnet-5-5": {"label": "IK · Claude Sonnet 5.5", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_CLAUDE_55},
-    "gpt-5.6-sol":      {"label": "GPT-5.6 Sol", "tiers": (),
+    "gpt-5.6-sol":      {"label": "IK · GPT-5.6 Sol", "tiers": (),
                            "efforts": _EFFORT_OPENAI_SOL},
-    "glm-5.3":          {"label": "GLM-5.3", "tiers": ("heavy",),
+    "glm-5.3":          {"label": "IK · GLM-5.3", "tiers": ("heavy",),
                            "efforts": _EFFORT_GLM_53},
-    "grok-4.6":         {"label": "Grok 4.6", "tiers": ("heavy", "balanced"),
+    "grok-4.6":         {"label": "IK · Grok 4.6", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GROK_46},
-    "deepseek-v4-pro":  {"label": "DeepSeek V4 Pro", "tiers": ("heavy",),
+    "deepseek-v4-pro":  {"label": "IK · DeepSeek V4 Pro", "tiers": ("heavy",),
                            "efforts": _EFFORT_DEEPSEEK},
-    "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "tiers": ("heavy", "balanced"),
+    "gemini-3.8-flash": {"label": "IK · Gemini 3.8 Flash", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GEMINI_38},
     "deepseek-v4.1-flash": {
-        "label": "DeepSeek V4.1 Flash", "tiers": ("heavy", "balanced"),
+        "label": "IK · DeepSeek V4.1 Flash", "tiers": ("heavy", "balanced"),
         "efforts": _EFFORT_DEEPSEEK,
     },
     # ── 中型池：基本面预分析 + SEO/科普 + 教训提炼 ──
-    "gpt-5.6-terra":    {"label": "GPT-5.6 Terra",
+    "gpt-5.6-terra":    {"label": "IK · GPT-5.6 Terra",
                            "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_OPENAI_TERRA},
-    "glm-5.3-flash":    {"label": "GLM-5.3 Flash",
+    "glm-5.3-flash":    {"label": "IK · GLM-5.3 Flash",
                            "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GLM_53_FLASH},
-    "grok-4.5":         {"label": "Grok 4.5", "tiers": ("balanced",),
+    "grok-4.5":         {"label": "IK · Grok 4.5", "tiers": ("balanced",),
                            "efforts": _EFFORT_GROK_45},
-    "grok-4.7":         {"label": "Grok 4.7", "tiers": ("heavy", "balanced"),
+    "grok-4.7":         {"label": "IK · Grok 4.7", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GROK_46},
     # ── 轻型池：走地实时研判 ──
     "gpt-5.6-luna":     {"label": "CPA · GPT-5.6 Luna", "tiers": ("light",),
@@ -568,7 +571,7 @@ LLM_MODELS: dict[str, dict] = {
     "gpt-6-luna":      {"label": "CPA · GPT-6 Luna", "tiers": ("light",),
                            "efforts": _EFFORT_OPENAI_LUNA},
     # Append new candidates to preserve existing index-based menu callbacks.
-    "gemini-4-argon":   {"label": "Gemini 4 Argon", "tiers": ("heavy", "balanced"),
+    "gemini-4-argon":   {"label": "IK · Gemini 4 Argon", "tiers": ("heavy", "balanced"),
                            "efforts": _EFFORT_GEMINI_4_ARGON},
     # CPA 返回的完整模型 ID，与 IK 标准名分开登记；追加以保留已有菜单回调编号。
     # efforts 沿用基础模型的本地能力表，CPA 是否接受及落实各档仍需单独探针验证。
@@ -603,11 +606,17 @@ LLM_MODELS: dict[str, dict] = {
         "label": "CPA · GPT-6.1 Terra", "tiers": ("heavy", "balanced"),
         "efforts": _EFFORT_OPENAI_TERRA, "upstream": "gpt-6.1-terra",
     },
-    # CPA 完整 ID，-xhigh 随模型名原样发送；efforts 暂沿用 Gemini 4 本地能力表，待探针验证。
+    # CPA 完整 ID，-xhigh 随模型名原样发送；efforts 按基础模型 Hydrogen 登记，
+    # CPA 名中的 -xhigh 与单独发送的 reasoning_effort 谁优先尚待探针验证。
     "gemini-4-hydrogen-xhigh": {
         "label": "CPA · Gemini 4 Hydrogen XHigh", "tiers": ("heavy", "balanced"),
-        "efforts": _EFFORT_GEMINI_4_ARGON,
+        "efforts": _EFFORT_GEMINI_4_HYDROGEN,
     },
+    # IK 标准名，按 gemini 家族自动走 ik_gemini；efforts 按 Google 官方能力表登记。
+    "gemini-4-carbon":   {"label": "IK · Gemini 4 Carbon", "tiers": ("heavy", "balanced"),
+                          "efforts": _EFFORT_GEMINI_4_ARGON},
+    "gemini-4-hydrogen": {"label": "IK · Gemini 4 Hydrogen", "tiers": ("heavy", "balanced"),
+                          "efforts": _EFFORT_GEMINI_4_HYDROGEN},
 }
 
 
@@ -913,6 +922,8 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gemini-4-argon": "flagship",
     "gemini-4-argon-high": "flagship",
     "gemini-4-hydrogen-xhigh": "flagship",
+    "gemini-4-carbon": "flagship",
+    "gemini-4-hydrogen": "flagship",
     "gpt-5.6-luna": "specialized_fast",
     "gpt-6-luna": "specialized_fast",
     "gpt-5.6-terra": "specialized_fast",

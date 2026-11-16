@@ -193,6 +193,8 @@ class TestModelProfile(unittest.TestCase):
                 "gpt-6.1-sol-cpa": ("cpa_gpt",),
                 "gpt-6.1-terra-cpa": ("cpa_gpt",),
                 "gemini-4-hydrogen-xhigh": ("cpa_gemini",),
+                "gemini-4-carbon": ("ik_gemini",),
+                "gemini-4-hydrogen": ("ik_gemini",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -236,7 +238,7 @@ class TestModelProfile(unittest.TestCase):
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
-            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
         })
         self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
@@ -245,7 +247,8 @@ class TestModelProfile(unittest.TestCase):
                                     "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                                     "gemini-4-argon", "claude-sonnet-5-5-high",
                                     "gemini-3.8-flash-high", "gemini-4-argon-high",
-                                    "gemini-4-hydrogen-xhigh"})
+                                    "gemini-4-hydrogen-xhigh", "gemini-4-carbon",
+                                    "gemini-4-hydrogen"})
         self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
@@ -255,7 +258,8 @@ class TestModelProfile(unittest.TestCase):
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                           "gemini-4-argon", "claude-sonnet-5-5-high",
                           "gemini-3.8-flash-high", "gemini-4-argon-high",
-                          "gemini-4-hydrogen-xhigh"})
+                          "gemini-4-hydrogen-xhigh", "gemini-4-carbon",
+                          "gemini-4-hydrogen"})
         self.assertEqual(heavy & light, set())
         self.assertEqual(balanced & light, set())
 
@@ -264,9 +268,9 @@ class TestModelProfile(unittest.TestCase):
             "claude-opus-5-5-high", "claude-sonnet-5-5-high",
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
-            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
         )
-        self.assertEqual(tuple(config.LLM_MODELS)[-8:], new_models)
+        self.assertEqual(tuple(config.LLM_MODELS)[-10:], new_models)
         for tier, expected in (
             ("heavy", new_models),
             ("balanced", new_models[1:4] + new_models[5:]),
@@ -284,6 +288,12 @@ class TestModelProfile(unittest.TestCase):
         })
         self.assertEqual(config.llm_model_efforts("gemini-3.8-flash"),
                          ("low", "medium", "high"))
+        # Google 官方：xhigh 仅 Hydrogen 支持；Gemini 4 不能关闭思考
+        for model in ("gemini-4-argon", "gemini-4-argon-high", "gemini-4-carbon"):
+            self.assertEqual(config.llm_model_efforts(model), ("low", "medium", "high"))
+        for model in ("gemini-4-hydrogen", "gemini-4-hydrogen-xhigh"):
+            self.assertEqual(config.llm_model_efforts(model),
+                             ("low", "medium", "high", "xhigh"))
         self.assertEqual(config.llm_model_efforts("gemini-4-argon"),
                          ("low", "medium", "high"))
         self.assertEqual(config.llm_model_efforts("gpt-6-astra"),
@@ -699,6 +709,8 @@ class TestModelProfile(unittest.TestCase):
             ("claude-sonnet-5-5", "ik_claude"),
             ("gemini-3.8-flash", "ik_gemini"),
             ("gemini-4-argon", "ik_gemini"),
+            ("gemini-4-carbon", "ik_gemini"),
+            ("gemini-4-hydrogen", "ik_gemini"),
             ("claude-opus-5-5-high", "cpa_claude"),
             ("claude-sonnet-5-5-high", "cpa_claude"),
             ("gemini-3.8-flash-high", "cpa_gemini"),
@@ -974,6 +986,17 @@ class TestModelProfile(unittest.TestCase):
                                          for choice in choices))
                 self.assertTrue(all(len(cb.encode("utf-8")) <= 64 for cb in callbacks))
                 self.assertIn("lm:", callbacks)
+
+    def test_model_labels_carry_provider_prefix(self):
+        """TG 按钮靠标签前缀区分供应商：IK 组模型以「IK · 」开头，CPA 组以「CPA · 」开头。"""
+        prefixes = {"ikuncode": "IK · ", "cpa": "CPA · "}
+        for model in config.LLM_MODELS:
+            with self.subTest(model=model):
+                groups = config.llm_route_groups_for_model(model)
+                providers = {config.LLM_ROUTE_GROUPS[g]["provider"] for g in groups}
+                self.assertEqual(len(providers), 1)
+                self.assertTrue(config.llm_model_label(model).startswith(
+                    prefixes[providers.pop()]))
 
     def test_resolve_model_chain_drops_model_with_no_configured_group(self):
         """访客重档默认 deepseek，只买了 GPT 密钥时——链应该跳过它、退到回退模型，
