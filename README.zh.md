@@ -179,6 +179,21 @@ Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-
 部署后首次启动仅把轻档主/回退槽位中保存的 `gpt-5.6-luna` 一次性迁移为 `gpt-6-luna`，
 保留其他模型选择及空回退；之后再手动选择模型，重启不会重复覆盖。
 
+**OpenRouter 接入**：四个组 `op_gpt`/`op_gemini`/`op_claude`/`op_grok`，Base URL 填
+`https://openrouter.ai/api/v1`。四组各用一条独立 Key（同一 Key 不能跨组；可在 OpenRouter 后台给每条 Key
+单独设额度上限）。Key 用本地 PowerShell 脚本写入本地与服务器 `.env`（隐藏输入、自动备份、原子替换）：
+`& .\scripts\set_openrouter_keys.ps1 -SshTarget ubuntu@<服务器IP> -SshPort <端口>`。模型用本地别名「标准名 + `-op`」（如 `gpt-6.1-sol-op`、`claude-opus-5-5-op`），
+只走对应 `op_*` 组，请求时换成 OpenRouter 的 ID（如 `openai/gpt-6.1-sol`、`anthropic/claude-opus-5.5`）。
+别名未单列 token 预算/预警线时，沿用标准名（去掉 `-op`）的配置；全模型防自审也把它与 IK/CPA 同款视为同一模型。
+强度选项取自 OpenRouter 模型元数据 `reasoning.supported_efforts`（2026-11-15）。共 16 个：
+GPT-6 Astra / 6.1 Sol / 6.1 Terra / 6 Sol / 6 Luna，Gemini 4 Carbon / Argon / Hydrogen、3.8 Flash，
+Claude Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5，Grok 4.7 / 4.6 / 4.5。档位沿用标准名；
+Fable 5.2 仅重档，Haiku 5.5 与 GPT-6 Luna 仅轻档。
+
+**面板显示名**：TG 的 `/llm` 面板、全模型配置和密钥组测试里，IK 标准名显示为 `xxx-ikun`
+（如 `gemini-3.8-flash-ikun`），CPA 独有的两款 Luna 显示为 `gpt-6-luna-cpa` / `gpt-5.6-luna-cpa`。
+这只是显示：数据库里保存的选择、日志、`.env` 键名和发给上游的模型名都仍是原 ID。
+
 **Claude 接入**：`ik_claude` 使用 IK 的 OpenAI 兼容接口 `/v1/chat/completions`，
 复用现有阻塞/流式客户端。Base URL 填 `https://api.ikuncode.ai/v1`，不要填完整 `/messages`
 地址。Opus 5.5 开放重档，Sonnet 5.5 开放重档和平衡档；默认主模型和回退槽不变。

@@ -452,8 +452,8 @@ def llm_max_tokens_for_model(model: str) -> int:
     """返回模型的重档输出预算（按模型覆盖 > 全局默认）。"""
     if model in LLM_MODEL_MAX_TOKENS:
         return LLM_MODEL_MAX_TOKENS[model]
-    # 本地别名（-cpa）未单列时沿用上游同名模型的预算
-    return LLM_MODEL_MAX_TOKENS.get(llm_upstream_model(model), LLM_MAX_TOKENS)
+    # 本地别名（-cpa / -op）未单列时沿用基础模型标准名的预算
+    return LLM_MODEL_MAX_TOKENS.get(llm_base_model(model), LLM_MAX_TOKENS)
 
 
 # 输入规模只做预警，绝不截断、不压缩、不阻止请求。估算值因不同供应商 tokenizer
@@ -468,7 +468,7 @@ def llm_input_warn_tokens_for_model(model: str) -> int:
     """返回模型的输入 token 预警线（按模型覆盖 > 全局预警线）。"""
     if model in LLM_MODEL_INPUT_WARN_TOKENS:
         return LLM_MODEL_INPUT_WARN_TOKENS[model]
-    return LLM_MODEL_INPUT_WARN_TOKENS.get(llm_upstream_model(model), LLM_INPUT_WARN_TOKENS)
+    return LLM_MODEL_INPUT_WARN_TOKENS.get(llm_base_model(model), LLM_INPUT_WARN_TOKENS)
 
 
 # 推理强度（reasoning_effort）档位：/analyze 选完预设/自定义后再选一档。
@@ -526,6 +526,12 @@ _EFFORT_GEMINI_4_ARGON = ("low", "medium", "high")
 _EFFORT_GEMINI_4_HYDROGEN = ("low", "medium", "high", "xhigh")
 # 两款 Claude 5.5 按官方五档登记；IK 兼容接口已通过阻塞/流式探针。
 _EFFORT_CLAUDE_55 = ("low", "medium", "high", "xhigh", "max")
+# OpenRouter 逐模型档位取自 /api/v1/models 的 reasoning.supported_efforts（2026-11-15）。
+# 与 IK / CPA 实测表分开维护：例如 OpenRouter 的 Astra / Sol 不提供 ultra。
+_EFFORT_OR_LOW_HIGH = ("low", "medium", "high")
+_EFFORT_OR_LOW_XHIGH = ("low", "medium", "high", "xhigh")
+_EFFORT_OR_LOW_MAX = ("low", "medium", "high", "xhigh", "max")
+_EFFORT_OR_NONE_MAX = ("none", "low", "medium", "high", "xhigh", "max")
 
 LLM_MODELS: dict[str, dict] = {
     # ── 重档池：推理能力优先，跑主 SOP 精算 ──
@@ -617,12 +623,99 @@ LLM_MODELS: dict[str, dict] = {
                           "efforts": _EFFORT_GEMINI_4_ARGON},
     "gemini-4-hydrogen": {"label": "IK · Gemini 4 Hydrogen", "tiers": ("heavy", "balanced"),
                           "efforts": _EFFORT_GEMINI_4_HYDROGEN},
+    # OpenRouter：本地名 = 标准名 + -op，只走 op_* 组；upstream 是 OpenRouter 的
+    # vendor/slug（Claude 用点号版本）。base 指向同一基础模型的标准名，用于继承 .env
+    # 的 token 预算/预警线，并让全模型防自审把它与 IK / CPA 同款视为同一模型。
+    # 档位沿用标准名；两款仅 OpenRouter 提供的 Claude：Fable 进重档，Haiku 进轻档。
+    "gpt-6-astra-op": {
+        "label": "OP · GPT-6 Astra", "tiers": ("heavy",), "efforts": _EFFORT_OR_LOW_MAX,
+        "upstream": "openai/gpt-6-astra", "base": "gpt-6-astra",
+    },
+    "gpt-6.1-sol-op": {
+        "label": "OP · GPT-6.1 Sol", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_MAX,
+        "upstream": "openai/gpt-6.1-sol", "base": "gpt-6.1-sol",
+    },
+    "gpt-6.1-terra-op": {
+        "label": "OP · GPT-6.1 Terra", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_NONE_MAX,
+        "upstream": "openai/gpt-6.1-terra", "base": "gpt-6.1-terra",
+    },
+    "gpt-6-sol-op": {
+        "label": "OP · GPT-6 Sol", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_NONE_MAX,
+        "upstream": "openai/gpt-6-sol", "base": "gpt-6-sol",
+    },
+    "gpt-6-luna-op": {
+        "label": "OP · GPT-6 Luna", "tiers": ("light",), "efforts": _EFFORT_OR_NONE_MAX,
+        "upstream": "openai/gpt-6-luna", "base": "gpt-6-luna",
+    },
+    "gemini-4-carbon-op": {
+        "label": "OP · Gemini 4 Carbon", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_HIGH,
+        "upstream": "google/gemini-4-carbon", "base": "gemini-4-carbon",
+    },
+    "gemini-4-argon-op": {
+        "label": "OP · Gemini 4 Argon", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_HIGH,
+        "upstream": "google/gemini-4-argon", "base": "gemini-4-argon",
+    },
+    "gemini-4-hydrogen-op": {
+        "label": "OP · Gemini 4 Hydrogen", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_XHIGH,
+        "upstream": "google/gemini-4-hydrogen", "base": "gemini-4-hydrogen",
+    },
+    "gemini-3.8-flash-op": {
+        "label": "OP · Gemini 3.8 Flash", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_HIGH,
+        "upstream": "google/gemini-3.8-flash", "base": "gemini-3.8-flash",
+    },
+    "claude-fable-5-2-op": {
+        "label": "OP · Claude Fable 5.2", "tiers": ("heavy",), "efforts": _EFFORT_OR_LOW_MAX,
+        "upstream": "anthropic/claude-fable-5.2", "base": "claude-fable-5-2",
+    },
+    "claude-opus-5-5-op": {
+        "label": "OP · Claude Opus 5.5", "tiers": ("heavy",), "efforts": _EFFORT_OR_LOW_MAX,
+        "upstream": "anthropic/claude-opus-5.5", "base": "claude-opus-5-5",
+    },
+    "claude-sonnet-5-5-op": {
+        "label": "OP · Claude Sonnet 5.5", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_MAX,
+        "upstream": "anthropic/claude-sonnet-5.5", "base": "claude-sonnet-5-5",
+    },
+    "claude-haiku-5-5-op": {
+        "label": "OP · Claude Haiku 5.5", "tiers": ("light",), "efforts": _EFFORT_OR_NONE_MAX,
+        "upstream": "anthropic/claude-haiku-5.5", "base": "claude-haiku-5-5",
+    },
+    "grok-4.7-op": {
+        "label": "OP · Grok 4.7", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_XHIGH,
+        "upstream": "x-ai/grok-4.7", "base": "grok-4.7",
+    },
+    "grok-4.6-op": {
+        "label": "OP · Grok 4.6", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OR_LOW_XHIGH,
+        "upstream": "x-ai/grok-4.6", "base": "grok-4.6",
+    },
+    "grok-4.5-op": {
+        "label": "OP · Grok 4.5", "tiers": ("balanced",), "efforts": _EFFORT_OR_LOW_HIGH,
+        "upstream": "x-ai/grok-4.5", "base": "grok-4.5",
+    },
 }
 
 
 def llm_upstream_model(model: str) -> str:
     """发给上游的真实模型名。本地别名（如 gpt-6-astra-cpa）换回 upstream，其余原样返回。"""
     return (LLM_MODELS.get(model) or {}).get("upstream") or model
+
+
+def llm_base_model(model: str) -> str:
+    """本地别名对应的基础模型标准名：-op 取 base，-cpa 取 upstream，其余原样返回。
+
+    只用于继承 token 预算/预警线与判定「是否同一基础模型」，不参与选路和请求。
+    """
+    spec = LLM_MODELS.get(model) or {}
+    return spec.get("base") or spec.get("upstream") or model
 
 
 def llm_model_label(model: str) -> str:
@@ -739,6 +832,16 @@ LLM_ROUTE_GROUPS: dict[str, dict] = {
                    "families": ("claude",)},
     "cpa_gemini": {"label": "CPA · Gemini", "provider": "cpa",
                    "families": ("gemini",)},
+    # OpenRouter：Base URL 填 https://openrouter.ai/api/v1。四组各用一条独立 key
+    # （同一 key 不能跨组），可在 OpenRouter 后台给每条 key 单独设额度上限。
+    "op_gpt": {"label": "OpenRouter · GPT", "provider": "openrouter",
+               "families": ("gpt",)},
+    "op_gemini": {"label": "OpenRouter · Gemini", "provider": "openrouter",
+                  "families": ("gemini",)},
+    "op_claude": {"label": "OpenRouter · Claude", "provider": "openrouter",
+                  "families": ("claude",)},
+    "op_grok": {"label": "OpenRouter · Grok", "provider": "openrouter",
+                "families": ("grok",)},
 }
 
 # 家族 → 默认密钥组。IKuncode 是主供应商，故各家族默认落到对应 ik_* 组；
@@ -767,6 +870,23 @@ LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
     "gemini-3.8-flash-high": ("cpa_gemini",),
     "gemini-4-argon-high": ("cpa_gemini",),
     "gemini-4-hydrogen-xhigh": ("cpa_gemini",),
+    # OpenRouter 本地别名（-op），请求时换回 vendor/slug，见 LLM_MODELS 的 upstream。
+    "gpt-6-astra-op": ("op_gpt",),
+    "gpt-6.1-sol-op": ("op_gpt",),
+    "gpt-6.1-terra-op": ("op_gpt",),
+    "gpt-6-sol-op": ("op_gpt",),
+    "gpt-6-luna-op": ("op_gpt",),
+    "gemini-4-carbon-op": ("op_gemini",),
+    "gemini-4-argon-op": ("op_gemini",),
+    "gemini-4-hydrogen-op": ("op_gemini",),
+    "gemini-3.8-flash-op": ("op_gemini",),
+    "claude-fable-5-2-op": ("op_claude",),
+    "claude-opus-5-5-op": ("op_claude",),
+    "claude-sonnet-5-5-op": ("op_claude",),
+    "claude-haiku-5-5-op": ("op_claude",),
+    "grok-4.7-op": ("op_grok",),
+    "grok-4.6-op": ("op_grok",),
+    "grok-4.5-op": ("op_grok",),
 }
 
 
@@ -805,6 +925,28 @@ def llm_models_in_group(group: str) -> list[str]:
     """反查该密钥组承载的已登记模型（面板「组内模型」展示用）。"""
     return [name for name in LLM_MODELS
             if group in llm_route_groups_for_model(name)]
+
+
+# 显示名后缀：IK 标准名没有后缀，面板里与 CPA / OpenRouter 混在一起时分不清供应商。
+_DISPLAY_SUFFIX_BY_PROVIDER = {"ikuncode": "-ikun", "cpa": "-cpa"}
+# 已带这些后缀的名字本身就能区分供应商，原样显示（CPA 的 -high / -xhigh 是上游真实 ID）。
+_PROVIDER_MARKED_SUFFIXES = ("-cpa", "-high", "-xhigh", "-op", "-ikun")
+
+
+def llm_model_display_id(model: str) -> str:
+    """TG 展示用模型名：IK 标准名加 -ikun，CPA 独有且无后缀的（两款 Luna）加 -cpa。
+
+    只改显示，不改模型 ID：数据库已保存的选择、日志、.env 键名、回调数据和发给上游的
+    名字都不变。未登记的名字原样显示，避免给私有/已下线模型套上误导性的供应商后缀。
+    """
+    if model not in LLM_MODELS or model.endswith(_PROVIDER_MARKED_SUFFIXES):
+        return model
+    providers = {LLM_ROUTE_GROUPS[group]["provider"]
+                 for group in llm_route_groups_for_model(model)
+                 if group in LLM_ROUTE_GROUPS}
+    if len(providers) != 1:
+        return model
+    return model + _DISPLAY_SUFFIX_BY_PROVIDER.get(providers.pop(), "")
 
 
 # 已有 odds.db 会保留运行时模型值。以下版本化映射只在本次模型方案升级时执行一次：
@@ -933,6 +1075,23 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "deepseek-v4.1-flash": "specialized_fast",
     "gemini-3.8-flash": "specialized_fast",
     "gemini-3.8-flash-high": "specialized_fast",
+    # OpenRouter -op 别名沿用标准名的等级；Fable 归旗舰，Haiku 归快速。
+    "gpt-6-astra-op": "flagship",
+    "gpt-6.1-sol-op": "flagship",
+    "gpt-6-sol-op": "flagship",
+    "gemini-4-carbon-op": "flagship",
+    "gemini-4-argon-op": "flagship",
+    "gemini-4-hydrogen-op": "flagship",
+    "claude-fable-5-2-op": "flagship",
+    "claude-opus-5-5-op": "flagship",
+    "claude-sonnet-5-5-op": "flagship",
+    "grok-4.7-op": "flagship",
+    "grok-4.6-op": "flagship",
+    "gpt-6.1-terra-op": "specialized_fast",
+    "gpt-6-luna-op": "specialized_fast",
+    "gemini-3.8-flash-op": "specialized_fast",
+    "claude-haiku-5-5-op": "specialized_fast",
+    "grok-4.5-op": "specialized_fast",
 }
 
 FULL_CONSULT_TASKS: tuple[dict, ...] = (

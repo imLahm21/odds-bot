@@ -193,7 +193,8 @@ def stored_route(template: dict, pairs: list[dict]) -> dict:
 
 
 def model_identity(model: str) -> str:
-    """CPA -high / -cpa aliases do not constitute independent foundation-model audits."""
+    """CPA -high / -cpa and OpenRouter -op aliases do not constitute independent
+    foundation-model audits."""
     if model.endswith("-high") and config.llm_model_registered(model[:-5]):
         return model[:-5]
-    return config.llm_upstream_model(model)
+    return config.llm_base_model(model)

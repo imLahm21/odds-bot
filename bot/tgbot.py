@@ -3521,7 +3521,7 @@ def _llm_panel_text() -> str:
         indices = [i for i, ep in enumerate(eps)
                    if ep["route_group"] == group]
         enabled = sum(1 for i in indices if llm_client.is_enabled(i))
-        models = config.llm_models_in_group(group)
+        models = [config.llm_model_display_id(m) for m in config.llm_models_in_group(group)]
         mark = "✅" if indices else "❌"
         lines.append(
             f"· {mark} <code>{group}</code> {spec['label']}："
@@ -3541,7 +3541,7 @@ def _llm_panel_text() -> str:
         rate = f"{st['error_rate']:.0f}%（{st['fails']}/{st['total']}）" \
             if st["total"] else "无样本"
         group = ep["route_group"]
-        models = config.llm_models_in_group(group)
+        models = [config.llm_model_display_id(m) for m in config.llm_models_in_group(group)]
         lines.append(
             f"{i}. <b>{ep['label']}</b> {sw} · {badge}{extra}\n"
             f"   <code>{ep['base_url']}</code>\n"
@@ -3565,13 +3565,13 @@ def _llm_panel_text() -> str:
 
     for slot in llm_client.slot_snapshot():
         role = "访客" if slot["role"] == "visitor" else "管理员"
-        fb = slot["fallback"] or "未设"
+        fb = config.llm_model_display_id(slot["fallback"]) or "未设"
         p_mark = _slot_mark(slot["primary_ready"], slot["primary_retired"],
                             slot["primary"])
         f_mark = _slot_mark(slot["fallback_ready"], slot["fallback_retired"],
                             slot["fallback"])
         lines.append(f"· {slot['label']} · {role}\n"
-                     f"　主：{p_mark} <b>{slot['primary']}</b>\n"
+                     f"　主：{p_mark} <b>{config.llm_model_display_id(slot['primary'])}</b>\n"
                      f"　回退：{f_mark} <b>{fb}</b>")
 
     lines.append("\n<b>⚙️ 可调参数</b>（点按钮改，即时生效免重启）")
@@ -3635,8 +3635,10 @@ def _llm_panel_keyboard(expand_test: int | None = None) -> dict:
         for vis in (False, True):
             role = "访客" if vis else "管理"
             r = "v" if vis else "a"
-            primary = llm_client.get_tier_model(tier, visitor=vis)
-            fallback = llm_client.get_fallback_model(tier, visitor=vis) or "未设"
+            primary = config.llm_model_display_id(
+                llm_client.get_tier_model(tier, visitor=vis))
+            fallback = config.llm_model_display_id(
+                llm_client.get_fallback_model(tier, visitor=vis)) or "未设"
             rows.append([
                 {"text": f"🎚️{role}主 {primary}",
                  "callback_data": f"lms:{tier}:{r}:p"},
@@ -3777,9 +3779,11 @@ def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
         elif not model:
             answer_callback(cb_id, f"{label}·{role} 已清空回退")
         elif llm_client.configured_count_for_model(model):
-            answer_callback(cb_id, f"{label}·{role}·{what} → {model}")
+            answer_callback(cb_id, f"{label}·{role}·{what} → "
+                                   f"{config.llm_model_display_id(model)}")
         else:
-            answer_callback(cb_id, f"⚠️ 已设 {model}，但其密钥组未配置")
+            answer_callback(cb_id, f"⚠️ 已设 {config.llm_model_display_id(model)}，"
+                                   "但其密钥组未配置")
         _llm_refresh(chat_id, message_id)
         return
 
@@ -3801,7 +3805,8 @@ def _handle_llm_model_callback(cb_id: str, data: str, chat_id: int,
     ok = llm_client.set_tier_model(tier, model, visitor=visitor)
     role = "访客" if visitor else "管理员"
     label = config.LLM_TIER_MODELS[tier]["label"]
-    answer_callback(cb_id, f"{label}·{role} → {model}" if ok else "切换失败")
+    answer_callback(cb_id, f"{label}·{role} → {config.llm_model_display_id(model)}"
+                    if ok else "切换失败")
     _llm_refresh(chat_id, message_id)
 
 
@@ -3888,7 +3893,7 @@ def _llm_run_group_probe(chat_id: int, message_id: int, group: str,
         result = llm_client.probe_model(idx, model)
         result["label"] = endpoints[idx]["label"]
         results.append(result)
-    lines = [f"<b>🧪 密钥组测试：{group} · {model}</b>"]
+    lines = [f"<b>🧪 密钥组测试：{group} · {config.llm_model_display_id(model)}</b>"]
     lines += [_fmt_probe_line(result) for result in results]
     lines.append("")
     lines.append(_llm_panel_text())
@@ -4459,7 +4464,7 @@ def handle_callback(cb: dict) -> None:
             if model not in models:
                 answer_callback(cb_id, "模型候选已变化，请重新选择")
                 return
-            answer_callback(cb_id, f"正在测试 {model}…")
+            answer_callback(cb_id, f"正在测试 {config.llm_model_display_id(model)}…")
             _submit_bg(_llm_run_group_probe, chat_id, message_id, group, model)
             return
         if data.startswith("ltg:"):

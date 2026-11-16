@@ -26,7 +26,8 @@ def _index(raw, sequence):
 def _summary(pair):
     if not pair["model"]:
         return "— 未设"
-    return f"<code>{escape(pair['model'])}</code> / {escape(pair['effort'] or '模型默认')}"
+    return (f"<code>{escape(config.llm_model_display_id(pair['model']))}</code>"
+            f" / {escape(pair['effort'] or '模型默认')}")
 
 
 def _profile_panel(conn, code, notice=""):
@@ -76,7 +77,7 @@ def _effort_panel(code, index, slot, model_index):
             for i, effort in enumerate(efforts)]
     rows.append([_button("↩️ 返回职责", f"fmc:r:{code}:{index}")])
     text = (f"🧠 <b>{_SLOTS[slot]} · 推理强度</b>\n"
-            f"模型：<code>{escape(model)}</code>\n"
+            f"模型：<code>{escape(config.llm_model_display_id(model))}</code>\n"
             "点击强度后保存；只列本地注册表允许的参数，不代表上游已实测。")
     if model.endswith("-high"):
         text += "\nCPA 的 -high 是模型名的一部分，独立强度参数是否生效仍须实测。"
@@ -109,7 +110,8 @@ def _rescue_effort_panel(code, model_index, group_index):
             for index, effort in enumerate(efforts)]
     rows.append([_button("↩️ 返回公共兜底", f"fmc:g:{code}")])
     return _screen(f"🧠 <b>公共兜底 · 选择强度后保存</b>\n"
-                   f"模型：<code>{escape(model)}</code>\n授权组：<code>{escape(group)}</code>\n"
+                   f"模型：<code>{escape(config.llm_model_display_id(model))}</code>\n"
+                   f"授权组：<code>{escape(group)}</code>\n"
                    "仅列本地登记的参数，不保证上游接受或落实该强度。", rows)
 
 
@@ -119,7 +121,8 @@ def _rescue_groups(code, model_index):
     groups = config.llm_route_groups_for_model(model)
     if len(groups) == 1:
         return _rescue_effort_panel(code, model_index, 0)
-    return _screen(f"🔐 为 <code>{escape(model)}</code> 选择公共兜底的固定授权组：", [
+    shown = escape(config.llm_model_display_id(model))
+    return _screen(f"🔐 为 <code>{shown}</code> 选择公共兜底的固定授权组：", [
         [_button(config.LLM_ROUTE_GROUPS[group]["label"] + f" · {group}",
                  f"fmc:gg:{code}:{model_index}:{index}")] for index, group in enumerate(groups)
     ] + [[_button("↩️ 返回公共兜底", f"fmc:g:{code}")]])

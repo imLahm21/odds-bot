@@ -349,7 +349,7 @@ def chain_error(tier: str, visitor: bool = False) -> str:
             continue
         groups = config.llm_route_groups_for_model(model)
         why = ("缺密钥组 " + "/".join(groups)) if groups else "未登记密钥组"
-        parts.append(f"{model}（{why}）")
+        parts.append(f"{config.llm_model_display_id(model)}（{why}）")
     detail = "；".join(parts) or "未选定任何模型"
     return (f"LLM 请求失败（{label}·{role} 无可用模型：{detail}。"
             "请在 .env 的 LLM_ROUTE_ENDPOINTS 补该组密钥，或用 /llm 面板改选模型）")
@@ -380,7 +380,8 @@ def routing_issues() -> list[str]:
                 if not groups:
                     reason = f"模型 {model} 未登记密钥组"
                 elif not configured_count_for_model(model):
-                    reason = f"模型 {model} 缺密钥组：{'/'.join(groups)}"
+                    reason = (f"模型 {config.llm_model_display_id(model)} "
+                              f"缺密钥组：{'/'.join(groups)}")
                 elif not config.llm_model_registered(model):
                     # 不算硬故障（可能是网关私有模型），但要提示无法本地校验。
                     reason = (f"模型 {model} 不在 config.LLM_MODELS，"
@@ -397,7 +398,8 @@ def routing_issues() -> list[str]:
             primary = get_tier_model(tier, visitor)
             fallback = get_fallback_model(tier, visitor)
             if fallback and fallback == primary:
-                issues.append(f"{label}·{role}：回退模型与主模型同为 {primary}，"
+                issues.append(f"{label}·{role}：回退模型与主模型同为 "
+                              f"{config.llm_model_display_id(primary)}，"
                               "主组挂掉时回退也必然挂，等于没有回退——"
                               "请在 /llm 面板改选同档其它模型")
     leftovers = _legacy_env_present()

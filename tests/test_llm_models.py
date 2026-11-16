@@ -44,7 +44,22 @@ except ModuleNotFoundError:
     sys.modules["markdown"] = markdown_stub
 
 from bot import analyzer, config, db, llm_client, tgbot   # noqa: E402
+from bot import full_model_settings                         # noqa: E402
 from scripts import probe_llm_efforts                       # noqa: E402
+
+# OpenRouter 本地别名（-op），按授权组与追加顺序列出。
+_OP_GPT = ("gpt-6-astra-op", "gpt-6.1-sol-op", "gpt-6.1-terra-op",
+           "gpt-6-sol-op", "gpt-6-luna-op")
+_OP_GEMINI = ("gemini-4-carbon-op", "gemini-4-argon-op", "gemini-4-hydrogen-op",
+              "gemini-3.8-flash-op")
+_OP_CLAUDE = ("claude-fable-5-2-op", "claude-opus-5-5-op", "claude-sonnet-5-5-op",
+              "claude-haiku-5-5-op")
+_OP_GROK = ("grok-4.7-op", "grok-4.6-op", "grok-4.5-op")
+_OP_MODELS = _OP_GPT + _OP_GEMINI + _OP_CLAUDE + _OP_GROK
+_OP_LIGHT = frozenset({"gpt-6-luna-op", "claude-haiku-5-5-op"})
+_OP_HEAVY = frozenset(_OP_MODELS) - _OP_LIGHT - {"grok-4.5-op"}
+_OP_BALANCED = (frozenset(_OP_MODELS) - _OP_LIGHT
+                - {"gpt-6-astra-op", "claude-fable-5-2-op", "claude-opus-5-5-op"})
 
 
 PRIMARY = {
@@ -195,6 +210,10 @@ class TestModelProfile(unittest.TestCase):
                 "gemini-4-hydrogen-xhigh": ("cpa_gemini",),
                 "gemini-4-carbon": ("ik_gemini",),
                 "gemini-4-hydrogen": ("ik_gemini",),
+                **{model: ("op_gpt",) for model in _OP_GPT},
+                **{model: ("op_gemini",) for model in _OP_GEMINI},
+                **{model: ("op_claude",) for model in _OP_CLAUDE},
+                **{model: ("op_grok",) for model in _OP_GROK},
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -239,8 +258,9 @@ class TestModelProfile(unittest.TestCase):
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
             "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
+            *_OP_HEAVY,
         })
-        self.assertEqual(balanced, {"gpt-5.6-terra", "deepseek-v4.1-flash",
+        self.assertEqual(balanced, {*_OP_BALANCED, "gpt-5.6-terra", "deepseek-v4.1-flash",
                                     "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
                                     "glm-5.3-flash", "grok-4.5",
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
@@ -249,10 +269,11 @@ class TestModelProfile(unittest.TestCase):
                                     "gemini-3.8-flash-high", "gemini-4-argon-high",
                                     "gemini-4-hydrogen-xhigh", "gemini-4-carbon",
                                     "gemini-4-hydrogen"})
-        self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna"})
+        self.assertEqual(light, {"gpt-5.6-luna", "gpt-6-luna",
+                                 "gpt-6-luna-op", "claude-haiku-5-5-op"})
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
-                         {"gpt-5.6-terra", "deepseek-v4.1-flash",
+                         {*(_OP_HEAVY & _OP_BALANCED), "gpt-5.6-terra", "deepseek-v4.1-flash",
                           "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
@@ -270,15 +291,18 @@ class TestModelProfile(unittest.TestCase):
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
             "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
         )
-        self.assertEqual(tuple(config.LLM_MODELS)[-10:], new_models)
+        appended = new_models + _OP_MODELS
+        self.assertEqual(tuple(config.LLM_MODELS)[-len(appended):], appended)
         for tier, expected in (
-            ("heavy", new_models),
-            ("balanced", new_models[1:4] + new_models[5:]),
+            ("heavy", new_models + tuple(m for m in _OP_MODELS if m in _OP_HEAVY)),
+            ("balanced", new_models[1:4] + new_models[5:]
+             + tuple(m for m in _OP_MODELS if m in _OP_BALANCED)),
         ):
             self.assertEqual(tuple(config.llm_tier_eligible_models(tier))[-len(expected):],
                              expected)
         self.assertEqual(config.llm_tier_eligible_models("light"),
-                         ["gpt-5.6-luna", "gpt-6-luna"])
+                         ["gpt-5.6-luna", "gpt-6-luna",
+                          "gpt-6-luna-op", "claude-haiku-5-5-op"])
 
     def test_effort_labels_and_per_model_capabilities(self):
         self.assertEqual(config.LLM_EFFORT_LABELS, {
@@ -701,6 +725,95 @@ class TestModelProfile(unittest.TestCase):
         self.assertFalse(config.llm_model_registered("xhgj-v1-flash"))
         self.assertFalse(config.llm_model_registered("xhgj-v1-pro"))
 
+    def test_openrouter_routes_send_vendor_slug_and_max_tokens(self):
+        expected = {"op_gpt": _OP_GPT, "op_gemini": _OP_GEMINI,
+                    "op_claude": _OP_CLAUDE, "op_grok": _OP_GROK}
+        vendors = {"op_gpt": "openai/", "op_gemini": "google/",
+                   "op_claude": "anthropic/", "op_grok": "x-ai/"}
+        endpoints = llm_client._parse_route_endpoints(
+            ",".join(f"{group}|test-key-{group}|https://openrouter.ai/api/v1|{group}"
+                     for group in expected))
+        self.assertEqual([ep["route_group"] for ep in endpoints], list(expected))
+        with (
+            patch.object(llm_client, "_ENDPOINTS", endpoints),
+            patch.object(llm_client, "_breakers", [_FakeBreaker() for _ in endpoints]),
+            patch.object(llm_client, "_rr_counters", {}),
+            patch.object(llm_client, "_get_disabled", return_value=set()),
+        ):
+            for group, models in expected.items():
+                self.assertEqual(config.LLM_ROUTE_GROUPS[group]["provider"], "openrouter")
+                self.assertEqual(tuple(config.llm_models_in_group(group)), models)
+                for model in models:
+                    with self.subTest(model=model):
+                        routed = llm_client._endpoints_by_priority(model)
+                        self.assertEqual([ep["route_group"] for _, ep in routed], [group])
+                        payload = llm_client._payload(
+                            model, "system", "user", 1024, "high", True, group)
+                        self.assertTrue(payload["model"].startswith(vendors[group]))
+                        self.assertFalse(payload["model"].endswith("-op"))
+                        self.assertEqual(payload["model"], config.llm_upstream_model(model))
+                        self.assertEqual(payload["max_tokens"], 1024)
+                        self.assertNotIn("max_completion_tokens", payload)
+                        self.assertEqual(payload["reasoning_effort"], "high")
+            # 标准名仍只走 IK，不会因为配了 OpenRouter 而被路由过去
+            for model in ("gpt-6.1-sol", "claude-opus-5-5", "gemini-4-argon", "grok-4.7"):
+                self.assertEqual(llm_client.configured_count_for_model(model), 0)
+        self.assertEqual(config.llm_upstream_model("claude-opus-5-5-op"),
+                         "anthropic/claude-opus-5.5")
+        self.assertEqual(config.llm_upstream_model("gpt-6.1-sol-op"), "openai/gpt-6.1-sol")
+
+    def test_openrouter_efforts_follow_openrouter_model_metadata(self):
+        expected = {
+            "gpt-6-astra-op": ("low", "medium", "high", "xhigh", "max"),
+            "gpt-6.1-sol-op": ("low", "medium", "high", "xhigh", "max"),
+            "gpt-6.1-terra-op": ("none", "low", "medium", "high", "xhigh", "max"),
+            "gpt-6-sol-op": ("none", "low", "medium", "high", "xhigh", "max"),
+            "gpt-6-luna-op": ("none", "low", "medium", "high", "xhigh", "max"),
+            "gemini-4-carbon-op": ("low", "medium", "high"),
+            "gemini-4-argon-op": ("low", "medium", "high"),
+            "gemini-4-hydrogen-op": ("low", "medium", "high", "xhigh"),
+            "gemini-3.8-flash-op": ("low", "medium", "high"),
+            "claude-fable-5-2-op": ("low", "medium", "high", "xhigh", "max"),
+            "claude-opus-5-5-op": ("low", "medium", "high", "xhigh", "max"),
+            "claude-sonnet-5-5-op": ("low", "medium", "high", "xhigh", "max"),
+            "claude-haiku-5-5-op": ("none", "low", "medium", "high", "xhigh", "max"),
+            "grok-4.7-op": ("low", "medium", "high", "xhigh"),
+            "grok-4.6-op": ("low", "medium", "high", "xhigh"),
+            "grok-4.5-op": ("low", "medium", "high"),
+        }
+        self.assertEqual(set(expected), set(_OP_MODELS))
+        for model, efforts in expected.items():
+            with self.subTest(model=model):
+                self.assertEqual(config.llm_model_efforts(model), efforts)
+                self.assertFalse(config.llm_model_supports_effort(model, "ultra"))
+
+    def test_openrouter_aliases_inherit_base_budgets_and_identity(self):
+        budgets = {"gpt-6.1-sol": 128000, "claude-opus-5-5": 96000,
+                   "grok-4.7-op": 50000}
+        warnings = {"gpt-6.1-sol": 700000, "claude-opus-5-5": 500000}
+        with (
+            patch.object(config, "LLM_MAX_TOKENS", 32000),
+            patch.object(config, "LLM_INPUT_WARN_TOKENS", 240000),
+            patch.object(config, "LLM_MODEL_MAX_TOKENS", budgets),
+            patch.object(config, "LLM_MODEL_INPUT_WARN_TOKENS", warnings),
+        ):
+            self.assertEqual(config.llm_max_tokens_for_model("gpt-6.1-sol-op"), 128000)
+            self.assertEqual(config.llm_max_tokens_for_model("claude-opus-5-5-op"), 96000)
+            self.assertEqual(config.llm_input_warn_tokens_for_model("gpt-6.1-sol-op"), 700000)
+            self.assertEqual(
+                config.llm_input_warn_tokens_for_model("claude-opus-5-5-op"), 500000)
+            # 别名单列时优先；基础模型未单列时回落全局默认
+            self.assertEqual(config.llm_max_tokens_for_model("grok-4.7-op"), 50000)
+            self.assertEqual(config.llm_max_tokens_for_model("claude-fable-5-2-op"), 32000)
+            self.assertEqual(
+                config.llm_input_warn_tokens_for_model("claude-fable-5-2-op"), 240000)
+        for alias, base in (("gpt-6.1-sol-op", "gpt-6.1-sol"),
+                            ("claude-opus-5-5-op", "claude-opus-5-5"),
+                            ("gpt-6.1-sol-cpa", "gpt-6.1-sol")):
+            with self.subTest(alias=alias):
+                self.assertEqual(config.llm_base_model(alias), base)
+                self.assertEqual(full_model_settings.model_identity(alias), base)
+
     def test_ik_and_cpa_probes_keep_exact_model_ids_and_do_not_cross_groups(self):
         groups = ("ik_claude", "cpa_claude", "ik_gemini", "cpa_gemini")
         endpoints = [self._group_endpoint(group, group) for group in groups]
@@ -938,6 +1051,40 @@ class TestModelProfile(unittest.TestCase):
         self.assertTrue(all(f"ltg:{group}" in callbacks for group in groups))
         self.assertTrue(any(cb.startswith("lms:") for cb in callbacks))
         self.assertNotIn("lt:all:heavy", callbacks)
+        # 槽位按钮与面板文字带供应商后缀；回调仍只用档位/序号，不含显示名
+        texts = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("🎚️访客主 deepseek-v4-pro-ikun", texts)
+        self.assertIn("🎚️管理主 gpt-6-luna-cpa", texts)
+        self.assertIn("🛟管理退 grok-4.6-ikun", texts)
+        self.assertIn("模型：deepseek-v4-pro-ikun, deepseek-v4.1-flash-ikun", panel)
+        self.assertIn("gpt-5.6-luna-cpa, gpt-6-luna-cpa, gpt-6-astra-cpa", panel)
+        self.assertFalse(any("-ikun" in cb for cb in callbacks))
+
+    def test_display_ids_mark_provider_without_changing_model_ids(self):
+        self.assertEqual(config.llm_model_display_id("gemini-3.8-flash"),
+                         "gemini-3.8-flash-ikun")
+        self.assertEqual(config.llm_model_display_id("deepseek-v4-pro"),
+                         "deepseek-v4-pro-ikun")
+        self.assertEqual(config.llm_model_display_id("gpt-6-luna"), "gpt-6-luna-cpa")
+        self.assertEqual(config.llm_model_display_id("gpt-5.6-luna"), "gpt-5.6-luna-cpa")
+        for model in ("gpt-6-astra-cpa", "claude-opus-5-5-high",
+                      "gemini-4-hydrogen-xhigh", "gpt-6.1-sol-op", "claude-opus-5-5-op"):
+            self.assertEqual(config.llm_model_display_id(model), model)
+        # 未登记 / 空值原样显示，不套供应商后缀
+        for model in ("gpt-5.5", "custom-private-model", ""):
+            self.assertEqual(config.llm_model_display_id(model), model)
+        markers = {"ikuncode": ("-ikun",), "cpa": ("-cpa", "-high", "-xhigh"),
+                   "openrouter": ("-op",)}
+        shown = set()
+        for model in config.LLM_MODELS:
+            with self.subTest(model=model):
+                provider = config.LLM_ROUTE_GROUPS[
+                    config.llm_route_groups_for_model(model)[0]]["provider"]
+                display = config.llm_model_display_id(model)
+                self.assertTrue(display.startswith(model))
+                self.assertTrue(display.endswith(markers[provider]))
+                shown.add(display)
+        self.assertEqual(len(shown), len(config.LLM_MODELS))
 
     def test_group_probe_tests_only_selected_model_on_each_group_endpoint(self):
         endpoints = [
@@ -970,7 +1117,8 @@ class TestModelProfile(unittest.TestCase):
         edit.assert_called_once()
 
     def test_group_probe_keyboard_requires_one_model_choice(self):
-        for group in ("ik_gpt", "ik_claude", "ik_gemini", "cpa_claude", "cpa_gemini"):
+        for group in ("ik_gpt", "ik_claude", "ik_gemini", "cpa_claude", "cpa_gemini",
+                      "op_gpt", "op_gemini", "op_claude", "op_grok"):
             with self.subTest(group=group):
                 keyboard = tgbot._llm_group_probe_keyboard(group)
                 callbacks = [button["callback_data"]
@@ -978,7 +1126,9 @@ class TestModelProfile(unittest.TestCase):
                 prefix = f"ltgm:{group}:"
                 choices = {cb[len(prefix):] for cb in callbacks if cb.startswith(prefix)}
                 self.assertEqual(choices, set(config.llm_models_in_group(group)))
-                if group in {"cpa_claude", "cpa_gemini"}:
+                if group.startswith("op_"):
+                    self.assertTrue(all(choice.endswith("-op") for choice in choices))
+                elif group in {"cpa_claude", "cpa_gemini"}:
                     self.assertTrue(all(choice.endswith(("-high", "-xhigh"))
                                         for choice in choices))
                 elif group in {"ik_claude", "ik_gemini"}:
@@ -989,7 +1139,7 @@ class TestModelProfile(unittest.TestCase):
 
     def test_model_labels_carry_provider_prefix(self):
         """TG 按钮靠标签前缀区分供应商：IK 组模型以「IK · 」开头，CPA 组以「CPA · 」开头。"""
-        prefixes = {"ikuncode": "IK · ", "cpa": "CPA · "}
+        prefixes = {"ikuncode": "IK · ", "cpa": "CPA · ", "openrouter": "OP · "}
         for model in config.LLM_MODELS:
             with self.subTest(model=model):
                 groups = config.llm_route_groups_for_model(model)

@@ -180,6 +180,9 @@ LLM_ROUTE_ENDPOINTS=ik_gpt|<IK_GPT_KEY>|https://api.ikuncode.cc/v1|IK-GPT,ik_gro
 # Claude/Gemini standard IDs route only to IK. CPA uses these four separate IDs:
 # claude-opus-5-5-high (heavy), claude-sonnet-5-5-high (heavy/balanced),
 # gemini-4-argon-high and gemini-3.8-flash-high (heavy/balanced).
+# OpenRouter groups op_gpt/op_gemini/op_claude/op_grok use https://openrouter.ai/api/v1 and one
+# separate key each. Their models are "<standard name>-op" aliases (e.g. gpt-6.1-sol-op) that are
+# sent upstream as OpenRouter IDs (openai/gpt-6.1-sol) and inherit the standard name's token limits.
 # Selected IDs are sent unchanged; reasoning_effort remains a separate field.
 # CPA variants inherit local effort options; endpoint support still needs live probing.
 # Existing selections are preserved. Select the CPA variants in /llm to use CPA.
