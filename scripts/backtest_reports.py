@@ -8,6 +8,8 @@
     python -m scripts.backtest_reports results            # 按日期补比分（调 API-Football）
     python -m scripts.backtest_reports stats              # 方向命中率统计表（Markdown）
     python -m scripts.backtest_reports roi                # 按候选表赔率算 ROI（Markdown）
+    python -m scripts.backtest_reports lean               # 影子倾向置信度：定线期分布 / H-CONF01 检验
+    python -m scripts.backtest_reports lean --threshold 65 --since 2026-12-01
 
 只读 report/，不改任何报告；中间产物与结果写到 --out 目录（默认 scripts/output/backtest）。
 `results` 每个比赛日 1 次请求（/fixtures?date=），响应落盘缓存，重跑不重复消耗额度。
@@ -218,6 +220,48 @@ def _layer(text: str, key: str) -> str | None:
     return None
 
 
+# ─── decision_final 注释（影子倾向只从这里读，不解析正文）──────────────────────
+# 与 bot/typesafe_decisions.py 的 _DECISION_FINAL_RE 同口径；脚本保持不依赖 bot 包。
+_DECISION_FINAL_RE = re.compile(
+    r"(?m)^[ \t]*<!--[ \t]*decision_final[ \t]+(\{.*\})[ \t]*-->")
+_LEAN_ID_RE = re.compile(r"C\d{2,}")
+
+
+def decision_final(text: str) -> dict | None:
+    """报告里最后一条 decision_final 注释 → dict；没有或不合法返回 None。"""
+    matches = list(_DECISION_FINAL_RE.finditer(text or ""))
+    if not matches:
+        return None
+    try:
+        data = json.loads(matches[-1].group(1))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) and data.get("schema") == "decision_final/1" else None
+
+
+def _lean_from_final(final: dict | None) -> dict | None:
+    """decision_final.lean → {id, play, odds, conf}；字段缺失或越界返回 None。"""
+    lean = (final or {}).get("lean")
+    if not isinstance(lean, dict):
+        return None
+    cid, play, odds, conf = lean.get("id"), lean.get("play"), lean.get("odds"), lean.get("conf")
+    if (not isinstance(cid, str) or not _LEAN_ID_RE.fullmatch(cid)
+            or not isinstance(play, str) or not play.strip()
+            or isinstance(odds, bool) or not isinstance(odds, (int, float)) or not odds > 1.0
+            or isinstance(conf, bool) or not isinstance(conf, int) or not 50 <= conf <= 100):
+        return None
+    return {"id": cid, "play": play.strip(), "odds": float(odds), "conf": conf}
+
+
+def _lean_line_kind(plain7: str) -> str | None:
+    """仅作诊断计数：第 7 节有没有写影子倾向行（None 无 / "none" 写「无」 / "pick" 选了边）。
+    样本数据一律取 decision_final，不从这里取。"""
+    m = re.search(r"(?m)^\s*[-*]?\s*影子倾向\s*[：:]\s*(.*)$", plain7)
+    if not m:
+        return None
+    return "none" if re.match(r"^[\[【「(（]*无", m.group(1).strip()) else "pick"
+
+
 def extract_one(path: str, text: str) -> dict | None:
     head = re.search(r"(?m)^##\s*比赛\s*[：:]\s*(.+?)\s+vs\.?\s+(.+?)\s*$", text)
     stem = Path(path).name.replace("_report.md", "")
@@ -263,6 +307,14 @@ def extract_one(path: str, text: str) -> dict | None:
         "no_lean": {k: "无倾向" in (_field(plain7, label) or "")
                     for k, label in (("ah", "亚盘判定"), ("x12", "胜平负判定"), ("ou", "大小球判定"))},
     }
+    # 影子倾向（docs/置信度影子倾向计划.md）：只读 decision_final
+    final = decision_final(text)
+    lean = _lean_from_final(final)
+    row["has_final"] = final is not None
+    row["lean"] = lean
+    row["writer_model"] = str((final or {}).get("writer_model") or "")
+    row["lean_cls"] = classify_play(lean["play"], home, away) if lean else None
+    row["lean_line"] = _lean_line_kind(plain7)
     if row["rule"] is None and row["hypotheses"]:
         m = next((h["code"] for h in row["hypotheses"] if h["code"].startswith("H-M")), None)
         row["rule"] = int(m[3:]) if m and m[3:].isdigit() else None
@@ -300,10 +352,23 @@ def _first_num(cell: str) -> float | None:
     return float(m.group(0)) if m else None
 
 
+_CODE_AH_RE = re.compile(rf"^让球\s+(.+?)\s+({_NUM})$")
+
+
 def classify_play(play: str, home: str, away: str) -> dict | None:
     """候选表「玩法」文本 → {market, side, line}；认不出返回 None。"""
     t = _plain(play)
     t = re.sub(r"[(（][^)）]*[)）]", "", t).strip()
+    # 代码候选表的让球行「让球 <队名> <线>」（bot/candidates.py）：队名与主/客队精确匹配时直接取，
+    # 避免队名里的数字（Schalke 04）或两队共享词（Manchester）干扰下面的通用解析
+    m_code = _CODE_AH_RE.match(t)
+    if m_code:
+        team = _norm_team(m_code.group(1))
+        side = ("home" if team and team == _norm_team(home) else
+                "away" if team and team == _norm_team(away) else None)
+        val = float(m_code.group(2))
+        if side and abs(val) <= 5 and not (abs(val) * 4) % 1:
+            return {"market": "ah", "side": side, "line": val}
     t = re.sub(r"胜平负|主线|次线|相邻线?|全场|大小球", " ", t)
     if re.search(r"双进|BTTS|两队都进", t, re.I):
         if re.search(r"no(?![a-z])|否", t, re.I):
@@ -439,8 +504,10 @@ def cmd_extract(args) -> None:
         texts = {f.replace("\\", "/"): open(f, encoding="utf-8", errors="replace").read()
                  for f in glob.glob(os.path.join(args.reports, "**", "*.md"), recursive=True)}
     rows = []
+    skipped = 0          # 复盘（_review.md）、只盲推（_review_blind.md）等非赛前报告
     for path, text in sorted(texts.items()):
         if not path.endswith("_report.md"):
+            skipped += 1
             continue
         row = extract_one(path, text)
         if row:
@@ -459,6 +526,9 @@ def cmd_extract(args) -> None:
     print("  大小球", sum("side" in r["ou"] for r in rows))
     print("  定性", sum(bool(r["qualitative"]) for r in rows),
           "军规", sum(r["rule"] is not None for r in rows))
+    print(f"影子倾向 {sum(r['lean'] is not None for r in rows)} 份"
+          f"（其中玩法可解析 {sum(_lean_ah(r) is not None for r in rows)} 份）")
+    print(f"  已按文件名排除非赛前报告（复盘 / 盲推等，非 _report.md）{skipped} 份")
 
 
 # ─── 赛果 ────────────────────────────────────────────────────────────────────
@@ -535,7 +605,7 @@ def _match_result(row: dict, cache: Path) -> dict | None:
     f = cache / f"{row['kickoff_date']}.json"
     if not f.exists():
         return None
-    fixtures = json.load(open(f, encoding="utf-8"))
+    fixtures = json.loads(f.read_text(encoding="utf-8"))
     h, a = _norm_team(row["home"]), _norm_team(row["away"])
     best, best_score = None, 0.0
     for x in fixtures:
@@ -976,17 +1046,252 @@ def cmd_roi(args) -> None:
     print("\n".join(md))
 
 
+# ─── 影子倾向：定线期分布 / H-CONF01 预登记检验（docs/置信度影子倾向计划.md 2.4）──
+# 检验口径预先写死，不看结果调参：定线期只看置信度分布给建议线；检验期只检验 H-CONF01。
+LEAN_CALIBRATION_N = 60          # 定线期：前 60 场已结算样本
+LEAN_TARGET_SHARE = 0.30         # 建议线 T：使约 30% 样本落在 T 及以上
+LEAN_T_FLOOR = 60                # T 取 5 的倍数，下限 60
+LEAN_PASS_N = 100                # 达标：≥T 组至少 100 场
+LEAN_REJECT_N = 60               # 否决：≥T 组至少 60 场
+LEAN_BUCKETS = ((50, 55, "50–54"), (55, 60, "55–59"), (60, 65, "60–64"),
+                (65, 70, "65–69"), (70, 75, "70–74"), (75, 101, "75+"))
+
+
+def _lean_ah(row: dict) -> dict | None:
+    """有影子倾向且玩法解析为亚盘的 {market, side, line}；否则 None。"""
+    cls = row.get("lean_cls")
+    return cls if row.get("lean") and cls and cls.get("market") == "ah" else None
+
+
+def lean_bucket(conf: int) -> str:
+    for lo, hi, name in LEAN_BUCKETS:
+        if lo <= conf < hi:
+            return name
+    return "—"
+
+
+def lean_samples(rows: list[dict], cache: Path) -> tuple[list[dict], dict]:
+    """赛前报告 → 已结算的影子倾向样本（按开球日期排序）。
+    同一场同一模型出现多份（管理员 + 访客）只算一份，优先管理员报告。"""
+    picked: dict[tuple, dict] = {}
+    dup = 0
+    for r in rows:
+        if _lean_ah(r) is None:
+            continue
+        key = (r["kickoff_date"], _norm_team(r["home"]), _norm_team(r["away"]),
+               r.get("writer_model") or "")
+        prev = picked.get(key)
+        if prev is None:
+            picked[key] = r
+            continue
+        dup += 1
+        if "/visitors/" in prev["path"] and "/visitors/" not in r["path"]:
+            picked[key] = r
+    samples, unmatched = [], 0
+    for r in picked.values():
+        res = _match_result(r, cache)
+        if not res:
+            unmatched += 1
+            continue
+        samples.append({
+            "date": r["kickoff_date"], "path": r["path"],
+            "model": r.get("writer_model") or "（未记录）",
+            "conf": r["lean"]["conf"], "odds": r["lean"]["odds"],
+            "result": settle_cls(_lean_ah(r), res["gh"], res["ga"]),
+        })
+    samples.sort(key=lambda s: (s["date"], s["path"]))
+    return samples, {"dup": dup, "unmatched": unmatched}
+
+
+def lean_summary(samples: list[dict]) -> dict:
+    """场数、命中/未中/走盘、方向命中率 ±95%、ROI。
+    盈亏按倾向一侧的赔率：全赢 +(O−1)、半赢 +0.5(O−1)、走盘 0、半输 −0.5、全输 −1（Roi/pnl）。"""
+    acc = Roi()
+    for s in samples:
+        acc.add(s["result"], s["odds"])
+    d = acc.win + acc.lose
+    hit = acc.win / d if d else None
+    return {"n": acc.n, "win": acc.win, "lose": acc.lose, "push": acc.push,
+            "hit": hit, "ci": _ci(hit, d) if hit is not None else None,
+            "profit": acc.profit, "roi": acc.profit / acc.n if acc.n else None}
+
+
+def suggest_threshold(confs: list[int]) -> int:
+    """建议检验线：T ∈ {60, 65, …, 100} 中「≥T 占比」最接近 30% 的那个（并列取较小）。"""
+    best: tuple[tuple[float, int], int] | None = None
+    for t in range(LEAN_T_FLOOR, 101, 5):
+        share = sum(c >= t for c in confs) / len(confs) if confs else 0.0
+        key = (abs(share - LEAN_TARGET_SHARE), t)
+        if best is None or key < best[0]:
+            best = (key, t)
+    return best[1]
+
+
+def hconf01_verdict(ge: list[dict]) -> tuple[str, list[str], dict]:
+    """按第 2.4 节的表判 ≥T 组：达标 / 否决 / 继续观察，并给出未满足的条件。ge 须按开球日期排序。"""
+    s = lean_summary(ge)
+    n = s["n"]
+    first, second = ge[: n // 2], ge[n // 2:]
+    roi1, roi2 = lean_summary(first)["roi"], lean_summary(second)["roi"]
+    roi_drop = None
+    if n >= 2:
+        top = max(range(n), key=lambda i: pnl(ge[i]["result"], ge[i]["odds"]))
+        roi_drop = lean_summary(ge[:top] + ge[top + 1:])["roi"]
+    upper = s["hit"] + s["ci"] if s["hit"] is not None else None
+    pass_checks = [
+        (f"≥T 组 ≥{LEAN_PASS_N} 场", n >= LEAN_PASS_N),
+        ("ROI > 0", s["roi"] is not None and s["roi"] > 0),
+        ("前后两半 ROI 同号", roi1 is not None and roi2 is not None and roi1 * roi2 > 0),
+        ("去掉盈利最大一笔后 ROI > 0", roi_drop is not None and roi_drop > 0),
+    ]
+    reject_checks = [
+        (f"≥T 组 ≥{LEAN_REJECT_N} 场", n >= LEAN_REJECT_N),
+        ("方向命中率 95% 区间上限 < 50%", upper is not None and upper < 0.5),
+    ]
+    passed = all(ok for _, ok in pass_checks)
+    rejected = all(ok for _, ok in reject_checks)
+    detail = {"summary": s, "roi_first": roi1, "roi_second": roi2,
+              "roi_drop_best": roi_drop, "hit_upper": upper}
+    if passed and not rejected:
+        return "达标", [], detail
+    if rejected and not passed:
+        return "否决", [], detail
+    unmet = ([f"达标·{name}" for name, ok in pass_checks if not ok]
+             + [f"否决·{name}" for name, ok in reject_checks if not ok])
+    if passed and rejected:
+        unmet = ["达标与否决条件同时满足，需人工判断"]
+    return "继续观察", unmet, detail
+
+
+def _pct(x: float | None, signed: bool = False) -> str:
+    if x is None:
+        return "—"
+    return f"{x:+.1%}" if signed else f"{x:.1%}"
+
+
+def _lean_group_table(groups: list[tuple[str, list[dict]]], head: str) -> list[str]:
+    out = [f"| {head} | 场数 | 方向命中率 | ±95% | ROI |",
+           "|------|------|-----------|------|-----|"]
+    for name, items in groups:
+        s = lean_summary(items)
+        out.append(f"| {name} | {s['n']} | {_pct(s['hit'])} | "
+                   f"{'±' + _pct(s['ci']) if s['ci'] is not None else '—'} | "
+                   f"{_pct(s['roi'], signed=True)} |")
+    return out + [""]
+
+
+def build_lean_md(rows: list[dict], cache: Path, threshold: int = 0,
+                  since: str = "") -> list[str]:
+    """lean.md 正文。threshold=0（定线期）时只看置信度分布，全文不出现命中率与收益数字。"""
+    from statistics import mean, median
+    leans = [r for r in rows if r.get("lean")]
+    samples, info = lean_samples(rows, cache)
+    md = ["# 影子倾向置信度（H-CONF01 预登记检验）", "",
+          "- 口径见 docs/置信度影子倾向计划.md 第 2.4 节与 reference_staking_kelly.md 7.4；"
+          "数据只取报告第 8 节 decision_final 的 lean 键",
+          f"- 模式：{'检验期（T = %d%s）' % (threshold, '，起算 ' + since if since else '') if threshold > 0 else '定线期（--threshold 0）'}",
+          "", "## 1. 样本概况", "",
+          f"- 赛前报告 {len(rows)} 份；含 decision_final {sum(bool(r.get('has_final')) for r in rows)} 份",
+          f"- 有影子倾向 {len(leans)} 份（玩法可解析 {sum(_lean_ah(r) is not None for r in rows)} 份）；"
+          f"配到完场比分 {len(samples)} 场；未配到比分 {info['unmatched']} 场；"
+          f"同场同模型重复报告去重 {info['dup']} 份",
+          f"- 写了影子倾向行但未入库：写「无」{sum(r.get('lean_line') == 'none' for r in rows)} 份；"
+          f"选了边却无 lean（不合法 / 非 active 定稿）"
+          f"{sum(r.get('lean_line') == 'pick' and not r.get('lean') for r in rows)} 份",
+          f"- 新格式报告（decision_final 含 writer_model）缺影子倾向行 "
+          f"{sum(bool(r.get('writer_model')) and r.get('lean_line') is None for r in rows)} 份", ""]
+    if not leans:
+        md += ["暂无样本：现有报告的 decision_final 里都没有 lean 键"
+               "（影子倾向上线前的旧报告，或 TYPESAFE_DECISION_MODE 不是 active）。", ""]
+        return md
+
+    by_model: dict[str, list[int]] = defaultdict(list)
+    for r in leans:
+        by_model[r.get("writer_model") or "（未记录）"].append(r["lean"]["conf"])
+    md += ["## 2. 按模型", "", "| 模型 | 份数 | 置信度均值 | 中位数 |",
+           "|------|------|-----------|--------|"]
+    for model, confs in sorted(by_model.items(), key=lambda kv: -len(kv[1])):
+        md.append(f"| {model} | {len(confs)} | {mean(confs):.1f} | {median(confs):g} |")
+    md += ["", "## 3. 置信度分布（全部有影子倾向的报告）", "", "| 置信度 | 份数 | 占比 |",
+           "|--------|------|------|"]
+    for _lo, _hi, name in LEAN_BUCKETS:
+        k = sum(lean_bucket(r["lean"]["conf"]) == name for r in leans)
+        md.append(f"| {name} | {k} | {k / len(leans):.1%} |")
+    md.append("")
+
+    if threshold <= 0:
+        md += ["## 4. 建议检验线（定线期）", "",
+               f"- 定线期样本 = 按开球日期排序的前 {LEAN_CALIBRATION_N} 场已结算样本；只看置信度分布"]
+        groups = [("全部模型", samples)]
+        if len(by_model) > 1:
+            groups += [(m, [s for s in samples if s["model"] == m]) for m in sorted(by_model)]
+            md.append("- ⚠️ 模型不止一个：不同模型的打分尺度不同，需分别定线、分别检验")
+        for name, items in groups:
+            if len(items) < LEAN_CALIBRATION_N:
+                md.append(f"- {name}：定线期：还差 {LEAN_CALIBRATION_N - len(items)} 场"
+                          f"（已结算 {len(items)} / {LEAN_CALIBRATION_N}）")
+                continue
+            head = items[:LEAN_CALIBRATION_N]
+            t = suggest_threshold([s["conf"] for s in head])
+            share = sum(s["conf"] >= t for s in head) / len(head)
+            md.append(f"- {name}：建议检验线 T = {t}（前 {LEAN_CALIBRATION_N} 场中 ≥T 占 {share:.0%}）；"
+                      f"定线期最后一场开球日期 {head[-1]['date']}，检验期起算日期建议取其后一天")
+        md += ["- 需人工确认 T 与起算日期后写入 reference_staking_kelly.md 7.4，之后不改", ""]
+        return md
+
+    tested = [s for s in samples if not since or s["date"] >= since]
+    ge = [s for s in tested if s["conf"] >= threshold]
+    lt = [s for s in tested if s["conf"] < threshold]
+    md += ["## 5. 描述性分桶表（仅作描述，不据此调整检验线）", "",
+           f"- 样本：{'起算日期 ' + since + ' 之后的' if since else '全部'}已结算样本 {len(tested)} 场", ""]
+    md += _lean_group_table(
+        [(name, [s for s in tested if lean_bucket(s["conf"]) == name])
+         for _lo, _hi, name in LEAN_BUCKETS], "置信度")
+    verdict, unmet, detail = hconf01_verdict(ge)
+    md += [f"## 6. H-CONF01 检验：置信度 ≥ {threshold} 时按首要分析庄赔率下注亚盘主线该侧，ROI > 0", ""]
+    md += _lean_group_table([(f"≥{threshold}", ge), (f"<{threshold}", lt)], "分组")
+    md += [f"- ≥T 组前半 ROI {_pct(detail['roi_first'], True)}、后半 ROI {_pct(detail['roi_second'], True)}"
+           "（按开球日期排序对半分）",
+           f"- 去掉盈利最大一笔后 ROI {_pct(detail['roi_drop_best'], True)}",
+           f"- 方向命中率 95% 区间上限 {_pct(detail['hit_upper'])}"]
+    models = defaultdict(int)
+    for s in ge:
+        models[s["model"]] += 1
+    md.append("- 各模型 ≥T 场数：" + ("；".join(f"{m} {k}" for m, k in sorted(models.items()))
+                                     if models else "无"))
+    if len({s["model"] for s in tested}) > 1:
+        md.append("- ⚠️ 不同模型需分别检验：上表混合了多个模型的样本，结论只作参考")
+    md += ["", f"**结论：{verdict}**" + (f"（未满足：{'；'.join(unmet)}）" if unmet else ""), ""]
+    return md
+
+
+def cmd_lean(args) -> None:
+    out = Path(args.out)
+    since = args.since.strip()
+    if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+        raise SystemExit("--since 须为 YYYY-MM-DD")
+    f = out / "features.json"
+    rows = json.load(open(f, encoding="utf-8")) if f.exists() else []
+    md = build_lean_md(rows, out / "fixtures_by_date", args.threshold, since)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "lean.md").write_text("\n".join(md), encoding="utf-8")
+    print("\n".join(md))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["extract", "results", "stats", "roi"])
+    ap.add_argument("cmd", choices=["extract", "results", "stats", "roi", "lean"])
     ap.add_argument("--reports", default="report")
     ap.add_argument("--reports-json", default="", help="可选：{路径: 正文} 的 JSON 缓存，省去逐个读盘")
     ap.add_argument("--out", default="scripts/output/backtest")
     ap.add_argument("--limit", type=int, default=0, help="results：本次最多请求几个比赛日")
     ap.add_argument("--status-only", action="store_true", help="results：只看套餐与额度，不拉比分")
+    ap.add_argument("--threshold", type=int, default=0,
+                    help="lean：检验线 T（0 = 还在定线期，只看置信度分布）")
+    ap.add_argument("--since", default="", help="lean：检验期起算日期 YYYY-MM-DD（按开球日期过滤）")
     args = ap.parse_args()
     {"extract": cmd_extract, "results": cmd_results, "stats": cmd_stats,
-     "roi": cmd_roi}[args.cmd](args)
+     "roi": cmd_roi, "lean": cmd_lean}[args.cmd](args)
 
 
 if __name__ == "__main__":

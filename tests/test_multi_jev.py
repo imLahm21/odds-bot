@@ -38,6 +38,11 @@ _REPORT = (
 )
 
 
+def _writer_model() -> str:
+    """定稿收到的出稿模型名（影子倾向计划）：默认配置下即合并模型。"""
+    return full_model_settings.defaults("analyze")["synthesis"]["model"]
+
+
 def _judgment(choice="C01", confidence=0.9):
     probabilities = dict.fromkeys(("C01", "C02", "PASS"), (1 - confidence) / 2)
     probabilities[choice] = confidence
@@ -94,7 +99,8 @@ class TestMultiJev(unittest.TestCase):
         self.assertTrue(report.startswith(_REPORT.split("### 8.", 1)[0]))
         self.assertIn("模型初选", report)
         self.assertLess(report.index("decision_final"), report.index("### 全模型执行记录"))
-        self.finalize.assert_called_once_with(_REPORT, "Home", "Away", "League")
+        self.finalize.assert_called_once_with(_REPORT, "Home", "Away", "League",
+                                              writer_model=_writer_model())
         self.request.assert_called_once()
         state, criteria, _ = self.request.call_args.args
         self.assertEqual(set(criteria), {"C01", "C02", "PASS"})
@@ -186,7 +192,9 @@ class TestMultiJev(unittest.TestCase):
         self.request.side_effect = request
         report, _ = self._run()
         self.assertEqual(events, ["audit", "repair", "audit", "decision"])
-        self.finalize.assert_called_once_with(repaired, "Home", "Away", "League")
+        # 修复路由替身没有返回模型名，最终出稿模型仍是合并模型
+        self.finalize.assert_called_once_with(repaired, "Home", "Away", "League",
+                                              writer_model=_writer_model())
         self.request.assert_called_once()
         self.assertIn("修复后的结论标记", self.request.call_args.args[0]["section_7_conclusion"])
         final = decisions.read_final_decision(report)

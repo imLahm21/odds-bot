@@ -248,7 +248,7 @@ def _lesson_excerpt(review_report: str) -> str:
     for pattern in patterns:
         section = _extract_heading_section(review_report, pattern)
         if section:
-            parts.append(section)
+            parts.append(strip_shadow_lean(section))
     return "\n\n".join(parts)
 
 
@@ -849,7 +849,7 @@ def resolve_decision(report: str) -> DecisionParseResult | None:
         }
     criteria["PASS"] = "The final section 8 decision explicitly says pass or empty stake."
     criteria["NONE"] = "The section does not identify one candidate or an explicit pass."
-    section = extract_decision_section(report) or ""
+    section = strip_shadow_lean(extract_decision_section(report) or "")
     judgment, _reason = _request_choice_result(
         {"decision_section": section, "candidates": criteria},
         criteria,
@@ -970,6 +970,8 @@ class DecisionSelection:
     tier: str = "pass"                      # value / explore / pass
     focus_modes: tuple[str, ...] = ()       # 自定义侧重模式（focus.MODES 的 key）
     focus_note: str = ""                    # 侧重对定稿做了什么调整（多条用「；」连接）
+    lean: ShadowLean | None = None          # 第 7 节影子倾向（只记录，不参与任何选择）
+    writer_model: str = ""                  # 实际出稿模型名（统计按模型拆开用）
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candidates", tuple(self.candidates))
@@ -1022,6 +1024,63 @@ def parse_data_quality(report: str) -> int | None:
         return None
     value = int(match.group(1))
     return value if 0 <= value <= 100 else None
+
+
+# ─── 影子倾向（docs/置信度影子倾向计划.md）：只记录，不参与任何下注决定 ──────────
+@dataclass(frozen=True, slots=True)
+class ShadowLean:
+    candidate_id: str      # 归一后的 C01..Cn
+    play: str
+    odds: float
+    conf: int              # 50~100
+
+
+_SHADOW_LEAN_LINE_RE = re.compile(r"(?m)^[ \t]*[-*]?[ \t]*\**影子倾向\**[ \t]*[：:].*(?:\r?\n)?")
+_SHADOW_LEAN_FIELD_RE = re.compile(r"(?m)^\s*[-*]?\s*影子倾向\s*[：:]\s*(.*)$")
+_SHADOW_LEAN_ID_RE = re.compile(r"(?<![A-Za-z0-9])[Cc](\d{1,2})(?!\d)")
+_SHADOW_LEAN_CONF_RE = re.compile(r"置信度\s*[：:]?\s*(\d{1,3})")
+
+
+def strip_shadow_lean(text: str) -> str:
+    """去掉「影子倾向」行。凡是把报告交给会做选择的模型（Jev、串关抽取）之前都要先剥掉，
+    保证影子倾向不影响任何下注决定。"""
+    return _SHADOW_LEAN_LINE_RE.sub("", text or "")
+
+
+def has_shadow_lean_line(report: str) -> bool:
+    """第 7 节是否写了「影子倾向」行（不看内容；写「无」也算有）。"""
+    section = extract_conclusion_section(report)
+    return bool(section and _SHADOW_LEAN_FIELD_RE.search(_plain(section)))
+
+
+def parse_shadow_lean(report: str, candidates) -> ShadowLean | None:
+    """第 7 节「影子倾向：C01 …｜置信度 58 / 100」→ ShadowLean。
+    只接受候选表里最靠前的两条让球行（主线两侧）；写「无」、缺行、ID 越界、
+    置信度不在 [SHADOW_LEAN_CONF_MIN, SHADOW_LEAN_CONF_MAX] 时返回 None。"""
+    section = extract_conclusion_section(report)
+    if not section:
+        return None
+    match = _SHADOW_LEAN_FIELD_RE.search(_plain(section))
+    if not match:
+        return None
+    value = match.group(1).strip()
+    if re.match(r"^[\[【「(（]*无", value):
+        return None
+    id_match = _SHADOW_LEAN_ID_RE.search(value)
+    conf_match = _SHADOW_LEAN_CONF_RE.search(value)
+    if not id_match or not conf_match:
+        return None
+    candidate_id = f"C{int(id_match.group(1)):02d}"
+    conf = int(conf_match.group(1))
+    if not config.SHADOW_LEAN_CONF_MIN <= conf <= config.SHADOW_LEAN_CONF_MAX:
+        return None
+    main_line = [c for c in (candidates or ())
+                 if _plain(c.play).startswith("让球")][:2]
+    chosen = next((c for c in main_line if c.candidate_id == candidate_id), None)
+    if chosen is None or chosen.odds is None or chosen.odds <= 1.0:
+        return None
+    return ShadowLean(candidate_id=candidate_id, play=_plain(chosen.play),
+                      odds=float(chosen.odds), conf=conf)
 
 
 def verified_hypothesis_count(path: str | Path | None = None) -> int:
@@ -1122,7 +1181,8 @@ def _request_selection(
     signal: str | None = None,
     quality: int | None = None,
 ) -> tuple[ChoiceJudgment | None, str | None]:
-    conclusion = extract_conclusion_section(report)
+    # 喂给 Jev 的第 7 节先剥掉影子倾向行：影子倾向只记录，不得影响选中项
+    conclusion = strip_shadow_lean(extract_conclusion_section(report) or "").strip()
     if not conclusion:
         return None, "section_7_missing"
     criteria: dict[str, Any] = {
@@ -1177,6 +1237,7 @@ def select_decision(
     use_jev: bool = True,
     explore_allowed: bool = True,
     modes: tuple[str, ...] = (),
+    writer_model: str = "",
 ) -> DecisionSelection | None:
     """三档决策（SOP 7.5 第 6 条）：
       价值注 —— 有 eligible 且 edge>0 的候选：Jev 在正 edge 候选 + PASS 中选；
@@ -1189,12 +1250,16 @@ def select_decision(
       aggressive   —— 价值注 k ×FOCUS_AGGRESSIVE_K_MULT，上限 FOCUS_K_MAX；
       conservative —— 价值注 k ×FOCUS_CONSERVATIVE_K_MULT，且不下探索注。
     任何模式都不绕过数据质量门槛。modes=() 时与未加侧重前完全一致。
+    影子倾向（第 7 节）只解析后放进结果供 decision_final 记录，任何分支都不读它；
+    writer_model 同样只记录。
     候选表无法解析时返回 None（报告保持原样，串关抽取走既有 fallback）。"""
     pool = _selection_pool(report)
     if pool is None:
         return None
     modes = tuple(modes or ())
     candidates, evidence = pool
+    lean = (parse_shadow_lean(report, candidates)
+            if config.SHADOW_LEAN_MODE == "on" else None)
     raw_signal = parse_signal_strength(report)
     signal = effective_signal(raw_signal)
     quality = parse_data_quality(report) if raw_signal is not None else None
@@ -1208,6 +1273,8 @@ def select_decision(
         "signal": signal,
         "quality": quality,
         "focus_modes": modes,
+        "lean": lean,                     # 只记录：下面任何分支都不得读取
+        "writer_model": writer_model or "",
     }
     notes: list[str] = []
 
@@ -1439,6 +1506,12 @@ def _selection_block(selection: DecisionSelection) -> list[str]:
     if selection.focus_modes:
         # 只增不改（schema 仍为 decision_final/1）；无侧重时不写，预设精算报告逐字不变
         payload["focus"] = list(selection.focus_modes)
+    # 影子倾向与出稿模型：只增不改，缺失时不写键；可见文字行不加任何内容
+    if selection.lean is not None:
+        payload["lean"] = {"id": selection.lean.candidate_id, "play": selection.lean.play,
+                           "odds": round(selection.lean.odds, 6), "conf": selection.lean.conf}
+    if selection.writer_model:
+        payload["writer_model"] = selection.writer_model
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                       allow_nan=False).replace("-->", "--\\u003e")
     # 注释放在段首：放在注额行之后会被注额解析当作续行（含 "pass" 字样）
@@ -1813,9 +1886,12 @@ def log_selection_shadow(report: str, home: str, away: str, league: str) -> None
 
 
 def log_selection(report: str, selection: DecisionSelection | None) -> None:
-    """active 模式的审计行（同 TYPESAFE_SHADOW 字段口径）。"""
+    """active 模式的审计行（同 TYPESAFE_SHADOW 字段口径，另加影子倾向 ID 与置信度）。"""
+    record = selection_record(report, selection, feature="decision_select")
+    lean = selection.lean if selection else None
+    record["lean_id"] = lean.candidate_id if lean else ""
+    record["lean_conf"] = lean.conf if lean else None
     log.info(
         "TYPESAFE_DECISION %s",
-        json.dumps(selection_record(report, selection, feature="decision_select"),
-                   ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
     )

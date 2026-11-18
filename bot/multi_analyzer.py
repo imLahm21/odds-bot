@@ -570,6 +570,26 @@ def _candidate_mismatches(report: str, bundle: dict) -> list[str]:
     return out
 
 
+# 影子倾向缺行只是记录缺失（docs/置信度影子倾向计划.md 步骤 6）：归 minor，
+# 不进 blockers、不触发修复重写，也不参与修复稿验收的问题计数。
+SHADOW_LEAN_MISSING = "第 7 节缺「影子倾向」行"
+_MINOR_DETERMINISTIC = frozenset({SHADOW_LEAN_MISSING})
+SHADOW_LEAN_AUDIT_NOTE = (
+    "第 7 节的「影子倾向」行是强制选边的只记录项，不属于方向越权，"
+    "审计不得因此判定违反无倾向规则。"
+)
+
+
+def _shadow_lean_note() -> str:
+    """审计 / 合并提示词里的影子倾向说明；SHADOW_LEAN_MODE 不为 on 时为空串。"""
+    instruction = analyzer.shadow_lean_instruction()
+    return instruction + SHADOW_LEAN_AUDIT_NOTE + "\n" if instruction else ""
+
+
+def _blocking_issues(issues: list[str]) -> list[str]:
+    return [issue for issue in issues if issue not in _MINOR_DETERMINISTIC]
+
+
 def _basic_report_issues(report: str, focus_required: bool = False,
                          bundle: dict | None = None) -> list[str]:
     issues = []
@@ -591,6 +611,9 @@ def _basic_report_issues(report: str, focus_required: bool = False,
         issues.append("第 8 节候选表无法解析")
     if signal in ("medium", "strong") and typesafe_decisions.verified_hypothesis_count() == 0:
         issues.append("信号强度越权：登记表没有「已验证」假设，信号强度不得为中/强")
+    if (config.SHADOW_LEAN_MODE == "on"
+            and not typesafe_decisions.has_shadow_lean_line(report or "")):
+        issues.append(SHADOW_LEAN_MISSING)   # minor：只提示，不触发修复、不拦截出稿
     if bundle:
         mismatches = _candidate_mismatches(report or "", bundle)
         if mismatches:
@@ -608,10 +631,12 @@ def _blocker(problem: str) -> dict:
 
 
 def _split_severity(deterministic: list[str], model_issues) -> dict:
-    """确定性问题一律 blocker；模型给的 issue 只有 severity=="blocker" 才阻断，
+    """确定性问题除 _MINOR_DETERMINISTIC（影子倾向缺行）外一律 blocker；
+    模型给的 issue 只有 severity=="blocker" 才阻断，
     没有 severity 字段的旧式返回（含纯字符串）按 minor 处理。"""
-    blockers = [_blocker(text) for text in deterministic]
-    minors = []
+    blockers = [_blocker(text) for text in _blocking_issues(deterministic)]
+    minors = [{"section": "7", "severity": "minor", "problem": text}
+              for text in deterministic if text in _MINOR_DETERMINISTIC]
     for issue in model_issues or []:
         if isinstance(issue, dict) and str(issue.get("severity", "")).strip().lower() == "blocker":
             blockers.append(issue)
@@ -638,7 +663,8 @@ def _audit_report(bundle: dict, report: str, cards: list[dict], *,
         "检查第1到第8节、第7节的信号强度与数据质量两行、数据缺失、edge、Kelly、"
         "档位（价值注/探索注/空仓）、比分，以及有侧重时第 9 节是否逐条回应。"
         "第 8 节数字以输入里的「代码候选表」为准核对。不要重写报告。\n"
-        '{"ok":true,"issues":[{"section":"7","severity":"blocker","problem":"...",'
+        + _shadow_lean_note()
+        + '{"ok":true,"issues":[{"section":"7","severity":"blocker","problem":"...",'
         '"required_fix":"..."}]}\n'
         + _SEVERITY_RULE % (
             "缺少必需章节；无已验证假设且无基本面明文覆盖却给出方向；"
@@ -679,8 +705,9 @@ def _accept_repair(original: str, repaired: str, bundle: dict) -> bool:
     if not repaired or len(repaired) < config.FULL_CONSULT_REPAIR_MIN_RATIO * len(original or ""):
         return False
     focus_required = _focus_required(bundle)
-    if (len(_basic_report_issues(repaired, focus_required, bundle=bundle))
-            > len(_basic_report_issues(original, focus_required, bundle=bundle))):
+    # 只比较阻断级确定性问题：影子倾向缺行是 minor，不左右修复稿取舍
+    if (len(_blocking_issues(_basic_report_issues(repaired, focus_required, bundle=bundle)))
+            > len(_blocking_issues(_basic_report_issues(original, focus_required, bundle=bundle)))):
         return False
     return typesafe_decisions._selection_pool(repaired) is not None
 
@@ -712,6 +739,7 @@ def _synthesis_prompt(bundle: dict, cards: list[dict]) -> tuple[str, str, dict]:
         "卡片里 direction_downgraded 表示该方向因无权限已被代码降级；"
         "unverified_quotes > 0 的卡片，其对应 findings 不得作为关键依据。\n"
         "必须保留现有输出格式的 ### 1 到 ### 8，必须包含 ### 8. 投注决策。\n"
+        + _shadow_lean_note()
     )
     # 侧重任务段 _analyze_prompts 已加在数据之后，但专家卡片与合并要求又接在其后；
     # 再追加一次，保证它仍是整个输入的最后一段。
@@ -1045,6 +1073,9 @@ def run(csv_text: str, fundamentals: str, home: str, away: str,
         finalize_kwargs["modes"] = focus_obj.modes
     if not count_explore:
         finalize_kwargs["count_explore"] = False
+    # 最终出稿模型：合并实际产出正文的模型；修复稿被采纳时 _adopt_repair_route 已改成修复模型
+    if synthesis.get("model"):
+        finalize_kwargs["writer_model"] = str(synthesis["model"])
     report = analyzer.finalize_decision(report, home, away, league, **finalize_kwargs)
     if apply_focus_modes:
         report = focus.stamp(report, focus_obj)

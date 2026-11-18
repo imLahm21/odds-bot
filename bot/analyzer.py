@@ -31,7 +31,7 @@ def _start_typesafe_shadow(target, *args, name: str) -> None:
 
 def finalize_decision(report: str, home: str = "", away: str = "",
                       league: str = "", *, modes: tuple[str, ...] = (),
-                      count_explore: bool = True) -> str:
+                      count_explore: bool = True, writer_model: str = "") -> str:
     """生成时定第 8 节选中项（TYPESAFE_DECISION_MODE）：
       off    —— 原样返回，沿用报告模型自己的选择；
       shadow —— 原样返回，后台跑一遍 Jev 选定并记 TYPESAFE_SHADOW 日志；
@@ -40,6 +40,8 @@ def finalize_decision(report: str, home: str = "", away: str = "",
     modes：自定义侧重模式（focus.MODES 的 key），active 时透传给 select_decision；
     conservative 不下探索注。off/shadow 行为不变。
     count_explore=False（复盘盲推）：不查也不占当日探索注额度，只看 EXPLORE_MODE。
+    writer_model：实际出稿模型名，active 时只写进 decision_final（统计按模型拆开），
+    不参与选择；shadow 不用。
     任何异常都退回原报告，不影响精算主流程。"""
     mode = config.TYPESAFE_DECISION_MODE
     if mode == "off" or not (report or "").strip():
@@ -55,7 +57,7 @@ def finalize_decision(report: str, home: str = "", away: str = "",
             min_confidence=config.TYPESAFE_DECISION_MIN_CONFIDENCE,
             explore_allowed=("conservative" not in modes) and (
                 _explore_budget_left() if count_explore else config.EXPLORE_MODE == "on"),
-            modes=modes)
+            modes=modes, writer_model=writer_model)
         typesafe_decisions.log_selection(report, selection)
         if selection is None:
             log.warning("第 8 节候选表无法解析，保留报告模型的选择")
@@ -72,16 +74,20 @@ FOCUS_MISSING_SECTION_9_NOTE = "\n\n> ⚠️ 模型未输出「### 9. 侧重专�
 
 
 def _finalize_with_focus(report: str, home: str, away: str, league: str,
-                         extra_instruction: str = "", *, count_explore: bool = True) -> str:
+                         extra_instruction: str = "", *, count_explore: bool = True,
+                         writer_model: str = "") -> str:
     """finalize_decision + 侧重标记：按侧重模式定稿，在「## 赛事：」行后标注本场侧重；
     有侧重但模型漏写第 9 节时在末尾提示。无侧重时与 finalize_decision 完全一致。
-    count_explore=False 透传给 finalize_decision（复盘盲推不占探索注额度）。"""
+    count_explore=False 透传给 finalize_decision（复盘盲推不占探索注额度）；
+    writer_model 非空时透传（只写进 decision_final）。"""
     focus_obj = focus.parse(extra_instruction)
     kwargs = {}
     if focus_obj.modes:
         kwargs["modes"] = focus_obj.modes
     if not count_explore:
         kwargs["count_explore"] = False
+    if writer_model:
+        kwargs["writer_model"] = writer_model
     report = finalize_decision(report, home, away, league, **kwargs)
     report = focus.stamp(report, focus_obj)
     if not focus_obj.empty and not focus.has_section_9(report):
@@ -274,8 +280,14 @@ def strip_rules_manifest(text: str) -> str:
 
 
 def prepare_report_for_display(text: str) -> str:
-    """统一清理用户展示正文；原始报告、资格筛选与机器可读决策保持不变。"""
+    """统一清理用户展示正文；原始报告、资格筛选与机器可读决策保持不变。
+    TG 显示用它，故不剥影子倾向行（TG 照常显示）。"""
     return report_display.hide_eligibility_column(strip_rules_manifest(text))
+
+
+def prepare_report_for_publish(text: str) -> str:
+    """对外发布（Ghost / 微信）用：在展示清理之外，再去掉只供内部记录的影子倾向行。"""
+    return typesafe_decisions.strip_shadow_lean(prepare_report_for_display(text))
 
 
 def format_rules_manifest(mf: dict) -> str:
@@ -410,6 +422,19 @@ def _stream_llm(system: str, user: str, effort: str = "",
                                       input_metrics=input_metrics)
 
 
+SHADOW_LEAN_INSTRUCTION = (
+    "第 7 节另写一行「影子倾向」：无论各判定是否为无倾向，都必须在代码候选表的让球主线两侧"
+    "（表下注明的两个 ID）中选一个，并给 50~100 的置信度（50 = 看不出差别，是最常见的正常答案）；"
+    "这一行只作记录，不改变任何判定、p_最终 与注额，也不得因为写了它而把判定从「无倾向」改成选边。"
+)
+
+
+def shadow_lean_instruction() -> str:
+    """影子倾向提示句（docs/置信度影子倾向计划.md 5a）。只按 SHADOW_LEAN_MODE 开关，
+    不随本场情况变化——带/不带侧重的 system 必须逐字相同（输入缓存依赖这一点）。"""
+    return SHADOW_LEAN_INSTRUCTION if config.SHADOW_LEAN_MODE == "on" else ""
+
+
 def _analyze_prompts(csv_text: str, fundamentals: str,
                      home: str, away: str, league: str,
                      extra_instruction: str = "",
@@ -440,7 +465,8 @@ def _analyze_prompts(csv_text: str, fundamentals: str,
         "**没有已验证假设、也没有基本面明文覆盖时，第 7 节各判定写『无倾向』**，"
         "不得为了给出结论而选边。过渡期第 8 节 p_最终 = p_市场，不做校准平移。"
         "报告第 7 节须先写「四层判断」行，并写出「信号强度」「数据质量」两行。"
-        "盘口数据为 CSV，基本面为【原始数据】文本（含代码算好的【事实表】、两队近10场、"
+        + shadow_lean_instruction()
+        + "盘口数据为 CSV，基本面为【原始数据】文本（含代码算好的【事实表】、两队近10场、"
         "历史交锋、未来赛程、积分榜、赛季统计、伤停，来自 API-Football，均截至开球前）。"
         "**统计数字（胜平负、进失球、主客场分拆、休息天数、积分差）直接引用【事实表】，"
         "不要自己数逐场列表**。你需先按 SOP 步骤1的读法分析这份基本面——判赛事情境"
@@ -546,7 +572,7 @@ def analyze(csv_text: str, fundamentals: str,
     """调 LLM 跑精算 SOP，返回报告文本；失败返回错误说明串。visitor 透传角色。"""
     if not available():
         return "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。"
-    input_metrics: dict[str, int] = {}
+    input_metrics: dict[str, int | str] = {}
     system, user = _analyze_prompts(
         csv_text, fundamentals, home, away, league, extra_instruction,
         input_metrics)
@@ -554,7 +580,8 @@ def analyze(csv_text: str, fundamentals: str,
                        input_metrics=input_metrics)
     if report and not report.startswith(_LLM_ERR_PREFIXES):
         report = _finalize_with_focus(report, home, away, league,
-                                      extra_instruction, count_explore=count_explore)
+                                      extra_instruction, count_explore=count_explore,
+                                      writer_model=str(input_metrics.get("actual_model", "")))
         has_h2h, has_form = fund_has(fundamentals)
         mf = rules_manifest(
             league_name=league, has_h2h=has_h2h, has_form=has_form)
@@ -1348,7 +1375,7 @@ def analyze_stream(csv_text: str, fundamentals: str,
     if not available():
         yield ("error", "未配置 LLM_ROUTE_ENDPOINTS，无法分析。请在 .env 配置。")
         return
-    input_metrics: dict[str, int] = {}
+    input_metrics: dict[str, int | str] = {}
     system, user = _analyze_prompts(
         csv_text, fundamentals, home, away, league, extra_instruction,
         input_metrics)
@@ -1372,8 +1399,11 @@ def analyze_stream(csv_text: str, fundamentals: str,
             has_h2h, has_form = fund_has(fundamentals)
             mf = rules_manifest(
                 league_name=league, has_h2h=has_h2h, has_form=has_form)
-            report = _finalize_with_focus(payload, home, away, league,
-                                          extra_instruction, count_explore=count_explore)
+            # llm_client 在 yield done 之前已把实际出稿模型写进 input_metrics
+            report = _finalize_with_focus(
+                payload, home, away, league, extra_instruction,
+                count_explore=count_explore,
+                writer_model=str(input_metrics.get("actual_model", "")))
             yield ("done", report + "\n\n" + format_rules_manifest(mf))
         elif kind == "error":
             yield ("error", payload)
@@ -1604,8 +1634,9 @@ def _extract_decision_llm(report: str, home: str = "", away: str = "",
         "硬规则：① 只依据报告已有内容，不自行重算、不编造；② 数字用阿拉伯数字、"
         "百分数一律转小数；③ 只输出一个 JSON 对象。"
     )
+    # 影子倾向只记录：喂给抽取模型前先剥掉，保证它不影响串关选腿
     user = (f"## 比赛：{home} vs {away}\n\n" if (home or away) else "") + \
-           f"### 精算报告\n{report}\n"
+           f"### 精算报告\n{typesafe_decisions.strip_shadow_lean(report)}\n"
     raw = _call_llm(system, user,
                     effort=config.FUND_ANALYZE_EFFORT,
                     tier="balanced",

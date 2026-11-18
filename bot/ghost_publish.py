@@ -362,8 +362,8 @@ def report_to_post(report_md: str, *, title: str | None = None,
 
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
     text = _ARCHIVE_LINE_RE.sub("", text)   # 剥掉「> 归档路径：…」行，不进发布正文
-    # 原始归档保留机器字段；公开正文隐藏内部注释和候选资格列。
-    text = analyzer.prepare_report_for_display(text)
+    # 原始归档保留机器字段；公开正文隐藏内部注释、候选资格列与影子倾向行。
+    text = analyzer.prepare_report_for_publish(text)
 
     # 队名/赛事等元信息始终从完整原文提取（复盘的「## 比赛/赛事」在第一步盲推开头）。
     meta_src = text

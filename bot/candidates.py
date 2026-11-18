@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import median
 
-from . import goals_model
+from . import config, goals_model
 from .market_facts import NODE_ORDER, Quote, consistent_lines, pick_bookmaker, rows_from_csv
 
 _SUSPECT_EDGE = -0.15
@@ -212,6 +212,18 @@ def build_table(csv_text: str, league: str = "", home: str = "主", away: str = 
     return CandidateTable(node=node, bookmaker=base, snapshot=snap, rows=rows, lam_total=lam)
 
 
+def shadow_lean_hint(table: CandidateTable) -> str:
+    """第 7 节「影子倾向」可选的 ID（docs/置信度影子倾向计划.md 2.1）。
+    build_table 先排让球主线两侧，故前两行都是让球时即 C01 / C02；否则本场缺亚盘主线。
+    SHADOW_LEAN_MODE 不为 on 时返回空串（不提示）。"""
+    if config.SHADOW_LEAN_MODE != "on":
+        return ""
+    head = table.rows[:2]
+    if len(head) == 2 and all(c.play.startswith("让球 ") for c in head):
+        return "- 影子倾向（第 7 节）只能在 C01 / C02 中选一个（让球主线两侧）"
+    return "- 影子倾向（第 7 节）：本场缺亚盘主线，写「无（缺亚盘主线）」"
+
+
 def format_table(table: CandidateTable | None) -> str:
     """注入 prompt 的【代码候选表】段落；列与 CLAUDE.md 输出格式第 8 节一致。"""
     if table is None or not table.rows:
@@ -230,6 +242,9 @@ def format_table(table: CandidateTable | None) -> str:
             notes.append(f"C{i:02d}：{c.note}")
     if notes:
         out.append("- 排除 / 说明：" + "；".join(notes))
+    lean_hint = shadow_lean_hint(table)
+    if lean_hint:
+        out.append(lean_hint)
     out.append("- 可在表末追加「主队大小球 / 客队大小球」行（CSV 有数据时），ID 顺延；"
                "发现报价可疑可把资格改为 excluded 并写明理由，但不得改动数字")
     return "\n".join(out)

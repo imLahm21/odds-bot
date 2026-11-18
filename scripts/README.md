@@ -6,6 +6,7 @@
 | 脚本 | 用途 | 常用命令 |
 |---|---|---|
 | `build_calibration.py` | 从 `竞彩.xlsx` 重算置信度、方向命中率和 ROI 校准表 | `python -m scripts.build_calibration --out scripts/output/calibration_out.md` |
+| `backtest_reports.py` | 历史报告回测：特征抽取、补比分、命中率 / ROI，影子倾向置信度检验 | `python -m scripts.backtest_reports lean` |
 | `dump_catalog.py` | 从缓存或 API-Football 导出联赛与博彩公司目录 | `python -m scripts.dump_catalog` |
 | `probe.py` | API-Football 套餐、联赛、赛程和盘前赔率结构探针 | `python -m scripts.probe leagues` |
 | `probe_live.py` | 滚球盘口和滚球 bet 类型探针 | `python -m scripts.probe_live` |
@@ -25,3 +26,23 @@
 API 探针的原始 JSON 继续写入项目根目录的 `probe_samples/`，该目录不纳入 Git。
 
 `build_calibration.py` 的完整参数和统计口径见 [build_calibration.md](build_calibration.md)。
+
+## 影子倾向置信度检验（`backtest_reports lean`）
+
+报告第 7 节的「影子倾向」行（亚盘主线强制选边 + 50~100 置信度）只记录、不影响注额，
+数据落在第 8 节 `decision_final` 的 `lean` 与 `writer_model` 键（仅 `TYPESAFE_DECISION_MODE=active` 时写入）。
+检验口径是预登记的，见 `rules/风控验证/reference_staking_kelly.md` 7.4 与 `docs/置信度影子倾向计划.md`。
+
+```bash
+python -m scripts.backtest_reports extract                                # 报告 → features.json（含 lean）
+python -m scripts.backtest_reports results                                # 按比赛日补比分（有缓存不重复请求）
+python -m scripts.backtest_reports lean                                   # 定线期：只看置信度分布，给建议检验线 T
+python -m scripts.backtest_reports lean --threshold 65 --since 2026-12-01 # 检验期：H-CONF01 达标 / 否决 / 继续观察
+```
+
+- `--threshold 0`（默认）是定线期：前 60 场已结算样本只看分布，输出不含任何命中率或 ROI；
+  建议线 T 需人工确认后连同起算日期写进 7.4，之后不改。
+- `--threshold T` 时输出描述性分桶表与 H-CONF01 检验，`--since` 按开球日期过滤检验期样本。
+- 只统计 `_report.md`（复盘 `_review.md`、盲推 `_review_blind.md` 按文件名排除）；
+  同一场同一模型的重复报告（管理员 + 访客）只算一份；统计按 `writer_model` 拆开，模型不止一个时会提示分别检验。
+- 结果写入 `scripts/output/backtest/lean.md`；没有任何带 `lean` 的报告时输出「暂无样本」并正常结束。

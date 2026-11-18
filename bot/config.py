@@ -362,6 +362,11 @@ QUALITY_MIN_TO_BET = 40          # 数据质量低于此值本场全部空仓（
 QUALITY_DEFAULT = 70             # 报告未写数据质量时的保守默认（取 0.75 档）
 HYPOTHESIS_REGISTRY = "rules/假设登记表.md"
 
+# 影子倾向（docs/置信度影子倾向计划.md）：只记录，不影响结论、选中项与注额。
+SHADOW_LEAN_MODE = os.getenv("SHADOW_LEAN_MODE", "on").strip().lower()   # on / off
+SHADOW_LEAN_CONF_MIN = 50        # 低于此值视为不合法（强制选边时把握不可能低于抛硬币）
+SHADOW_LEAN_CONF_MAX = 100
+
 # 探索注（无正 edge 时收集 BCG 执行样本，见 reference_staking_kelly 3.4）
 EXPLORE_MODE = os.getenv("EXPLORE_MODE", "on").strip().lower()   # on / off
 EXPLORE_MIN_EDGE = float(os.getenv("EXPLORE_MIN_EDGE", "-0.03"))  # 只在价格接近公平时探索

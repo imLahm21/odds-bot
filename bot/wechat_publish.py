@@ -313,7 +313,7 @@ def report_to_wx_article(report_md: str, home: str, away: str,
 
     text = report_md.replace("\r\n", "\n").replace("\r", "\n")
     text = _ARCHIVE_LINE_RE.sub("", text)
-    text = analyzer.prepare_report_for_display(text)  # 内部注释和候选资格列不进发布流程
+    text = analyzer.prepare_report_for_publish(text)  # 内部注释、候选资格列与影子倾向行不进发布流程
 
     # 只喂免费正文（第 7 节「最终精算结论」之前）给 LLM——天然不含下注结论。
     pm = re.search(r"(?m)^\#{3}\s*7\s*[\.、]?\s*最终精算结论", text)

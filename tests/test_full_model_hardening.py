@@ -45,7 +45,8 @@ from test_market_facts import make_csv  # noqa: E402
 
 SECTIONS_1_6 = "".join(f"### {n}. 段\n内容\n" for n in range(1, 7))
 SECTION_7 = ("### 7. 最终精算结论\n- **亚盘判定**：无倾向\n- **信号强度**：无\n"
-             "- **数据质量**：85 / 100\n")
+             "- **数据质量**：85 / 100\n"
+             "- **影子倾向**：C01 主胜｜置信度 50 / 100｜依据：看不出差别（仅记录，不影响结论与注额）\n")
 TABLE_HEAD = ("| ID | 玩法 | 赔率 | 门槛=1/赔率 | p_市场 | p_最终 | edge | 资格 |\n"
               "|----|------|------|-------------|--------|--------|------|------|\n")
 VALID_REPORT = (SECTIONS_1_6 + SECTION_7 + "### 8. 投注决策\n" + TABLE_HEAD
@@ -416,9 +417,16 @@ class TestExploreBudget(unittest.TestCase):
              patch.object(analyzer, "finalize_decision", side_effect=lambda r, *a, **k: r) as fin:
             multi.run("csv", "", "H", "A", "L", settings=settings.defaults("review"),
                       profile="review", apply_focus_modes=False, count_explore=False)
-            self.assertEqual(fin.call_args.kwargs, {"count_explore": False})
+            # writer_model（影子倾向计划）：出稿模型名，只写进 decision_final
+            kwargs = dict(fin.call_args.kwargs)
+            self.assertEqual(kwargs.pop("writer_model"),
+                             settings.defaults("review")["synthesis"]["model"])
+            self.assertEqual(kwargs, {"count_explore": False})
             multi.run("csv", "", "H", "A", "L", settings=settings.defaults("analyze"))
-            self.assertEqual(fin.call_args.kwargs, {})
+            kwargs = dict(fin.call_args.kwargs)
+            self.assertEqual(kwargs.pop("writer_model"),
+                             settings.defaults("analyze")["synthesis"]["model"])
+            self.assertEqual(kwargs, {})
 
 
 # ─── WP-7：假设结算 ──────────────────────────────────────────────────────────

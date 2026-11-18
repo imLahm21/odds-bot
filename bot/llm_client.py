@@ -747,6 +747,14 @@ def _input_observation(system: str, user: str, model: str, output_budget: int,
     return observed
 
 
+def _record_actual_model(input_metrics: dict | None, model: str) -> None:
+    """成功返回正文时把实际出稿模型写回调用方的 input_metrics["actual_model"]。
+    有故障转移，调用方事先不知道最终是哪个模型；只在成功路径调用。
+    _input_observation 只读固定的几个计数键，多一个字符串键不影响观测与日志。"""
+    if input_metrics is not None and model:
+        input_metrics["actual_model"] = model
+
+
 def _log_input_observation(request_id: str, observation: dict) -> None:
     """把可估算的输入组成写入日志；warn 仅提高日志级别，不改变请求。"""
     logger = log.warning if observation["warn"] else log.info
@@ -1173,6 +1181,7 @@ def chat(system: str, user: str, effort: str = "", tier: str = "heavy",
             if not rate_limited:
                 br.record(ok)
             if ok:
+                _record_actual_model(input_metrics, model)
                 return content
             raw_errs.append(err)
             labeled.append(f"{ep['label']}({model})：{err}")
@@ -1418,6 +1427,7 @@ def stream_chat(system: str, user: str, effort: str = "", tier: str = "heavy",
                     if not usage_logged:
                         _log_usage(request_id, model, ep["label"], None)
                     br.record(True)
+                    _record_actual_model(input_metrics, model)
                     yield ev
                     return
                 elif ev[0] == "ratelimit":
@@ -1522,6 +1532,7 @@ def chat_model(system: str, user: str, model: str, effort: str = "",
             if not rate_limited:
                 br.record(ok)
             if ok:
+                _record_actual_model(input_metrics, current_model)
                 return content
             raw_errs.append(err)
             labeled.append(f"{ep['label']}({current_model})：{err}")
@@ -1614,6 +1625,7 @@ def stream_chat_model(system: str, user: str, model: str, effort: str = "",
                     if not usage_logged:
                         _log_usage(request_id, current_model, ep["label"], None)
                     br.record(True)
+                    _record_actual_model(input_metrics, current_model)
                     yield ev
                     return
                 elif ev[0] == "ratelimit":
