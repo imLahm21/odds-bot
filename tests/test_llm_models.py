@@ -215,6 +215,8 @@ class TestModelProfile(unittest.TestCase):
                 **{model: ("op_gemini",) for model in _OP_GEMINI},
                 **{model: ("op_claude",) for model in _OP_CLAUDE},
                 **{model: ("op_grok",) for model in _OP_GROK},
+                "gpt-6.2-sol-cpa": ("cpa_gpt",),
+                "gpt-6.2-astra-cpa": ("cpa_gpt",),
             })
 
     def test_group_inferred_from_model_prefix(self):
@@ -259,10 +261,10 @@ class TestModelProfile(unittest.TestCase):
             "gemini-3.8-flash-high", "gemini-4-argon-high",
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
             "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
-            *_OP_HEAVY,
+            *_OP_HEAVY, "gpt-6.2-sol-cpa", "gpt-6.2-astra-cpa",
         })
         self.assertEqual(balanced, {*_OP_BALANCED, "gpt-5.6-terra", "deepseek-v4.1-flash",
-                                    "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+                                    "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "gpt-6.2-sol-cpa",
                                     "glm-5.3-flash", "grok-4.5",
                                     "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                                     "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
@@ -275,7 +277,7 @@ class TestModelProfile(unittest.TestCase):
         self.assertNotIn("gpt-5.6-sol", heavy | balanced | light)
         self.assertEqual(heavy & balanced,
                          {*(_OP_HEAVY & _OP_BALANCED), "gpt-5.6-terra", "deepseek-v4.1-flash",
-                          "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+                          "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "gpt-6.2-sol-cpa",
                           "glm-5.3-flash", "gpt-6-sol", "gpt-6.1-sol", "grok-4.6",
                           "grok-4.7", "gemini-3.8-flash", "claude-sonnet-5-5",
                           "gemini-4-argon", "claude-sonnet-5-5-high",
@@ -292,12 +294,13 @@ class TestModelProfile(unittest.TestCase):
             "gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
             "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",
         )
-        appended = new_models + _OP_MODELS
+        cpa_62 = ("gpt-6.2-sol-cpa", "gpt-6.2-astra-cpa")
+        appended = new_models + _OP_MODELS + cpa_62
         self.assertEqual(tuple(config.LLM_MODELS)[-len(appended):], appended)
         for tier, expected in (
-            ("heavy", new_models + tuple(m for m in _OP_MODELS if m in _OP_HEAVY)),
+            ("heavy", new_models + tuple(m for m in _OP_MODELS if m in _OP_HEAVY) + cpa_62),
             ("balanced", new_models[1:4] + new_models[5:]
-             + tuple(m for m in _OP_MODELS if m in _OP_BALANCED)),
+             + tuple(m for m in _OP_MODELS if m in _OP_BALANCED) + cpa_62[:1]),
         ):
             self.assertEqual(tuple(config.llm_tier_eligible_models(tier))[-len(expected):],
                              expected)
@@ -690,6 +693,7 @@ class TestModelProfile(unittest.TestCase):
     def test_cpa_routes_and_payloads_use_exact_provider_model_names(self):
         expected = {
             "cpa_gpt": {"gpt-6-astra-cpa", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa",
+                        "gpt-6.2-sol-cpa", "gpt-6.2-astra-cpa",
                         "gpt-5.6-luna", "gpt-6-luna"},
             "cpa_claude": {"claude-opus-5-5-high", "claude-sonnet-5-5-high"},
             "cpa_gemini": {"gemini-3.8-flash-high", "gemini-4-argon-high",
@@ -725,6 +729,28 @@ class TestModelProfile(unittest.TestCase):
         self.assertNotIn("openai_gpt", config.LLM_ROUTE_GROUPS)
         self.assertFalse(config.llm_model_registered("xhgj-v1-flash"))
         self.assertFalse(config.llm_model_registered("xhgj-v1-pro"))
+
+    def test_cpa_gpt_62_models_follow_cpa_probe(self):
+        """6.2 Sol 进重档 + 平衡档，6.2 Astra 只进重档；档位按 2026-11-17 CPA 探针。"""
+        cases = {"gpt-6.2-sol-cpa": ("gpt-6.2-sol", ("heavy", "balanced")),
+                 "gpt-6.2-astra-cpa": ("gpt-6.2-astra", ("heavy",))}
+        for alias, (upstream, tiers) in cases.items():
+            with self.subTest(alias=alias):
+                spec = config.LLM_MODELS[alias]
+                self.assertEqual(spec["tiers"], tiers)
+                self.assertEqual(config.llm_upstream_model(alias), upstream)
+                self.assertEqual(config.llm_base_model(alias), upstream)
+                self.assertEqual(full_model_settings.model_identity(alias), upstream)
+                self.assertEqual(config.llm_route_groups_for_model(alias), ("cpa_gpt",))
+                self.assertEqual(config.llm_model_efforts(alias),
+                                 ("low", "medium", "high", "xhigh", "max"))
+                self.assertEqual(config.llm_model_display_id(alias), alias)
+                self.assertEqual(config.FULL_CONSULT_MODEL_GRADES[alias], "flagship")
+        self.assertNotIn("gpt-6.2-astra-cpa", config.llm_tier_eligible_models("balanced"))
+        # 标准名没有登记，不会被前缀推导误送到 IK
+        self.assertFalse(config.llm_model_registered("gpt-6.2-sol"))
+        with patch.dict(config.LLM_MODEL_MAX_TOKENS, {"gpt-6.2-sol": 128000}, clear=True):
+            self.assertEqual(config.llm_max_tokens_for_model("gpt-6.2-sol-cpa"), 128000)
 
     def test_openrouter_routes_send_vendor_slug_and_max_tokens(self):
         expected = {"op_gpt": _OP_GPT, "op_gemini": _OP_GEMINI,

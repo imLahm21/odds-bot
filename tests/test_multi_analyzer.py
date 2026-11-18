@@ -117,7 +117,7 @@ class TestMultiAnalyzer(unittest.TestCase):
         self.assertEqual(
             set(config.llm_tier_eligible_models("balanced")),
             {"gpt-6-sol", "grok-4.6", "gpt-5.6-terra", "deepseek-v4.1-flash",
-             "glm-5.3-flash", "grok-4.5", "gpt-6.1-sol", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "grok-4.7",
+             "glm-5.3-flash", "grok-4.5", "gpt-6.1-sol", "gpt-6.1-sol-cpa", "gpt-6.1-terra-cpa", "gpt-6.2-sol-cpa", "grok-4.7",
              "gemini-3.8-flash", "claude-sonnet-5-5", "gemini-4-argon",
              "claude-sonnet-5-5-high", "gemini-3.8-flash-high", "gemini-4-argon-high",
              "gemini-4-hydrogen-xhigh", "gemini-4-carbon", "gemini-4-hydrogen",

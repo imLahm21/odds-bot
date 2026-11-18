@@ -510,6 +510,9 @@ _EFFORT_OPENAI_SOL = ("none", "low", "medium", "high", "xhigh", "max",
                       "ultra")
 # 2026-10-04 Mixed/Pro 探针均接受这五档；none/minimal/ultra 返回 400。
 _EFFORT_OPENAI_61_SOL = ("low", "medium", "high", "xhigh", "max")
+# 2026-11-17 CPA 探针：6.2 Sol / Astra 的报错文案列出 low/medium/high/xhigh/max；
+# minimal/ultra 返回 400，none 返回 200 但不在其列表内，故不开放。OpenRouter 元数据同为这五档。
+_EFFORT_OPENAI_62 = ("low", "medium", "high", "xhigh", "max")
 _EFFORT_OPENAI_TERRA = ("none", "low", "medium", "high", "xhigh", "max")
 # Luna max 在当前 OpenAI 端点实测返回 400，但按管理员明确要求保留。
 _EFFORT_OPENAI_LUNA = ("none", "low", "medium", "high", "xhigh", "max")
@@ -706,6 +709,15 @@ LLM_MODELS: dict[str, dict] = {
         "label": "OP · Grok 4.5", "tiers": ("balanced",), "efforts": _EFFORT_OR_LOW_HIGH,
         "upstream": "x-ai/grok-4.5", "base": "grok-4.5",
     },
+    # CPA 的 GPT-6.2（2026-11-17 登记），同样用本地别名 -cpa、只走 cpa_gpt。
+    "gpt-6.2-sol-cpa": {
+        "label": "CPA · GPT-6.2 Sol", "tiers": ("heavy", "balanced"),
+        "efforts": _EFFORT_OPENAI_62, "upstream": "gpt-6.2-sol",
+    },
+    "gpt-6.2-astra-cpa": {
+        "label": "CPA · GPT-6.2 Astra", "tiers": ("heavy",),
+        "efforts": _EFFORT_OPENAI_62, "upstream": "gpt-6.2-astra",
+    },
 }
 
 
@@ -868,6 +880,8 @@ LLM_MODEL_GROUP_OVERRIDES: dict[str, tuple[str, ...]] = {
     "gpt-6-astra-cpa": ("cpa_gpt",),
     "gpt-6.1-sol-cpa": ("cpa_gpt",),
     "gpt-6.1-terra-cpa": ("cpa_gpt",),
+    "gpt-6.2-sol-cpa": ("cpa_gpt",),
+    "gpt-6.2-astra-cpa": ("cpa_gpt",),
     "gpt-5.6-luna": ("cpa_gpt",),
     "gpt-6-luna": ("cpa_gpt",),
     "claude-opus-5-5-high": ("cpa_claude",),
@@ -1058,6 +1072,8 @@ FULL_CONSULT_MODEL_GRADES: dict[str, str] = {
     "gpt-6.1-sol": "flagship",
     "gpt-6-astra-cpa": "flagship",
     "gpt-6.1-sol-cpa": "flagship",
+    "gpt-6.2-sol-cpa": "flagship",
+    "gpt-6.2-astra-cpa": "flagship",
     "gpt-5.6-sol": "flagship",
     "grok-4.6": "flagship",
     "grok-4.7": "flagship",

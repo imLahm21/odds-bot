@@ -159,7 +159,8 @@ LLM 精算按**档位**（而非写死模型名）路由，每档分管理员/�
 
 **CPA 接入**：供应商按模型名分离，一个模型名只属于一个授权组。两款 Luna 统一走 `cpa_gpt`，
 旧 `openai_gpt` 组已移除。GPT 的标准名（`gpt-6-astra`、`gpt-6.1-sol` 等）只走 IK；CPA 的 GPT
-用本地别名 `gpt-6-astra-cpa`、`gpt-6.1-sol-cpa`、`gpt-6.1-terra-cpa`，只走 `cpa_gpt`，请求时自动换回
+用本地别名 `gpt-6-astra-cpa`、`gpt-6.1-sol-cpa`、`gpt-6.1-terra-cpa`、`gpt-6.2-sol-cpa`
+（heavy / balanced）、`gpt-6.2-astra-cpa`（仅 heavy），只走 `cpa_gpt`，请求时自动换回
 上游真实模型名（去掉 `-cpa`）；别名未单列 token 预算时沿用上游同名模型的配置。
 Claude / Gemini 按真实模型 ID 分开：标准名只走 IK；以下四个 `-high` 变体仅走 CPA。
 
